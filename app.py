@@ -386,6 +386,23 @@ def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
     except Exception:
         pass
 
+    if np.isnan(current_price) or np.isnan(previous_close):
+        try:
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        except Exception:
+            hist = pd.DataFrame()
+
+        if not hist.empty and "Close" in hist.columns:
+            close_series = hist["Close"].dropna()
+            if not close_series.empty:
+                if np.isnan(current_price):
+                    current_price = float(close_series.iloc[-1])
+                if np.isnan(previous_close):
+                    if len(close_series) >= 2:
+                        previous_close = float(close_series.iloc[-2])
+                    else:
+                        previous_close = float(close_series.iloc[-1])
+
     if np.isnan(current_price) or np.isnan(previous_close) or not currency:
         try:
             info = ticker.info
@@ -408,23 +425,6 @@ def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
             info_currency = info.get("currency")
             if isinstance(info_currency, str):
                 currency = info_currency.upper().strip()
-
-    if np.isnan(current_price) or np.isnan(previous_close):
-        try:
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
-        except Exception:
-            hist = pd.DataFrame()
-
-        if not hist.empty and "Close" in hist.columns:
-            close_series = hist["Close"].dropna()
-            if not close_series.empty:
-                if np.isnan(current_price):
-                    current_price = float(close_series.iloc[-1])
-                if np.isnan(previous_close):
-                    if len(close_series) >= 2:
-                        previous_close = float(close_series.iloc[-2])
-                    else:
-                        previous_close = float(close_series.iloc[-1])
 
     if not currency:
         currency = default_currency_from_symbol(symbol)
@@ -862,6 +862,8 @@ with tab_single:
 
     selected_top_row: Dict[str, str | int | float | None] | None = None
     if selection_options:
+        if "single_top_pick" in st.session_state and st.session_state["single_top_pick"] not in selection_options:
+            st.session_state.pop("single_top_pick")
         selected_label = st.selectbox(
             "Top100에서 바로 분석할 종목",
             options=list(selection_options.keys()),
