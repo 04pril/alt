@@ -1,19 +1,28 @@
 from __future__ import annotations
 
-from typing import Dict, List
+import re
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 from predictor import normalize_symbol, run_forecast
+from top100_universe import (
+    KR_NAME_ALIASES,
+    KR_MANUAL_SYMBOLS,
+    KR_TOP100_NAMES,
+    US_NAME_QUERY_OVERRIDES,
+    US_TOP100_NAME_SYMBOLS,
+)
 
 
 WATCHLIST_PRESETS: Dict[str, List[str]] = {
     "코인": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "BNB-USD", "DOGE-USD"],
     "미국주식": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD"],
-    "한국주식": ["005930", "000660", "035420", "051910", "005380", "035720", "068270", "207940"],
+    "한국주식": ["005930", "000660", "035420", "005380", "035720", "068270", "247540", "373220"],
 }
 
 VALIDATION_LABEL_TO_MODE = {
@@ -35,6 +44,17 @@ TRADE_METRIC_LABELS = {
     "signal_threshold_pct": "최소신호강도(%)",
 }
 
+VALIDATION_ITEM_LABELS = {
+    "validation_mode": "검증모드",
+    "gap_days_total": "총 갭일수(purge+embargo)",
+    "purge_days": "purge 일수",
+    "embargo_days": "embargo 일수",
+    "research_test_days": "연구구간 테스트 일수",
+    "final_holdout_days": "최종 홀드아웃 일수",
+    "vol_low_threshold_pct": "저변동성 경계(%)",
+    "vol_high_threshold_pct": "고변동성 경계(%)",
+}
+
 
 def parse_symbols(raw_text: str) -> List[str]:
     normalized = raw_text.replace("\n", ",")
@@ -49,6 +69,21 @@ def dedupe_keep_order(values: List[str]) -> List[str]:
             output.append(value)
             seen.add(value)
     return output
+
+
+def dedupe_symbol_pairs(values: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    seen = set()
+    output: List[Tuple[str, str]] = []
+    for name, symbol in values:
+        key = symbol.upper().strip()
+        if key and key not in seen:
+            output.append((name, key))
+            seen.add(key)
+    return output
+
+
+def looks_like_symbol(text: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z0-9.\-]{1,12}", text.strip().upper()))
 
 
 def grade_from_score(score: float) -> str:
@@ -69,47 +104,205 @@ def metric_value(metric_df: pd.DataFrame, key: str, default: float = 0.0) -> flo
     return value
 
 
+def model_metric_value(metrics_df: pd.DataFrame, model: str, key: str, default: float = 0.0) -> float:
+    row = metrics_df.loc[metrics_df["model"] == model, key]
+    if row.empty:
+        return default
+    value = float(row.iloc[0])
+    if np.isnan(value):
+        return default
+    return value
+
+
+def to_trade_view(metric_df: pd.DataFrame) -> pd.DataFrame:
+    view = metric_df.copy()
+    view["지표"] = view["metric"].map(TRADE_METRIC_LABELS).fillna(view["metric"])
+    view = view[["지표", "value"]].rename(columns={"value": "값"})
+    return view
+
+
+def to_model_view(metrics_df: pd.DataFrame) -> pd.DataFrame:
+    return metrics_df.rename(
+        columns={
+            "model": "모델",
+            "mae": "MAE",
+            "mape_pct": "MAPE(%)",
+            "direction_acc_pct": "방향정확도(%)",
+        }
+    )
+
+
+def to_validation_view(summary_df: pd.DataFrame) -> pd.DataFrame:
+    view = summary_df.copy()
+    view["항목"] = view["item"].map(VALIDATION_ITEM_LABELS).fillna(view["item"])
+    view = view[["항목", "value"]].rename(columns={"value": "값"})
+    return view
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_krx_name_map() -> Dict[str, Dict[str, str]]:
+    try:
+        df = pd.read_html(
+            "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+            encoding="euc-kr",
+        )[0]
+    except Exception:
+        return {}
+
+    name_col, market_col, code_col = df.columns[:3]
+    frame = df[[name_col, market_col, code_col]].copy()
+    frame.columns = ["name", "market", "code"]
+    frame["name"] = frame["name"].astype(str).str.strip()
+    frame["market"] = frame["market"].astype(str).str.strip()
+    frame["code"] = frame["code"].astype(str).str.strip().str.zfill(6)
+    frame = frame.drop_duplicates(subset=["name"], keep="first")
+    return frame.set_index("name")[["market", "code"]].to_dict("index")
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def search_symbol_from_yf(query: str, market_hint: str) -> str | None:
+    q = query.strip()
+    if not q:
+        return None
+
+    try:
+        quotes = yf.Search(q, max_results=12).quotes
+    except Exception:
+        return None
+    if not quotes:
+        return None
+
+    def valid_symbol(item: dict) -> bool:
+        symbol = str(item.get("symbol", "")).upper()
+        exchange = str(item.get("exchange", "")).upper()
+        if not symbol:
+            return False
+        if market_hint == "KR":
+            return symbol.endswith(".KS") or symbol.endswith(".KQ")
+        if symbol.endswith(".KS") or symbol.endswith(".KQ"):
+            return False
+        if exchange in {"NMS", "NAS", "NYQ", "NYS", "ASE", "AMEX", "PCX", "BATS", "NGM", "NCM", "NMQ"}:
+            return True
+        return looks_like_symbol(symbol)
+
+    for item in quotes:
+        if valid_symbol(item):
+            return str(item.get("symbol")).upper()
+
+    first_symbol = str(quotes[0].get("symbol", "")).upper()
+    return first_symbol if first_symbol else None
+
+
+def resolve_kr_name_to_symbol(name: str) -> str | None:
+    if name in KR_MANUAL_SYMBOLS:
+        return KR_MANUAL_SYMBOLS[name].upper()
+
+    candidate_names = [name]
+    alias = KR_NAME_ALIASES.get(name)
+    if alias and alias != name:
+        candidate_names.append(alias)
+
+    name_map = load_krx_name_map()
+    for candidate in candidate_names:
+        if candidate in name_map:
+            code = name_map[candidate]["code"]
+            market = name_map[candidate]["market"]
+            suffix = ".KQ" if "코스닥" in market else ".KS"
+            return f"{code}{suffix}".upper()
+
+    return search_symbol_from_yf(query=alias or name, market_hint="KR")
+
+
+def resolve_us_name_to_symbol(name: str, symbol_hint: str | None) -> str | None:
+    if symbol_hint:
+        return symbol_hint.upper()
+    if looks_like_symbol(name):
+        return name.upper()
+
+    query = US_NAME_QUERY_OVERRIDES.get(name, name)
+    return search_symbol_from_yf(query=query, market_hint="US")
+
+
+def build_top100_entries(asset_type: str) -> List[Dict[str, str | int | None]]:
+    if asset_type == "한국주식":
+        entries = []
+        for i, name in enumerate(KR_TOP100_NAMES, start=1):
+            entries.append({"rank": i, "name": name, "symbol_hint": KR_MANUAL_SYMBOLS.get(name)})
+        return entries
+
+    if asset_type == "미국주식":
+        entries = []
+        for i, (name, symbol) in enumerate(US_TOP100_NAME_SYMBOLS, start=1):
+            entries.append({"rank": i, "name": name, "symbol_hint": symbol})
+        return entries
+
+    return []
+
+
+def resolve_top100_entries(asset_type: str, entries: List[Dict[str, str | int | None]]) -> Tuple[List[Tuple[str, str]], List[str]]:
+    resolved: List[Tuple[str, str]] = []
+    unresolved: List[str] = []
+
+    for entry in entries:
+        name = str(entry["name"])
+        symbol_hint = entry.get("symbol_hint")
+
+        if asset_type == "한국주식":
+            symbol = resolve_kr_name_to_symbol(name=name)
+        elif asset_type == "미국주식":
+            symbol = resolve_us_name_to_symbol(name=name, symbol_hint=str(symbol_hint) if symbol_hint else None)
+        else:
+            symbol = None
+
+        if symbol:
+            resolved.append((name, symbol))
+        else:
+            unresolved.append(name)
+
+    return resolved, unresolved
+
+
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
-    ensemble = result.metrics[result.metrics["model"] == "Ensemble"]
-    ensemble_row = ensemble.iloc[0] if not ensemble.empty else result.metrics.iloc[0]
+    eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics
+    eval_trade_metrics = (
+        result.final_holdout_trade_metrics if not result.final_holdout_trade_metrics.empty else result.trade_metrics
+    )
 
     latest_close = float(result.latest_close)
     next_pred = float(result.future_frame["ensemble_pred"].iloc[0])
     last_pred = float(result.future_frame["ensemble_pred"].iloc[-1])
     expected_return = (last_pred / latest_close - 1.0) * 100.0
-    next_day_return = (next_pred / latest_close - 1.0) * 100.0
 
-    mae = float(ensemble_row["mae"])
-    mape = float(ensemble_row["mape_pct"])
-    direction_acc = float(ensemble_row["direction_acc_pct"])
+    mae = model_metric_value(eval_metrics, "Ensemble", "mae", default=0.0)
+    direction_acc = model_metric_value(eval_metrics, "Ensemble", "direction_acc_pct", default=0.0)
+    mape = model_metric_value(eval_metrics, "Ensemble", "mape_pct", default=0.0)
     mae_pct = (mae / max(latest_close, 1e-9)) * 100.0
 
-    win_rate_pct = metric_value(result.trade_metrics, "win_rate_pct")
-    expectancy_pct = metric_value(result.trade_metrics, "expectancy_pct")
-    max_dd_pct = metric_value(result.trade_metrics, "max_drawdown_pct")
-    net_cum_return_pct = metric_value(result.trade_metrics, "net_cum_return_pct")
-    trades = metric_value(result.trade_metrics, "trades")
+    win_rate_pct = metric_value(eval_trade_metrics, "win_rate_pct")
+    expectancy_pct = metric_value(eval_trade_metrics, "expectancy_pct")
+    net_cum_return_pct = metric_value(eval_trade_metrics, "net_cum_return_pct")
+    max_dd_pct = metric_value(eval_trade_metrics, "max_drawdown_pct")
+    trades = metric_value(eval_trade_metrics, "trades")
 
     trend_score = float(np.clip((expected_return + 12.0) / 24.0, 0.0, 1.0) * 100.0)
     error_score = float(np.clip(100.0 - mae_pct * 12.0, 0.0, 100.0))
     drawdown_penalty = float(np.clip(abs(min(max_dd_pct, 0.0)) * 2.0, 0.0, 40.0))
-    trade_score = float(np.clip(50.0 + expectancy_pct * 6.0 + (win_rate_pct - 50.0) * 0.8 - drawdown_penalty, 0, 100))
-    score = 0.40 * direction_acc + 0.25 * trend_score + 0.20 * error_score + 0.15 * trade_score
+    trade_score = float(np.clip(50.0 + expectancy_pct * 7.0 + (win_rate_pct - 50.0) * 0.8 - drawdown_penalty, 0, 100))
+    score = 0.35 * direction_acc + 0.20 * trend_score + 0.15 * error_score + 0.30 * trade_score
 
     return {
         "심볼": symbol,
         "등급": grade_from_score(score),
         "유망도점수": score,
         "예상수익률(%)": expected_return,
-        "내일예상수익률(%)": next_day_return,
-        "거래기대값(%)": expectancy_pct,
-        "누적수익률(%)": net_cum_return_pct,
-        "방향정확도(%)": direction_acc,
-        "승률(%)": win_rate_pct,
-        "최대낙폭(%)": max_dd_pct,
-        "거래횟수": trades,
-        "MAE/가격(%)": mae_pct,
-        "MAPE(%)": mape,
+        "최종홀드아웃_기대값(%)": expectancy_pct,
+        "최종홀드아웃_누적수익률(%)": net_cum_return_pct,
+        "최종홀드아웃_방향정확도(%)": direction_acc,
+        "최종홀드아웃_승률(%)": win_rate_pct,
+        "최종홀드아웃_MDD(%)": max_dd_pct,
+        "최종홀드아웃_거래횟수": trades,
+        "최종홀드아웃_MAE/가격(%)": mae_pct,
+        "최종홀드아웃_MAPE(%)": mape,
         "최근종가": latest_close,
         "내일예측종가": next_pred,
         f"{forecast_days}일예측종가": last_pred,
@@ -128,43 +321,74 @@ def render_single_result(result, forecast_days: int) -> None:
     c3.metric(f"{forecast_days}일 기대 수익률", f"{expected_return:+.2f}%")
     c4.metric("검증모드", "워크포워드" if result.validation_mode == "walk_forward" else "홀드아웃")
 
-    st.subheader("모델 성능 (백테스트)")
-    metrics_view = result.metrics.rename(
-        columns={
-            "model": "모델",
-            "mae": "MAE",
-            "mape_pct": "MAPE(%)",
-            "direction_acc_pct": "방향정확도(%)",
-        }
-    )
-    st.dataframe(metrics_view, use_container_width=True, hide_index=True)
+    st.subheader("검증 설정 요약")
+    st.dataframe(to_validation_view(result.validation_summary), use_container_width=True, hide_index=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.subheader("연구구간 모델 성능")
+        st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
+    with right:
+        st.subheader("최종 홀드아웃 모델 성능")
+        st.dataframe(to_model_view(result.final_holdout_metrics), use_container_width=True, hide_index=True)
 
     weight_table = result.metrics[result.metrics["model"].isin(result.weights.keys())][["model"]].copy().assign(
         weight_pct=lambda df: df["model"].map(result.weights).fillna(0.0) * 100.0
     )
-    weight_table = weight_table.rename(columns={"model": "모델", "weight_pct": "가중치(%)"})
+    weight_table = weight_table.rename(columns={"model": "모델", "weight_pct": "연구구간 가중치(%)"})
     st.dataframe(weight_table, use_container_width=True, hide_index=True)
 
-    st.subheader("실전 가정 백테스트 (신호일 종가 계산 → 다음날 시가 진입)")
-    trade_view = result.trade_metrics.copy()
-    trade_view["지표"] = trade_view["metric"].map(TRADE_METRIC_LABELS).fillna(trade_view["metric"])
-    trade_view = trade_view[["지표", "value"]].rename(columns={"value": "값"})
-    st.dataframe(trade_view, use_container_width=True, hide_index=True)
+    bt_left, bt_right = st.columns(2)
+    with bt_left:
+        st.subheader("연구구간 거래 백테스트")
+        st.dataframe(to_trade_view(result.trade_metrics), use_container_width=True, hide_index=True)
+    with bt_right:
+        st.subheader("최종 홀드아웃 거래 백테스트")
+        st.dataframe(to_trade_view(result.final_holdout_trade_metrics), use_container_width=True, hide_index=True)
 
-    eq = result.trade_backtest[["equity_curve"]].copy()
-    eq["net_cum_return_pct"] = (eq["equity_curve"] - 1.0) * 100.0
+    st.subheader("변동성 레짐별 성과 분해")
+    if result.regime_metrics.empty:
+        st.warning("레짐 분해 데이터가 부족합니다.")
+    else:
+        regime_view = result.regime_metrics.rename(
+            columns={
+                "segment": "구간",
+                "regime": "레짐",
+                "days": "일수",
+                "coverage_pct": "커버리지(%)",
+                "trades": "거래횟수",
+                "win_rate_pct": "승률(%)",
+                "expectancy_pct": "기대값/거래(%)",
+                "net_cum_return_pct": "누적수익률(%)",
+                "max_drawdown_pct": "최대낙폭(%)",
+                "avg_signal_abs": "평균신호강도(|signal|)",
+                "avg_volatility_pct": "평균변동성(%)",
+            }
+        )
+        st.dataframe(regime_view, use_container_width=True, hide_index=True)
+
+    st.subheader("연구구간 vs 최종 홀드아웃 누적수익률")
     eq_fig = go.Figure()
     eq_fig.add_trace(
         go.Scatter(
-            x=eq.index,
-            y=eq["net_cum_return_pct"],
+            x=result.trade_backtest.index,
+            y=(result.trade_backtest["equity_curve"] - 1.0) * 100.0,
             mode="lines",
-            name="누적수익률(%)",
+            name="연구구간",
             line=dict(width=2),
         )
     )
+    eq_fig.add_trace(
+        go.Scatter(
+            x=result.final_holdout_trade_backtest.index,
+            y=(result.final_holdout_trade_backtest["equity_curve"] - 1.0) * 100.0,
+            mode="lines",
+            name="최종홀드아웃",
+            line=dict(width=2, dash="dot"),
+        )
+    )
     eq_fig.update_layout(
-        height=280,
+        height=300,
         margin=dict(l=20, r=20, t=20, b=20),
         hovermode="x unified",
         yaxis_title="누적수익률(%)",
@@ -185,19 +409,19 @@ def render_single_result(result, forecast_days: int) -> None:
     fig.add_trace(
         go.Scatter(
             x=result.test_frame.index,
-            y=result.test_frame["actual_next_close"],
+            y=result.test_frame["ensemble_pred"],
             mode="lines",
-            name="백테스트 실제",
-            line=dict(width=2, dash="dot"),
+            name="연구구간 예측",
+            line=dict(width=2),
         )
     )
     fig.add_trace(
         go.Scatter(
-            x=result.test_frame.index,
-            y=result.test_frame["ensemble_pred"],
+            x=result.final_holdout_frame.index,
+            y=result.final_holdout_frame["ensemble_pred"],
             mode="lines",
-            name="백테스트 예측",
-            line=dict(width=2),
+            name="최종홀드아웃 예측",
+            line=dict(width=2, dash="dot"),
         )
     )
     fig.add_trace(
@@ -269,6 +493,9 @@ def run_cached(
     retrain_every: int,
     total_cost_bps: float,
     min_signal_strength_pct: float,
+    final_holdout_days: int,
+    purge_days: int,
+    embargo_days: int,
 ):
     return run_forecast(
         symbol=symbol,
@@ -279,6 +506,9 @@ def run_cached(
         retrain_every=retrain_every,
         total_cost_bps=total_cost_bps,
         min_signal_strength_pct=min_signal_strength_pct,
+        final_holdout_days=final_holdout_days,
+        purge_days=purge_days,
+        embargo_days=embargo_days,
     )
 
 
@@ -300,7 +530,8 @@ with st.sidebar:
         st.caption("숫자 6자리 입력 시 자동으로 .KS / .KQ를 붙입니다.")
 
     years = st.slider("학습 데이터 기간(년)", min_value=2, max_value=10, value=5)
-    test_days = st.slider("검증 구간(일)", min_value=30, max_value=220, value=60)
+    test_days = st.slider("연구구간 테스트(일)", min_value=20, max_value=260, value=60)
+    final_holdout_days = st.slider("최종 홀드아웃(일)", min_value=20, max_value=220, value=40)
     forecast_days = st.slider("미래 예측(일)", min_value=7, max_value=60, value=14)
 
     validation_label = st.selectbox("검증 모드", list(VALIDATION_LABEL_TO_MODE.keys()), index=0)
@@ -309,6 +540,9 @@ with st.sidebar:
         retrain_every = st.slider("워크포워드 재학습 주기(일)", min_value=1, max_value=20, value=5)
     else:
         retrain_every = 5
+
+    purge_days = st.slider("Purging 일수", min_value=0, max_value=10, value=2)
+    embargo_days = st.slider("Embargo 일수", min_value=0, max_value=10, value=1)
 
     total_cost_bps = st.slider("왕복 거래비용 가정(bps)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
     min_signal_strength_pct = st.slider(
@@ -342,6 +576,9 @@ with tab_single:
                     retrain_every=retrain_every,
                     total_cost_bps=total_cost_bps,
                     min_signal_strength_pct=min_signal_strength_pct,
+                    final_holdout_days=final_holdout_days,
+                    purge_days=purge_days,
+                    embargo_days=embargo_days,
                 )
         except Exception as exc:
             st.error(f"실행 중 오류: {exc}")
@@ -351,29 +588,69 @@ with tab_single:
         st.write("사이드바에서 설정 후 **단일 종목 예측 실행**을 눌러 주세요.")
 
 with tab_scan:
-    st.caption("여러 종목을 한 번에 분석해서 유망도 순위로 보여줍니다.")
+    st.caption("이름으로 고른 Top100 후보와 직접 입력 심볼을 한 번에 분석해 유망도 순위를 보여줍니다.")
+
+    use_top100 = asset_type in {"한국주식", "미국주식"}
+    if use_top100:
+        entries = build_top100_entries(asset_type=asset_type)
+        option_map = {
+            f"{entry['rank']:>3}. {entry['name']}" + (f" ({entry['symbol_hint']})" if entry["symbol_hint"] else ""): entry
+            for entry in entries
+        }
+        option_labels = list(option_map.keys())
+        default_labels = option_labels[: min(20, len(option_labels))]
+        selected_labels = st.multiselect(
+            "Top100 종목 선택(이름 기준)",
+            options=option_labels,
+            default=default_labels,
+            key=f"top100_names_{asset_type}",
+        )
+        selected_entries = [option_map[label] for label in selected_labels]
+    else:
+        selected_entries = []
+
     preset_symbols = WATCHLIST_PRESETS[asset_type]
-    selected_symbols = st.multiselect(
-        "기본 후보",
-        options=preset_symbols,
-        default=preset_symbols[: min(6, len(preset_symbols))],
-        key=f"preset_{asset_type}",
-    )
+    manual_symbol_mode = st.checkbox("심볼 직접 선택 모드 사용", value=(asset_type == "코인"), key=f"manual_mode_{asset_type}")
+    if manual_symbol_mode:
+        selected_symbols = st.multiselect(
+            "기본 심볼 후보",
+            options=preset_symbols,
+            default=preset_symbols[: min(6, len(preset_symbols))],
+            key=f"preset_{asset_type}",
+        )
+    else:
+        selected_symbols = []
+
     extra_symbols_raw = st.text_input(
         "추가 심볼 (쉼표/줄바꿈 구분, 선택사항)",
         value="",
         key=f"extra_{asset_type}",
     )
-    top_n = st.slider("상위 카드 표시 개수", min_value=3, max_value=10, value=5, key="top_n")
+    top_n = st.slider("상위 카드 표시 개수", min_value=3, max_value=15, value=7, key="top_n")
     run_scan = st.button("유망 종목 스캔 실행", type="primary", key="scan_run")
 
     if run_scan:
+        resolved_pairs: List[Tuple[str, str]] = []
+        unresolved_names: List[str] = []
+
+        if selected_entries:
+            name_pairs, unresolved_names = resolve_top100_entries(asset_type=asset_type, entries=selected_entries)
+            resolved_pairs.extend(name_pairs)
+
         extra_symbols = parse_symbols(extra_symbols_raw)
-        scan_input = dedupe_keep_order(selected_symbols + extra_symbols)
-        if not scan_input:
-            st.error("스캔할 심볼이 없습니다. 기본 후보를 선택하거나 추가 심볼을 입력해 주세요.")
+        resolved_pairs.extend((sym, sym) for sym in selected_symbols)
+        resolved_pairs.extend((sym, sym) for sym in extra_symbols)
+        resolved_pairs = dedupe_symbol_pairs(resolved_pairs)
+
+        if unresolved_names:
+            unresolved_frame = pd.DataFrame({"미해결 종목명": unresolved_names})
+            st.warning("일부 종목은 티커를 자동으로 찾지 못했습니다. 아래 목록은 직접 심볼 입력이 필요합니다.")
+            st.dataframe(unresolved_frame, use_container_width=True, hide_index=True)
+
+        if not resolved_pairs:
+            st.error("스캔할 심볼이 없습니다. Top100 선택 또는 심볼 직접 입력을 확인해 주세요.")
         else:
-            if validation_mode == "walk_forward" and len(scan_input) >= 8:
+            if validation_mode == "walk_forward" and len(resolved_pairs) >= 8:
                 st.warning("워크포워드 모드는 느릴 수 있습니다. 심볼 수를 줄이면 더 빠릅니다.")
 
             rows: List[Dict[str, float | str]] = []
@@ -381,10 +658,10 @@ with tab_scan:
             progress = st.progress(0.0)
             status = st.empty()
 
-            for idx, raw in enumerate(scan_input, start=1):
+            for idx, (display_name, raw_symbol) in enumerate(resolved_pairs, start=1):
                 try:
-                    symbol = normalize_symbol(asset_type=asset_type, raw_symbol=raw, korea_market=korea_market)
-                    status.write(f"{idx}/{len(scan_input)} 분석 중: `{symbol}`")
+                    symbol = normalize_symbol(asset_type=asset_type, raw_symbol=raw_symbol, korea_market=korea_market)
+                    status.write(f"{idx}/{len(resolved_pairs)} 분석 중: `{display_name}` -> `{symbol}`")
                     scan_result = run_cached(
                         symbol=symbol,
                         years=years,
@@ -394,11 +671,16 @@ with tab_scan:
                         retrain_every=retrain_every,
                         total_cost_bps=total_cost_bps,
                         min_signal_strength_pct=min_signal_strength_pct,
+                        final_holdout_days=final_holdout_days,
+                        purge_days=purge_days,
+                        embargo_days=embargo_days,
                     )
-                    rows.append(build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days))
+                    row = build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days)
+                    row["종목명"] = display_name
+                    rows.append(row)
                 except Exception as exc:
-                    errors.append({"심볼": raw, "오류": str(exc)})
-                progress.progress(idx / len(scan_input))
+                    errors.append({"입력": display_name, "심볼": raw_symbol, "오류": str(exc)})
+                progress.progress(idx / len(resolved_pairs))
 
             status.empty()
             progress.empty()
@@ -406,9 +688,13 @@ with tab_scan:
             if rows:
                 summary = (
                     pd.DataFrame(rows)
-                    .sort_values(["유망도점수", "거래기대값(%)", "예상수익률(%)"], ascending=[False, False, False])
+                    .sort_values(
+                        ["유망도점수", "최종홀드아웃_기대값(%)", "예상수익률(%)"],
+                        ascending=[False, False, False],
+                    )
                     .reset_index(drop=True)
                 )
+                summary.insert(0, "순위", np.arange(1, len(summary) + 1))
                 top_df = summary.head(min(top_n, len(summary)))
 
                 st.subheader("유망 후보 카드")
@@ -417,19 +703,19 @@ with tab_scan:
                     row = top_df.iloc[i]
                     with card_cols[i % len(card_cols)]:
                         st.metric(
-                            f"{row['심볼']} · {row['등급']}",
+                            f"#{int(row['순위'])} {row['종목명']}",
                             f"{row['유망도점수']:.1f}점",
                             f"{row['예상수익률(%)']:+.2f}%",
                         )
+                        st.caption(f"{row['심볼']} · 홀드아웃 기대값 {row['최종홀드아웃_기대값(%)']:+.3f}%")
                         st.caption(
-                            f"기대값/거래 {row['거래기대값(%)']:+.3f}% · 승률 {row['승률(%)']:.1f}% · MDD {row['최대낙폭(%)']:.2f}%"
+                            f"방향정확도 {row['최종홀드아웃_방향정확도(%)']:.1f}% · 승률 {row['최종홀드아웃_승률(%)']:.1f}% · MDD {row['최종홀드아웃_MDD(%)']:.2f}%"
                         )
-                        st.caption(f"방향정확도 {row['방향정확도(%)']:.1f}% · MAE/가격 {row['MAE/가격(%)']:.2f}%")
 
                 score_fig = go.Figure(
                     data=[
                         go.Bar(
-                            x=top_df["심볼"],
+                            x=top_df["종목명"],
                             y=top_df["유망도점수"],
                             text=[f"{value:.1f}" for value in top_df["유망도점수"]],
                             textposition="outside",
@@ -438,10 +724,10 @@ with tab_scan:
                 )
                 score_fig.update_layout(
                     title="상위 후보 유망도 점수",
-                    height=360,
+                    height=380,
                     margin=dict(l=20, r=20, t=50, b=20),
                     yaxis_title="점수",
-                    xaxis_title="심볼",
+                    xaxis_title="종목",
                 )
                 st.plotly_chart(score_fig, use_container_width=True)
 
@@ -451,7 +737,7 @@ with tab_scan:
                 st.warning("정상 분석된 종목이 없습니다. 심볼 형식이나 인터넷 연결 상태를 확인해 주세요.")
 
             if errors:
-                st.subheader("실패한 심볼")
+                st.subheader("실패한 항목")
                 st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
     else:
-        st.write("기본 후보를 선택하고 **유망 종목 스캔 실행**을 눌러 주세요.")
+        st.write("종목을 선택하고 **유망 종목 스캔 실행**을 눌러 주세요.")
