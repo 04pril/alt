@@ -40,17 +40,22 @@ TRADE_METRIC_LABELS = {
     "exposure_pct": "노출비율(%)",
     "avg_win_pct": "평균이익(%)",
     "avg_loss_pct": "평균손실(%)",
-    "cost_bps_assumed": "가정비용(bps)",
+    "round_trip_cost_bps_assumed": "왕복비용(bps)",
     "signal_threshold_pct": "최소신호강도(%)",
+    "allow_short": "숏허용(1/0)",
 }
 
 VALIDATION_ITEM_LABELS = {
     "validation_mode": "검증모드",
+    "target_mode": "타깃모드",
     "gap_days_total": "총 갭일수(purge+embargo)",
     "purge_days": "purge 일수",
     "embargo_days": "embargo 일수",
+    "validation_days": "validation 일수",
     "research_test_days": "연구구간 테스트 일수",
     "final_holdout_days": "최종 홀드아웃 일수",
+    "selected_signal_threshold_pct": "선택된 신호강도(%)",
+    "allow_short": "숏허용(1/0)",
     "vol_low_threshold_pct": "저변동성 경계(%)",
     "vol_high_threshold_pct": "고변동성 경계(%)",
 }
@@ -324,8 +329,11 @@ def render_single_result(result, forecast_days: int) -> None:
     st.subheader("검증 설정 요약")
     st.dataframe(to_validation_view(result.validation_summary), use_container_width=True, hide_index=True)
 
-    left, right = st.columns(2)
+    left, mid, right = st.columns(3)
     with left:
+        st.subheader("Validation 모델 성능")
+        st.dataframe(to_model_view(result.validation_metrics), use_container_width=True, hide_index=True)
+    with mid:
         st.subheader("연구구간 모델 성능")
         st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
     with right:
@@ -491,11 +499,14 @@ def run_cached(
     forecast_days: int,
     validation_mode: str,
     retrain_every: int,
-    total_cost_bps: float,
+    round_trip_cost_bps: float,
     min_signal_strength_pct: float,
     final_holdout_days: int,
     purge_days: int,
     embargo_days: int,
+    target_mode: str,
+    validation_days: int,
+    allow_short: bool,
 ):
     return run_forecast(
         symbol=symbol,
@@ -504,11 +515,14 @@ def run_cached(
         forecast_days=forecast_days,
         validation_mode=validation_mode,
         retrain_every=retrain_every,
-        total_cost_bps=total_cost_bps,
+        round_trip_cost_bps=round_trip_cost_bps,
         min_signal_strength_pct=min_signal_strength_pct,
         final_holdout_days=final_holdout_days,
         purge_days=purge_days,
         embargo_days=embargo_days,
+        target_mode=target_mode,
+        validation_days=validation_days,
+        allow_short=allow_short,
     )
 
 
@@ -540,11 +554,16 @@ with st.sidebar:
         retrain_every = st.slider("워크포워드 재학습 주기(일)", min_value=1, max_value=20, value=5)
     else:
         retrain_every = 5
+    validation_days = st.slider("Validation(가중치 산출) 일수", min_value=20, max_value=180, value=40)
+
+    target_mode_label = st.selectbox("예측 타깃", ["수익률(return)", "가격(price)"], index=0)
+    target_mode = "return" if target_mode_label.startswith("수익률") else "price"
 
     purge_days = st.slider("Purging 일수", min_value=0, max_value=10, value=2)
     embargo_days = st.slider("Embargo 일수", min_value=0, max_value=10, value=1)
 
-    total_cost_bps = st.slider("왕복 거래비용 가정(bps)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
+    round_trip_cost_bps = st.slider("왕복 거래비용 가정(bps)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
+    allow_short = st.checkbox("숏(공매도) 허용", value=False)
     min_signal_strength_pct = st.slider(
         "최소 신호 강도(%)",
         min_value=0.0,
@@ -574,11 +593,14 @@ with tab_single:
                     forecast_days=forecast_days,
                     validation_mode=validation_mode,
                     retrain_every=retrain_every,
-                    total_cost_bps=total_cost_bps,
+                    round_trip_cost_bps=round_trip_cost_bps,
                     min_signal_strength_pct=min_signal_strength_pct,
                     final_holdout_days=final_holdout_days,
                     purge_days=purge_days,
                     embargo_days=embargo_days,
+                    target_mode=target_mode,
+                    validation_days=validation_days,
+                    allow_short=allow_short,
                 )
         except Exception as exc:
             st.error(f"실행 중 오류: {exc}")
@@ -669,11 +691,14 @@ with tab_scan:
                         forecast_days=forecast_days,
                         validation_mode=validation_mode,
                         retrain_every=retrain_every,
-                        total_cost_bps=total_cost_bps,
+                        round_trip_cost_bps=round_trip_cost_bps,
                         min_signal_strength_pct=min_signal_strength_pct,
                         final_holdout_days=final_holdout_days,
                         purge_days=purge_days,
                         embargo_days=embargo_days,
+                        target_mode=target_mode,
+                        validation_days=validation_days,
+                        allow_short=allow_short,
                     )
                     row = build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days)
                     row["종목명"] = display_name
