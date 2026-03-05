@@ -502,6 +502,93 @@ def render_top100_snapshot_cards(rows: List[Dict[str, str | int | float | None]]
         )
 
 
+def detect_mobile_client() -> bool:
+    user_agent = ""
+    try:
+        headers = getattr(st.context, "headers", None)
+        if headers is not None:
+            user_agent = str(headers.get("User-Agent", "") or headers.get("user-agent", ""))
+    except Exception:
+        user_agent = ""
+    if not user_agent:
+        return False
+    return bool(re.search(r"mobile|android|iphone|ipad|ipod", user_agent, flags=re.IGNORECASE))
+
+
+def apply_responsive_css(is_mobile_ui: bool) -> None:
+    if is_mobile_ui:
+        st.markdown(
+            """
+            <style>
+            .block-container {
+              padding-top: 0.8rem !important;
+              padding-bottom: 1.0rem !important;
+              padding-left: 0.8rem !important;
+              padding-right: 0.8rem !important;
+            }
+            h1 { font-size: 1.4rem !important; }
+            h2, h3 { font-size: 1.08rem !important; }
+            [data-testid="stMetricLabel"] { font-size: 0.78rem !important; }
+            [data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+            [data-testid="stTabs"] button[role="tab"] {
+              font-size: 0.85rem !important;
+              padding: 0.45rem 0.5rem !important;
+            }
+            [data-testid="stDataFrame"] {
+              font-size: 0.84rem !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            """
+            <style>
+            .block-container {
+              padding-top: 1.0rem !important;
+              padding-bottom: 1.2rem !important;
+              padding-left: 1.4rem !important;
+              padding-right: 1.4rem !important;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def build_snapshot_view_df(rows: List[Dict[str, str | int | float | None]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["순위", "시장", "종목명", "심볼", "현재가", "전일대비(%)"])
+
+    frame = pd.DataFrame(rows).copy()
+    frame["심볼"] = frame["심볼"].fillna("-")
+
+    def _fmt_price(row: pd.Series) -> str:
+        return format_live_price(value=float(row.get("현재가", float("nan"))), currency=str(row.get("통화", "USD")))
+
+    frame["현재가"] = frame.apply(_fmt_price, axis=1)
+    def _fmt_change(value: object) -> str:
+        number = first_valid_float(value)
+        return f"{number:+.2f}%" if np.isfinite(number) else "N/A"
+
+    frame["전일대비(%)"] = frame["전일대비(%)"].map(_fmt_change)
+    return frame[["순위", "시장", "종목명", "심볼", "현재가", "전일대비(%)"]]
+
+
+def build_single_picker_options(rows: List[Dict[str, str | int | float | None]]) -> Dict[str, Dict[str, str | int | float | None]]:
+    options: Dict[str, Dict[str, str | int | float | None]] = {}
+    for row in rows:
+        symbol = row.get("심볼")
+        if not symbol:
+            continue
+        change_pct = float(row.get("전일대비(%)", float("nan")))
+        change_text = f"{change_pct:+.2f}%" if np.isfinite(change_pct) else "N/A"
+        label = f"#{int(row['순위'])} [{row['시장']}] {row['종목명']} ({symbol}) · {change_text}"
+        options[label] = row
+    return options
+
+
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
     eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics
     eval_trade_metrics = (
@@ -549,31 +636,48 @@ def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float |
     }
 
 
-def render_single_result(result, forecast_days: int) -> None:
+def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None:
     latest_close = result.latest_close
     last_pred = float(result.future_frame["ensemble_pred"].iloc[-1])
     next_pred = float(result.future_frame["ensemble_pred"].iloc[0])
     expected_return = (last_pred / latest_close - 1.0) * 100.0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("최근 종가", f"{latest_close:,.2f}")
-    c2.metric("내일 예측 종가", f"{next_pred:,.2f}")
-    c3.metric(f"{forecast_days}일 기대 수익률", f"{expected_return:+.2f}%")
-    c4.metric("검증모드", "워크포워드" if result.validation_mode == "walk_forward" else "홀드아웃")
+    if is_mobile_ui:
+        top_row_1 = st.columns(2)
+        top_row_2 = st.columns(2)
+        top_row_1[0].metric("최근 종가", f"{latest_close:,.2f}")
+        top_row_1[1].metric("내일 예측 종가", f"{next_pred:,.2f}")
+        top_row_2[0].metric(f"{forecast_days}일 기대수익률", f"{expected_return:+.2f}%")
+        top_row_2[1].metric("검증모드", "워크포워드" if result.validation_mode == "walk_forward" else "홀드아웃")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("최근 종가", f"{latest_close:,.2f}")
+        c2.metric("내일 예측 종가", f"{next_pred:,.2f}")
+        c3.metric(f"{forecast_days}일 기대 수익률", f"{expected_return:+.2f}%")
+        c4.metric("검증모드", "워크포워드" if result.validation_mode == "walk_forward" else "홀드아웃")
 
     st.subheader("검증 설정 요약")
     st.dataframe(to_validation_view(result.validation_summary), use_container_width=True, hide_index=True)
 
-    left, mid, right = st.columns(3)
-    with left:
-        st.subheader("Validation 모델 성능")
+    if is_mobile_ui:
+        st.subheader("모델 성능")
+        st.caption("Validation")
         st.dataframe(to_model_view(result.validation_metrics), use_container_width=True, hide_index=True)
-    with mid:
-        st.subheader("연구구간 모델 성능")
+        st.caption("연구구간")
         st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
-    with right:
-        st.subheader("최종 홀드아웃 모델 성능")
+        st.caption("최종 홀드아웃")
         st.dataframe(to_model_view(result.final_holdout_metrics), use_container_width=True, hide_index=True)
+    else:
+        left, mid, right = st.columns(3)
+        with left:
+            st.subheader("Validation 모델 성능")
+            st.dataframe(to_model_view(result.validation_metrics), use_container_width=True, hide_index=True)
+        with mid:
+            st.subheader("연구구간 모델 성능")
+            st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
+        with right:
+            st.subheader("최종 홀드아웃 모델 성능")
+            st.dataframe(to_model_view(result.final_holdout_metrics), use_container_width=True, hide_index=True)
 
     weight_table = result.metrics[result.metrics["model"].isin(result.weights.keys())][["model"]].copy().assign(
         weight_pct=lambda df: df["model"].map(result.weights).fillna(0.0) * 100.0
@@ -581,13 +685,20 @@ def render_single_result(result, forecast_days: int) -> None:
     weight_table = weight_table.rename(columns={"model": "모델", "weight_pct": "연구구간 가중치(%)"})
     st.dataframe(weight_table, use_container_width=True, hide_index=True)
 
-    bt_left, bt_right = st.columns(2)
-    with bt_left:
-        st.subheader("연구구간 거래 백테스트")
+    if is_mobile_ui:
+        st.subheader("거래 백테스트")
+        st.caption("연구구간")
         st.dataframe(to_trade_view(result.trade_metrics), use_container_width=True, hide_index=True)
-    with bt_right:
-        st.subheader("최종 홀드아웃 거래 백테스트")
+        st.caption("최종 홀드아웃")
         st.dataframe(to_trade_view(result.final_holdout_trade_metrics), use_container_width=True, hide_index=True)
+    else:
+        bt_left, bt_right = st.columns(2)
+        with bt_left:
+            st.subheader("연구구간 거래 백테스트")
+            st.dataframe(to_trade_view(result.trade_metrics), use_container_width=True, hide_index=True)
+        with bt_right:
+            st.subheader("최종 홀드아웃 거래 백테스트")
+            st.dataframe(to_trade_view(result.final_holdout_trade_metrics), use_container_width=True, hide_index=True)
 
     st.subheader("변동성 레짐별 성과 분해")
     if result.regime_metrics.empty:
@@ -631,7 +742,7 @@ def render_single_result(result, forecast_days: int) -> None:
         )
     )
     eq_fig.update_layout(
-        height=300,
+        height=260 if is_mobile_ui else 300,
         margin=dict(l=20, r=20, t=20, b=20),
         hovermode="x unified",
         yaxis_title="누적수익률(%)",
@@ -698,7 +809,7 @@ def render_single_result(result, forecast_days: int) -> None:
         )
     )
     fig.update_layout(
-        height=620,
+        height=430 if is_mobile_ui else 620,
         hovermode="x unified",
         legend=dict(orientation="h", y=1.02, x=0),
         margin=dict(l=20, r=20, t=10, b=20),
@@ -724,6 +835,7 @@ st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
 st.title("코인 · 미국주식 · 한국주식 가격 예측기")
 st.caption("Yahoo Finance 데이터를 기반으로 앙상블 모델 예측 결과를 시각화합니다.")
 st.info("이 도구는 실험/학습 목적입니다. 어떤 모델도 미래 가격을 보장하지 않습니다.", icon="ℹ️")
+auto_mobile_detected = detect_mobile_client()
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
@@ -763,6 +875,13 @@ def run_cached(
 
 with st.sidebar:
     st.subheader("공통 설정")
+    ui_mode_choice = st.selectbox("화면 모드", ["자동", "PC", "모바일"], index=0)
+    if ui_mode_choice == "자동":
+        is_mobile_ui = auto_mobile_detected
+    else:
+        is_mobile_ui = ui_mode_choice == "모바일"
+    st.caption(f"현재 적용 UI: {'모바일' if is_mobile_ui else 'PC'}")
+
     asset_type = st.selectbox("자산 유형", ["코인", "미국주식", "한국주식"], index=0)
 
     if asset_type == "코인":
@@ -813,12 +932,34 @@ with st.sidebar:
     raw_symbol = st.text_input("심볼", value=default_symbol)
 
 
+apply_responsive_css(is_mobile_ui=is_mobile_ui)
 tab_single, tab_scan = st.tabs(["단일 종목 상세 예측", "유망 종목 빠른 보기"])
 
 with tab_single:
-    st.caption("Top100 리스트에서 종목코드를 몰라도 바로 고르고 예측할 수 있습니다.")
-    top_scope = st.radio("Top100 보기", ["전체", "국내", "해외"], horizontal=True, key="single_top_scope")
-    top_limit = st.slider("리스트 표시 개수", min_value=10, max_value=100, value=30, step=10, key="single_top_limit")
+    st.caption("Top100에서 검색해 바로 분석합니다. 화면 모드는 사이드바에서 전체 앱 기준으로 전환됩니다.")
+    mobile_mode = is_mobile_ui
+
+    if mobile_mode:
+        top_scope = st.radio("Top100 보기", ["전체", "국내", "해외"], horizontal=True, key="single_top_scope_mobile")
+        top_limit = st.slider("리스트 표시 개수", min_value=10, max_value=100, value=40, step=10, key="single_top_limit_mobile")
+        search_keyword = st.text_input("종목 검색", value="", placeholder="종목명 또는 심볼", key="single_search_mobile")
+        sort_mode = st.selectbox(
+            "정렬",
+            ["기본 순위", "전일대비 높은순", "전일대비 낮은순"],
+            index=0,
+            key="single_sort_mobile",
+        )
+    else:
+        ctrl_scope, ctrl_limit, ctrl_sort = st.columns([1.2, 1.0, 1.2])
+        top_scope = ctrl_scope.radio("Top100 보기", ["전체", "국내", "해외"], horizontal=True, key="single_top_scope_desktop")
+        top_limit = ctrl_limit.slider("리스트 표시", min_value=10, max_value=100, value=60, step=10, key="single_top_limit_desktop")
+        sort_mode = ctrl_sort.selectbox(
+            "정렬",
+            ["기본 순위", "전일대비 높은순", "전일대비 낮은순"],
+            index=0,
+            key="single_sort_desktop",
+        )
+        search_keyword = st.text_input("종목 검색", value="", placeholder="예: 삼성, NVDA, SOXL, 005930", key="single_search_desktop")
 
     if "single_quote_refresh_token" not in st.session_state:
         st.session_state["single_quote_refresh_token"] = 0
@@ -828,7 +969,7 @@ with tab_single:
         if st.button("시세 새로고침", key="single_quote_refresh_btn"):
             st.session_state["single_quote_refresh_token"] += 1
     with help_col:
-        st.caption("현재가/등락률은 Yahoo Finance의 실시간 또는 지연 시세를 사용합니다. (전일 정규장 종가 대비)")
+        st.caption("현재가/등락률은 Yahoo Finance 실시간 또는 지연 시세를 사용합니다. (전일 정규장 종가 대비)")
 
     with st.spinner("Top100 시세를 불러오는 중..."):
         top_rows, unresolved_single_names = resolve_single_top100_entries(scope=top_scope, display_limit=top_limit)
@@ -852,14 +993,38 @@ with tab_single:
         enriched["통화"] = snapshot.get("currency", default_currency_from_symbol(symbol) if symbol else "")
         snapshot_rows.append(enriched)
 
-    selection_options: Dict[str, Dict[str, str | int | float | None]] = {}
-    for row in snapshot_rows:
-        symbol = row.get("심볼")
-        if not symbol:
-            continue
-        label = f"#{int(row['순위'])} [{row['시장']}] {row['종목명']} ({symbol})"
-        selection_options[label] = row
+    filtered_rows = snapshot_rows
+    keyword = search_keyword.strip().lower()
+    if keyword:
+        filtered_rows = [
+            row
+            for row in filtered_rows
+            if keyword in str(row.get("종목명", "")).lower()
+            or keyword in str(row.get("심볼", "")).lower()
+            or keyword in str(row.get("시장", "")).lower()
+        ]
 
+    if sort_mode != "기본 순위":
+        if sort_mode == "전일대비 높은순":
+            filtered_rows = sorted(
+                filtered_rows,
+                key=lambda row: (
+                    not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
+                    -first_valid_float(row.get("전일대비(%)")),
+                ),
+            )
+        else:
+            filtered_rows = sorted(
+                filtered_rows,
+                key=lambda row: (
+                    not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
+                    first_valid_float(row.get("전일대비(%)")),
+                ),
+            )
+    else:
+        filtered_rows = sorted(filtered_rows, key=lambda row: int(row["순위"]))
+
+    selection_options = build_single_picker_options(filtered_rows)
     selected_top_row: Dict[str, str | int | float | None] | None = None
     if selection_options:
         if "single_top_pick" in st.session_state and st.session_state["single_top_pick"] not in selection_options:
@@ -871,21 +1036,36 @@ with tab_single:
         )
         selected_top_row = selection_options[selected_label]
     else:
-        st.warning("현재 Top100 목록에서 자동 해석된 심볼이 없어 바로 분석을 실행할 수 없습니다.")
+        st.warning("검색/필터 조건에 맞는 종목이 없거나 자동 해석된 심볼이 없습니다.")
+
+    if not mobile_mode:
+        st.dataframe(build_snapshot_view_df(filtered_rows), use_container_width=True, height=420, hide_index=True)
+        with st.expander("카드형 리스트 보기"):
+            render_top100_snapshot_cards(rows=filtered_rows)
+    else:
+        render_top100_snapshot_cards(rows=filtered_rows)
 
     if unresolved_single_names:
         with st.expander("심볼 자동 해석 실패 종목"):
             st.dataframe(pd.DataFrame({"종목명": unresolved_single_names}), use_container_width=True, hide_index=True)
 
-    render_top100_snapshot_cards(rows=snapshot_rows)
-
-    run_col_manual, run_col_top = st.columns(2)
-    run_single = run_col_manual.button("단일 종목 예측 실행", type="primary", key="single_run")
-    run_single_top = run_col_top.button(
-        "Top100 선택 종목 예측 실행",
-        key="single_run_top100",
-        disabled=selected_top_row is None,
-    )
+    if mobile_mode:
+        run_single_top = st.button(
+            "선택 종목 예측 실행",
+            key="single_run_top100_mobile",
+            type="primary",
+            disabled=selected_top_row is None,
+        )
+        run_single = st.button("사이드바 심볼로 예측 실행", key="single_run_mobile")
+    else:
+        run_col_top, run_col_manual = st.columns(2)
+        run_single_top = run_col_top.button(
+            "Top100 선택 종목 예측 실행",
+            key="single_run_top100",
+            type="primary",
+            disabled=selected_top_row is None,
+        )
+        run_single = run_col_manual.button("사이드바 심볼로 예측 실행", key="single_run")
 
     if run_single or run_single_top:
         try:
@@ -921,9 +1101,20 @@ with tab_single:
         else:
             if run_single_top and selected_top_row is not None:
                 st.caption(f"Top100 선택 분석: `{symbol}`")
-            render_single_result(result=single_result, forecast_days=forecast_days)
+            render_single_result(result=single_result, forecast_days=forecast_days, is_mobile_ui=is_mobile_ui)
     else:
-        st.write("사이드바 설정 후 **단일 종목 예측 실행** 또는 **Top100 선택 종목 예측 실행**을 눌러 주세요.")
+        st.write("사이드바 설정 후 **사이드바 심볼로 예측 실행** 또는 **Top100 선택 종목 예측 실행**을 눌러 주세요.")
+
+    with st.expander("원격 접속(Tailscale) 안내"):
+        st.markdown(
+            """
+            1. 이 PC와 원격 기기에 Tailscale을 설치하고 같은 Tailnet에 로그인합니다.
+            2. 서버 PC에서 앱 실행: `streamlit run app.py --server.address 0.0.0.0 --server.port 8501`
+            3. 서버 PC Tailscale IP 확인: `tailscale ip -4`
+            4. 원격 기기 브라우저에서 접속: `http://<TAILSCALE_IP>:8501`
+            5. 외부 공개 없이 Tailnet 내부에서만 접속되므로 원격 확인 용도로 안전합니다.
+            """
+        )
 
 with tab_scan:
     st.caption("이름으로 고른 Top100 후보와 직접 입력 심볼을 한 번에 분석해 유망도 순위를 보여줍니다.")
@@ -936,7 +1127,8 @@ with tab_scan:
             for entry in entries
         }
         option_labels = list(option_map.keys())
-        default_labels = option_labels[: min(20, len(option_labels))]
+        default_pick_count = 10 if is_mobile_ui else 20
+        default_labels = option_labels[: min(default_pick_count, len(option_labels))]
         selected_labels = st.multiselect(
             "Top100 종목 선택(이름 기준)",
             options=option_labels,
@@ -964,7 +1156,13 @@ with tab_scan:
         value="",
         key=f"extra_{asset_type}",
     )
-    top_n = st.slider("상위 카드 표시 개수", min_value=3, max_value=15, value=7, key="top_n")
+    top_n = st.slider(
+        "상위 카드 표시 개수",
+        min_value=3,
+        max_value=10 if is_mobile_ui else 15,
+        value=5 if is_mobile_ui else 7,
+        key="top_n",
+    )
     run_scan = st.button("유망 종목 스캔 실행", type="primary", key="scan_run")
 
     if run_scan:
@@ -1039,7 +1237,7 @@ with tab_scan:
                 top_df = summary.head(min(top_n, len(summary)))
 
                 st.subheader("유망 후보 카드")
-                card_cols = st.columns(min(3, len(top_df)))
+                card_cols = st.columns(min((1 if is_mobile_ui else 3), len(top_df)))
                 for i in range(len(top_df)):
                     row = top_df.iloc[i]
                     with card_cols[i % len(card_cols)]:
@@ -1065,7 +1263,7 @@ with tab_scan:
                 )
                 score_fig.update_layout(
                     title="상위 후보 유망도 점수",
-                    height=380,
+                    height=300 if is_mobile_ui else 380,
                     margin=dict(l=20, r=20, t=50, b=20),
                     yaxis_title="점수",
                     xaxis_title="종목",
