@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import re
 from typing import Dict, List, Tuple
 
@@ -265,6 +266,240 @@ def resolve_top100_entries(asset_type: str, entries: List[Dict[str, str | int | 
             unresolved.append(name)
 
     return resolved, unresolved
+
+
+def build_single_top100_entries(scope: str) -> List[Dict[str, str | int | None]]:
+    def pack(asset: str, market_label: str) -> List[Dict[str, str | int | None]]:
+        return [
+            {
+                "rank": int(entry["rank"]),
+                "name": str(entry["name"]),
+                "symbol_hint": entry.get("symbol_hint"),
+                "asset_type": asset,
+                "market_label": market_label,
+            }
+            for entry in build_top100_entries(asset_type=asset)
+        ]
+
+    kr_entries = pack("한국주식", "국내")
+    us_entries = pack("미국주식", "해외")
+
+    if scope == "국내":
+        selected = kr_entries
+    elif scope == "해외":
+        selected = us_entries
+    else:
+        selected: List[Dict[str, str | int | None]] = []
+        max_len = max(len(kr_entries), len(us_entries))
+        for idx in range(max_len):
+            if idx < len(kr_entries):
+                selected.append(kr_entries[idx])
+            if idx < len(us_entries):
+                selected.append(us_entries[idx])
+
+    output: List[Dict[str, str | int | None]] = []
+    for i, entry in enumerate(selected, start=1):
+        enriched = dict(entry)
+        enriched["display_rank"] = i
+        output.append(enriched)
+    return output
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def resolve_single_top100_entries(scope: str, display_limit: int) -> Tuple[List[Dict[str, str | int | None]], List[str]]:
+    entries = build_single_top100_entries(scope=scope)[: max(display_limit, 0)]
+    resolved_map: Dict[Tuple[str, str], str] = {}
+    unresolved_names: List[str] = []
+
+    for market in ("한국주식", "미국주식"):
+        market_entries = [entry for entry in entries if entry["asset_type"] == market]
+        if not market_entries:
+            continue
+
+        resolved_pairs, unresolved = resolve_top100_entries(asset_type=market, entries=market_entries)
+        for name, symbol in resolved_pairs:
+            resolved_map[(market, name)] = symbol
+
+        market_label = "국내" if market == "한국주식" else "해외"
+        unresolved_names.extend([f"[{market_label}] {name}" for name in unresolved])
+
+    rows: List[Dict[str, str | int | None]] = []
+    for entry in entries:
+        market = str(entry["asset_type"])
+        name = str(entry["name"])
+        symbol = resolved_map.get((market, name))
+        rows.append(
+            {
+                "순위": int(entry["display_rank"]),
+                "원순위": int(entry["rank"]),
+                "시장": str(entry["market_label"]),
+                "자산유형": market,
+                "종목명": name,
+                "심볼": symbol,
+                "심볼힌트": entry.get("symbol_hint"),
+            }
+        )
+    return rows, unresolved_names
+
+
+def first_valid_float(*values: object) -> float:
+    for value in values:
+        try:
+            number = float(value)
+        except Exception:
+            continue
+        if np.isfinite(number):
+            return number
+    return float("nan")
+
+
+def default_currency_from_symbol(symbol: str) -> str:
+    upper = symbol.upper()
+    if upper.endswith(".KS") or upper.endswith(".KQ"):
+        return "KRW"
+    if upper.endswith("-USD"):
+        return "USD"
+    return "USD"
+
+
+def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
+    ticker = yf.Ticker(symbol)
+    current_price = float("nan")
+    previous_close = float("nan")
+    currency = ""
+
+    try:
+        fast_info = ticker.fast_info or {}
+        current_price = first_valid_float(
+            fast_info.get("last_price"),
+            fast_info.get("regular_market_price"),
+            fast_info.get("lastPrice"),
+            fast_info.get("regularMarketPrice"),
+        )
+        previous_close = first_valid_float(
+            fast_info.get("previous_close"),
+            fast_info.get("previousClose"),
+        )
+        fast_currency = fast_info.get("currency")
+        if isinstance(fast_currency, str):
+            currency = fast_currency.upper().strip()
+    except Exception:
+        pass
+
+    if np.isnan(current_price) or np.isnan(previous_close) or not currency:
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+
+        if np.isnan(current_price):
+            current_price = first_valid_float(
+                info.get("regularMarketPrice"),
+                info.get("currentPrice"),
+                info.get("navPrice"),
+            )
+        if np.isnan(previous_close):
+            previous_close = first_valid_float(
+                info.get("previousClose"),
+                info.get("regularMarketPreviousClose"),
+                info.get("chartPreviousClose"),
+            )
+        if not currency:
+            info_currency = info.get("currency")
+            if isinstance(info_currency, str):
+                currency = info_currency.upper().strip()
+
+    if np.isnan(current_price) or np.isnan(previous_close):
+        try:
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+        except Exception:
+            hist = pd.DataFrame()
+
+        if not hist.empty and "Close" in hist.columns:
+            close_series = hist["Close"].dropna()
+            if not close_series.empty:
+                if np.isnan(current_price):
+                    current_price = float(close_series.iloc[-1])
+                if np.isnan(previous_close):
+                    if len(close_series) >= 2:
+                        previous_close = float(close_series.iloc[-2])
+                    else:
+                        previous_close = float(close_series.iloc[-1])
+
+    if not currency:
+        currency = default_currency_from_symbol(symbol)
+
+    change_pct = float("nan")
+    if np.isfinite(current_price) and np.isfinite(previous_close) and previous_close != 0:
+        change_pct = (current_price / previous_close - 1.0) * 100.0
+
+    return {
+        "symbol": symbol,
+        "currency": currency,
+        "current_price": float(current_price) if np.isfinite(current_price) else float("nan"),
+        "previous_close": float(previous_close) if np.isfinite(previous_close) else float("nan"),
+        "change_pct": float(change_pct) if np.isfinite(change_pct) else float("nan"),
+    }
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_quote_snapshots(symbols: Tuple[str, ...], refresh_token: int) -> Dict[str, Dict[str, float | str]]:
+    _ = refresh_token
+    snapshots: Dict[str, Dict[str, float | str]] = {}
+    for symbol in symbols:
+        snapshots[symbol] = fetch_single_quote_snapshot(symbol=symbol)
+    return snapshots
+
+
+def format_live_price(value: float, currency: str) -> str:
+    if not np.isfinite(value):
+        return "N/A"
+    if currency in {"KRW", "JPY"}:
+        return f"{value:,.0f} {currency}"
+    return f"{value:,.2f} {currency}"
+
+
+def render_top100_snapshot_cards(rows: List[Dict[str, str | int | float | None]]) -> None:
+    for row in rows:
+        rank = int(row["순위"])
+        market = html.escape(str(row["시장"]))
+        name = html.escape(str(row["종목명"]))
+        symbol = html.escape(str(row["심볼"] or "-"))
+        currency = str(row.get("통화", "USD"))
+        current_price = float(row.get("현재가", float("nan")))
+        change_pct = float(row.get("전일대비(%)", float("nan")))
+
+        price_text = format_live_price(value=current_price, currency=currency)
+        if np.isfinite(change_pct):
+            change_text = f"{change_pct:+.2f}%"
+            if change_pct > 0:
+                change_color = "#ef4444"
+            elif change_pct < 0:
+                change_color = "#3b82f6"
+            else:
+                change_color = "#9ca3af"
+        else:
+            change_text = "N/A"
+            change_color = "#9ca3af"
+
+        st.markdown(
+            f"""
+            <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border:1px solid #2b2f39;border-radius:10px;margin-bottom:8px;background:#10151f;">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <div style="font-size:20px;font-weight:700;color:#3b82f6;min-width:28px;">{rank}</div>
+                <div>
+                  <div style="font-size:17px;font-weight:700;color:#f8fafc;line-height:1.15;">{name}</div>
+                  <div style="font-size:13px;color:#94a3b8;">{market} · {symbol}</div>
+                </div>
+              </div>
+              <div style="text-align:right;">
+                <div style="font-size:16px;font-weight:700;color:#f8fafc;">{price_text}</div>
+                <div style="font-size:14px;font-weight:700;color:{change_color};">{change_text}</div>
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
@@ -581,10 +816,87 @@ with st.sidebar:
 tab_single, tab_scan = st.tabs(["단일 종목 상세 예측", "유망 종목 빠른 보기"])
 
 with tab_single:
-    run_single = st.button("단일 종목 예측 실행", type="primary", key="single_run")
-    if run_single:
+    st.caption("Top100 리스트에서 종목코드를 몰라도 바로 고르고 예측할 수 있습니다.")
+    top_scope = st.radio("Top100 보기", ["전체", "국내", "해외"], horizontal=True, key="single_top_scope")
+    top_limit = st.slider("리스트 표시 개수", min_value=10, max_value=100, value=30, step=10, key="single_top_limit")
+
+    if "single_quote_refresh_token" not in st.session_state:
+        st.session_state["single_quote_refresh_token"] = 0
+
+    refresh_col, help_col = st.columns([1, 3])
+    with refresh_col:
+        if st.button("시세 새로고침", key="single_quote_refresh_btn"):
+            st.session_state["single_quote_refresh_token"] += 1
+    with help_col:
+        st.caption("현재가/등락률은 Yahoo Finance의 실시간 또는 지연 시세를 사용합니다. (전일 정규장 종가 대비)")
+
+    with st.spinner("Top100 시세를 불러오는 중..."):
+        top_rows, unresolved_single_names = resolve_single_top100_entries(scope=top_scope, display_limit=top_limit)
+        quote_symbols = tuple(str(row["심볼"]) for row in top_rows if row["심볼"])
+        quote_snapshots = (
+            fetch_quote_snapshots(
+                symbols=quote_symbols,
+                refresh_token=int(st.session_state["single_quote_refresh_token"]),
+            )
+            if quote_symbols
+            else {}
+        )
+
+    snapshot_rows: List[Dict[str, str | int | float | None]] = []
+    for row in top_rows:
+        symbol = str(row["심볼"]) if row["심볼"] else ""
+        snapshot = quote_snapshots.get(symbol, {})
+        enriched = dict(row)
+        enriched["현재가"] = snapshot.get("current_price", float("nan"))
+        enriched["전일대비(%)"] = snapshot.get("change_pct", float("nan"))
+        enriched["통화"] = snapshot.get("currency", default_currency_from_symbol(symbol) if symbol else "")
+        snapshot_rows.append(enriched)
+
+    selection_options: Dict[str, Dict[str, str | int | float | None]] = {}
+    for row in snapshot_rows:
+        symbol = row.get("심볼")
+        if not symbol:
+            continue
+        label = f"#{int(row['순위'])} [{row['시장']}] {row['종목명']} ({symbol})"
+        selection_options[label] = row
+
+    selected_top_row: Dict[str, str | int | float | None] | None = None
+    if selection_options:
+        selected_label = st.selectbox(
+            "Top100에서 바로 분석할 종목",
+            options=list(selection_options.keys()),
+            key="single_top_pick",
+        )
+        selected_top_row = selection_options[selected_label]
+    else:
+        st.warning("현재 Top100 목록에서 자동 해석된 심볼이 없어 바로 분석을 실행할 수 없습니다.")
+
+    if unresolved_single_names:
+        with st.expander("심볼 자동 해석 실패 종목"):
+            st.dataframe(pd.DataFrame({"종목명": unresolved_single_names}), use_container_width=True, hide_index=True)
+
+    render_top100_snapshot_cards(rows=snapshot_rows)
+
+    run_col_manual, run_col_top = st.columns(2)
+    run_single = run_col_manual.button("단일 종목 예측 실행", type="primary", key="single_run")
+    run_single_top = run_col_top.button(
+        "Top100 선택 종목 예측 실행",
+        key="single_run_top100",
+        disabled=selected_top_row is None,
+    )
+
+    if run_single or run_single_top:
         try:
-            symbol = normalize_symbol(asset_type=asset_type, raw_symbol=raw_symbol, korea_market=korea_market)
+            if run_single_top and selected_top_row is not None:
+                run_asset_type = str(selected_top_row["자산유형"])
+                run_raw_symbol = str(selected_top_row["심볼"])
+                run_korea_market = "KOSDAQ" if run_raw_symbol.endswith(".KQ") else "KOSPI"
+            else:
+                run_asset_type = asset_type
+                run_raw_symbol = raw_symbol
+                run_korea_market = korea_market
+
+            symbol = normalize_symbol(asset_type=run_asset_type, raw_symbol=run_raw_symbol, korea_market=run_korea_market)
             with st.spinner(f"{symbol} 데이터를 불러오고 모델을 학습하는 중..."):
                 single_result = run_cached(
                     symbol=symbol,
@@ -605,9 +917,11 @@ with tab_single:
         except Exception as exc:
             st.error(f"실행 중 오류: {exc}")
         else:
+            if run_single_top and selected_top_row is not None:
+                st.caption(f"Top100 선택 분석: `{symbol}`")
             render_single_result(result=single_result, forecast_days=forecast_days)
     else:
-        st.write("사이드바에서 설정 후 **단일 종목 예측 실행**을 눌러 주세요.")
+        st.write("사이드바 설정 후 **단일 종목 예측 실행** 또는 **Top100 선택 종목 예측 실행**을 눌러 주세요.")
 
 with tab_scan:
     st.caption("이름으로 고른 Top100 후보와 직접 입력 심볼을 한 번에 분석해 유망도 순위를 보여줍니다.")
