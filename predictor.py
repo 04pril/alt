@@ -3,11 +3,13 @@ from __future__ import annotations
 import contextlib
 import io
 import logging
+import ast
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 from sklearn.base import clone
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
@@ -21,6 +23,7 @@ MIN_TRAIN_DAYS = 120
 MIN_VAL_DAYS = 20
 MIN_TEST_DAYS = 20
 MIN_HOLDOUT_DAYS = 20
+NAVER_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
 def quiet_external_call(fn):
@@ -68,9 +71,76 @@ def normalize_symbol(asset_type: str, raw_symbol: str, korea_market: str = "KOSP
     return symbol
 
 
+def is_korean_stock_symbol(symbol: str) -> bool:
+    upper = symbol.strip().upper()
+    return upper.endswith(".KS") or upper.endswith(".KQ")
+
+
+def extract_korean_stock_code(symbol: str) -> str:
+    upper = symbol.strip().upper()
+    if upper.endswith(".KS") or upper.endswith(".KQ"):
+        return upper[:-3]
+    if upper.isdigit() and len(upper) == 6:
+        return upper
+    raise ValueError(f"한국주식 코드 형식이 아닙니다: {symbol}")
+
+
+def download_kr_price_data(symbol: str, years: int) -> pd.DataFrame:
+    code = extract_korean_stock_code(symbol)
+    end = pd.Timestamp.now(tz="Asia/Seoul").normalize()
+    start = end - pd.DateOffset(years=years, days=10)
+    url = (
+        "https://fchart.stock.naver.com/siseJson.nhn"
+        f"?symbol={code}&requestType=1&startTime={start:%Y%m%d}&endTime={end:%Y%m%d}&timeframe=day"
+    )
+    response = requests.get(url, headers=NAVER_HEADERS, timeout=20)
+    response.raise_for_status()
+    try:
+        payload = ast.literal_eval(response.text.strip())
+    except Exception as exc:
+        raise ValueError("네이버 금융 일봉 데이터를 파싱하지 못했습니다.") from exc
+
+    if not isinstance(payload, list) or len(payload) <= 1:
+        raise ValueError("네이버 금융 일봉 데이터가 비어 있습니다.")
+
+    rows = []
+    for item in payload[1:]:
+        if not isinstance(item, list) or len(item) < 6:
+            continue
+        try:
+            rows.append(
+                {
+                    "Date": pd.to_datetime(str(item[0]), format="%Y%m%d"),
+                    "Open": float(item[1]),
+                    "High": float(item[2]),
+                    "Low": float(item[3]),
+                    "Close": float(item[4]),
+                    "Volume": float(item[5]),
+                }
+            )
+        except Exception:
+            continue
+
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        raise ValueError("네이버 금융 일봉 데이터가 비어 있습니다.")
+
+    frame = frame.set_index("Date").sort_index()
+    frame = frame[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    if frame.empty:
+        raise ValueError("유효한 한국주식 OHLCV 데이터가 없습니다.")
+    return frame
+
+
 def download_price_data(symbol: str, years: int = 5) -> pd.DataFrame:
     if years < 1:
         raise ValueError("조회 기간(years)은 1 이상이어야 합니다.")
+
+    if is_korean_stock_symbol(symbol):
+        try:
+            return download_kr_price_data(symbol=symbol, years=years)
+        except Exception:
+            pass
 
     frame = quiet_external_call(
         lambda: yf.download(
