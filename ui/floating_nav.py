@@ -685,8 +685,8 @@ def theme_tokens(theme_mode: str) -> dict[str, str]:
         "chip": chip,
         "chip_hover": chip_hover,
         "shadow": shadow,
-        "top_offset": "0.42rem",
-        "top_offset_mobile": "0.28rem",
+        "top_offset": "0.58rem",
+        "top_offset_mobile": "0.42rem",
     }
 
 
