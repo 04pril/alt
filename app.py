@@ -207,7 +207,9 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
         code = str(row["code"]).strip()
         payload = {"market": market, "code": code}
         out.setdefault(name, payload)
-        out.setdefault(normalize_kr_name_key(name), payload)
+        normalized_key = normalize_kr_name_key(name)
+        if normalized_key:
+            out.setdefault(normalized_key, payload)
     return out
 
 
@@ -256,7 +258,11 @@ def resolve_kr_name_to_symbol(name: str) -> str | None:
 
     name_map = load_krx_name_map()
     for candidate in candidate_names:
-        for key in [candidate, normalize_kr_name_key(candidate)]:
+        keys = [candidate]
+        normalized_key = normalize_kr_name_key(candidate)
+        if normalized_key:
+            keys.append(normalized_key)
+        for key in keys:
             if key in name_map:
                 code = name_map[key]["code"]
                 market = name_map[key]["market"]
