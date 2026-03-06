@@ -106,7 +106,7 @@ _FLOATING_NAV_CSS = """
   gap: 0.34rem;
   min-height: 2.86rem;
   max-width: min(860px, calc(100vw - 1.4rem));
-  padding: 0.24rem 0.32rem 0.24rem 0.98rem;
+  padding: 0.24rem 0.18rem 0.24rem 1.16rem;
   border-radius: 999px;
   background:
     linear-gradient(135deg, var(--alt-nav-surface, rgba(15, 23, 42, 0.92)), var(--alt-nav-surface-2, rgba(30, 41, 59, 0.82))),
@@ -319,7 +319,7 @@ _FLOATING_NAV_CSS = """
 @media (max-width: 1024px) {
   .alt-floating-nav-shell {
     min-height: 2.72rem;
-    padding: 0.22rem 0.26rem 0.22rem 0.84rem;
+    padding: 0.22rem 0.14rem 0.22rem 1rem;
   }
 
   .alt-floating-nav-track {
@@ -342,7 +342,7 @@ _FLOATING_NAV_CSS = """
   .alt-floating-nav-shell {
     gap: 0.24rem;
     min-height: 2.5rem;
-    padding: 0.18rem 0.18rem 0.18rem 0.64rem;
+    padding: 0.18rem 0.1rem 0.18rem 0.8rem;
     border-radius: 1.05rem;
   }
 
