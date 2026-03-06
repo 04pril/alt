@@ -48,6 +48,32 @@ def _localize_timestamp_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return localized
 
 
+def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for asset_type, schedule in settings.asset_schedules.items():
+        universe = settings.universes.get(asset_type)
+        watchlist = list(universe.watchlist) if universe else []
+        top_universe = list(universe.top_universe) if universe else []
+        rows.append(
+            {
+                "자산유형": asset_type,
+                "타임프레임": schedule.timeframe,
+                "세션모드": schedule.session_mode,
+                "시간대": schedule.timezone,
+                "스캔주기(분)": schedule.scan_interval_minutes,
+                "진입주기(분)": schedule.entry_interval_minutes,
+                "청산주기(분)": schedule.exit_interval_minutes,
+                "Watchlist 개수": len(watchlist),
+                "Top Universe 개수": len(top_universe),
+                "대표 심볼": ", ".join((watchlist or top_universe)[:4]),
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    return frame.sort_values("자산유형").reset_index(drop=True)
+
+
 def compute_auto_trading_status(
     repository: TradingRepository,
     loop_sleep_seconds: int,
@@ -81,9 +107,9 @@ def compute_auto_trading_status(
             "state": "stopped",
             "label": "Stopped",
             "heartbeat_at": heartbeat_at.isoformat().replace("+00:00", "Z"),
-            "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S KST"),
+            "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S"),
             "heartbeat_age_seconds": heartbeat_age_seconds,
-            "reason": f"마지막 heartbeat는 {heartbeat_at_kst.strftime('%Y-%m-%d %H:%M:%S KST')} 입니다.",
+            "reason": f"마지막 heartbeat는 {heartbeat_at_kst.strftime('%Y-%m-%d %H:%M:%S')} 입니다.",
             "source": heartbeat_source,
         }
 
@@ -92,7 +118,7 @@ def compute_auto_trading_status(
             "state": "paused",
             "label": "Paused",
             "heartbeat_at": heartbeat_at.isoformat().replace("+00:00", "Z"),
-            "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S KST"),
+            "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S"),
             "heartbeat_age_seconds": heartbeat_age_seconds,
             "reason": "신규 진입이 일시 중단된 상태입니다.",
             "source": heartbeat_source,
@@ -102,7 +128,7 @@ def compute_auto_trading_status(
         "state": "running",
         "label": "Running",
         "heartbeat_at": heartbeat_at.isoformat().replace("+00:00", "Z"),
-        "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S KST"),
+        "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S"),
         "heartbeat_age_seconds": heartbeat_age_seconds,
         "reason": "worker heartbeat가 정상입니다.",
         "source": heartbeat_source,
@@ -120,6 +146,7 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "open_positions": _localize_timestamp_columns(repository.open_positions()),
         "open_orders": _localize_timestamp_columns(repository.open_orders()),
         "candidate_scans": _localize_timestamp_columns(repository.latest_candidates(limit=100)),
+        "asset_overview": build_asset_overview(settings),
         "equity_curve": equity_curve.sort_values("created_at") if not equity_curve.empty else pd.DataFrame(),
         "job_health": _localize_timestamp_columns(repository.recent_job_health(limit=50)),
         "recent_errors": _localize_timestamp_columns(repository.recent_system_events(level="ERROR", limit=50)),

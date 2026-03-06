@@ -12,6 +12,28 @@
 - 예측 레코드는 append-only로 저장하고, outcome/evaluation은 만기 후 별도 확정합니다.
 - 예측 정확도와 매매 성과는 분리 저장/표시합니다.
 
+최소 환경:
+
+- Python 3.14
+- Streamlit `>=1.55.0`
+
+## Navigation Architecture
+
+- 엔트리포인트 `app.py`는 `st.Page + st.navigation(position="hidden")`를 사용합니다.
+- 상단 내비게이션은 `ui/floating_nav.py`의 `st.components.v2.component(...)` 기반 custom shell 입니다.
+- component는 클릭된 page key만 Python으로 반환하고, 실제 라우팅은 `st.switch_page(...)`로 처리합니다.
+- 기존 `components.html`, parent DOM 주입, query param 기반 임시 라우팅은 제거했습니다.
+- custom component 실패 시 fallback은 다음 순서입니다.
+  1. `st.segmented_control`
+  2. `st.page_link`
+
+`.streamlit/config.toml`:
+
+- `client.toolbarMode = "minimal"`을 사용합니다.
+- 이유: 기본 툴바 크롬은 줄이고, 사이드바 열기 버튼만 유지한 채 floating nav가 상단을 차지하도록 하기 위해서입니다.
+- 상단 floating nav 오른쪽에는 해/달 토글이 있으며, 내부적으로 `theme.base`를 전환해 Streamlit 위젯 theme와 최대한 같은 로직으로 움직이게 합니다.
+- 개발 중 Streamlit 기본 도구가 더 필요하면 로컬에서 이 값을 바꿔도 됩니다.
+
 ## 현재 코드 기준 누락 요소와 이번 구현 범위
 
 기존 누락:
@@ -295,6 +317,12 @@ WantedBy=multi-user.target
 - 미국/한국주식은 `pre-close proxy fill` 가정이라 실제 MOC 체결과 다를 수 있습니다.
 - 코인 `1h` 데이터는 bar close 기준이며, 초단타 타이밍 시스템이 아닙니다.
 - worker는 단일 프로세스 기준입니다. 다중 worker를 돌리면 DB lock 충돌이 생길 수 있습니다.
+
+## Known Limitations
+
+- floating nav는 Streamlit 공식 라우팅 위에 얹는 UI 셸이므로, component 자체가 실패하면 fallback UI로 내려갑니다.
+- custom nav의 scroll hide/show는 브라우저 스크롤 이벤트 기반이라, 일부 임베디드 환경에서는 동작이 다를 수 있습니다.
+- 현재 페이지 함수는 `app.py` 안의 callable closure 형태라서, view 수가 더 늘어나면 별도 `pages/` 모듈로 다시 쪼개는 편이 낫습니다.
 
 ## 향후 바로 확장 가능한 것
 

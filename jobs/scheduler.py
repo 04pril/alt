@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config.settings import load_settings
@@ -19,6 +19,10 @@ from jobs.tasks import (
 from storage.repository import utc_now_iso
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _bucket_key(dt: datetime, minutes: int) -> str:
     bucket = (dt.minute // max(minutes, 1)) * max(minutes, 1)
     rounded = dt.replace(minute=bucket, second=0, microsecond=0)
@@ -29,7 +33,7 @@ def _run_guarded(context, job_name: str, run_key: str, fn):
     job_run_id = context.repository.begin_job_run(
         job_name=job_name,
         run_key=run_key,
-        scheduled_at=datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        scheduled_at=_utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         lock_owner=context.settings.scheduler.lock_owner,
     )
     if job_run_id is None:
@@ -65,25 +69,25 @@ def run_once(settings_path: str | None = None) -> None:
     _run_guarded(
         context,
         job_name="exit_management",
-        run_key=_bucket_key(datetime.utcnow(), 15),
+        run_key=_bucket_key(_utc_now(), 15),
         fn=lambda: exit_management_job(context),
     )
     _run_guarded(
         context,
         job_name="outcome_resolution",
-        run_key=_bucket_key(datetime.utcnow(), 60),
+        run_key=_bucket_key(_utc_now(), 60),
         fn=lambda: outcome_resolution_job(context),
     )
     _run_guarded(
         context,
         job_name="daily_report",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(_utc_now().date()),
         fn=lambda: daily_report_job(context),
     )
     _run_guarded(
         context,
         job_name="retrain_check",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(_utc_now().date()),
         fn=lambda: retrain_check_job(context),
     )
 

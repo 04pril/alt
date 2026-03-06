@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from config.settings import RuntimeSettings
-from monitoring.dashboard_hooks import compute_auto_trading_status, load_dashboard_data
+from monitoring.dashboard_hooks import build_asset_overview, compute_auto_trading_status, load_dashboard_data
 from storage.repository import TradingRepository
 
 
@@ -43,6 +43,14 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("job_health", data)
             self.assertIn("recent_errors", data)
             self.assertIn("auto_trading_status", data)
+            self.assertIn("asset_overview", data)
+
+    def test_asset_overview_contains_all_asset_types(self) -> None:
+        settings = RuntimeSettings()
+        overview = build_asset_overview(settings)
+        self.assertFalse(overview.empty)
+        self.assertEqual(set(overview["자산유형"]), {"코인", "미국주식", "한국주식"})
+        self.assertIn("대표 심볼", overview.columns)
 
     def test_auto_trading_status_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -52,7 +60,7 @@ class DashboardHooksTest(unittest.TestCase):
             self._insert_job_heartbeat(repo, (now - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"))
             status = compute_auto_trading_status(repo, loop_sleep_seconds=30, now=now)
             self.assertEqual(status["label"], "Running")
-            self.assertIn("KST", status["heartbeat_at_kst"])
+            self.assertEqual(status["heartbeat_at_kst"], "2026-03-06 20:59:30")
 
     def test_auto_trading_status_uses_worker_heartbeat_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
