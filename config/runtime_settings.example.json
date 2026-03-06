@@ -1,0 +1,38 @@
+{
+  "storage": {
+    "db_path": ".runtime/paper_trading.sqlite3"
+  },
+  "scheduler": {
+    "loop_sleep_seconds": 30,
+    "retry_backoff_seconds": 30,
+    "max_retry_count": 3,
+    "lock_owner": "paper-worker"
+  },
+  "strategy": {
+    "strategy_version": "paper_strategy_v1",
+    "validation_mode": "holdout",
+    "target_mode": "return",
+    "trade_mode": "close_to_close",
+    "retrain_every_bars": 5,
+    "test_bars": 60,
+    "validation_bars": 40,
+    "final_holdout_bars": 40,
+    "purge_bars": 2,
+    "embargo_bars": 1,
+    "round_trip_cost_bps": 8.0,
+    "min_signal_strength_pct": 0.4,
+    "min_expected_return_pct": 0.8,
+    "min_confidence": 0.55,
+    "max_expected_risk_pct": 4.0,
+    "max_cost_bps": 25.0,
+    "score_decay_exit_threshold": 0.2,
+    "trailing_stop_atr_mult": 1.0,
+    "stop_loss_atr_mult": 1.5,
+    "take_profit_atr_mult": 3.0,
+    "max_holding_bars": 5,
+    "time_stop_bars": 3,
+    "allow_short": false,
+    "target_daily_vol_pct": 1.0,
+    "max_position_size": 1.0
+  }
+}

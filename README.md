@@ -1,89 +1,304 @@
-# 멀티마켓 가격 예측 프로그램
+# 멀티마켓 예측 + 24/7 Paper Trading
 
-코인, 미국주식, 한국주식을 하나의 UI에서 선택해 예측하는 `Streamlit` 앱입니다.
+이 저장소는 두 계층으로 나뉩니다.
 
-- 데이터 소스: `Yahoo Finance` (인터넷 연결 필요)
-- 예측 방식: `Ridge + RandomForest + GradientBoosting` 앙상블
-- 출력:
-  - 단일 종목 상세 예측(성능/차트/미래 테이블)
-  - 이름 기반 Top100 선택(국내/해외)
-  - 연구구간 vs 최종 홀드아웃 성능 비교
-  - Validation 구간(가중치 산출 전용) 성능 별도 표시
-  - 실전 가정 백테스트(다음날 시가 체결 + 비용 반영)
-  - 변동성 레짐(저/중/고)별 성과 분해
-  - 유망 종목 빠른 보기(여러 종목 스캔 + 점수 순위)
+- `predictor.py`: 연구/검증/백테스트용 signal engine
+- `services/`, `storage/`, `jobs/`: 24/7 background paper trading 운영 계층
 
-## 1) 설치
+중요 원칙:
+
+- `predictor.py`의 검증 로직은 유지하고, 운영 계층이 감싸서 사용합니다.
+- Streamlit은 거래 루프를 돌리지 않습니다.
+- 예측 레코드는 append-only로 저장하고, outcome/evaluation은 만기 후 별도 확정합니다.
+- 예측 정확도와 매매 성과는 분리 저장/표시합니다.
+
+## 현재 코드 기준 누락 요소와 이번 구현 범위
+
+기존 누락:
+
+- worker/service/process 계층 부재
+- 시장시간/휴장일/자산군별 실행 주기 분리 부재
+- candidate scan, job_runs, system_events, control_flags 부재
+- 내부 paper broker 부재
+- 재시작 복구 가능한 주문/포지션 라이프사이클 부재
+- 배치 재학습 파이프라인 부재
+
+이번 구현:
+
+- `predictor.py` 재사용형 `run_forecast_on_price_data(...)`
+- `storage/repository.py` SQLite 운영 저장소
+- `services/*` 운영 모듈
+- `jobs/scheduler.py` 별도 worker 루프
+- `monitoring/dashboard_hooks.py` 읽기 전용 대시보드 reader
+- `scripts/init_runtime.py` 초기화 코드
+- `tests/*` 기본 테스트
+
+## 최종 아키텍처
+
+```text
+Market Data -> Universe Scanner -> Signal Engine(predictor wrapper) -> Candidate Scans
+                                                             |
+                                                             v
+                                                    Prediction Ledger
+
+Candidate Scans -> Risk Engine -> Paper Broker -> Orders -> Fills -> Positions
+                                                \-> Account Snapshots
+
+Unresolved Predictions -> Outcome Resolver -> Outcomes -> Evaluations
+
+Evaluations + Account Snapshots + Job Runs + System Events
+    -> Monitoring Dashboard Hooks
+    -> Daily Reports
+    -> Retrainer(weekly/monthly)
+```
+
+## 디렉터리 구조
+
+```text
+config/
+  settings.py
+  runtime_settings.example.json
+jobs/
+  scheduler.py
+  tasks.py
+monitoring/
+  dashboard_hooks.py
+scripts/
+  init_runtime.py
+services/
+  market_data_service.py
+  universe_scanner.py
+  signal_engine.py
+  risk_engine.py
+  portfolio_manager.py
+  paper_broker.py
+  outcome_resolver.py
+  evaluator.py
+  retrainer.py
+storage/
+  models.py
+  repository.py
+tests/
+  test_repository.py
+  test_risk_engine.py
+  test_dashboard_hooks.py
+predictor.py
+app.py
+```
+
+## DB 스키마
+
+운영 DB는 `config/settings.py`의 `storage.db_path`를 사용합니다. 기본값은 `.runtime/paper_trading.sqlite3` 입니다.
+
+필수 테이블:
+
+- `predictions`
+- `outcomes`
+- `evaluations`
+- `candidate_scans`
+- `orders`
+- `fills`
+- `positions`
+- `account_snapshots`
+- `model_registry`
+- `retrain_runs`
+- `job_runs`
+- `system_events`
+
+추가 테이블:
+
+- `control_flags`
+
+각 테이블은 최소한 아래를 저장합니다.
+
+- timestamps: `created_at`, `updated_at`, `resolved_at`, `finished_at`
+- symbol / asset_type / timeframe
+- model_version / feature_version / strategy_version
+- signal / score / confidence / threshold
+- expected_return / expected_risk / position_size
+- order status / fill price / fees / slippage
+- pnl / drawdown / exposure
+- error message / retry count / job status
+
+## 설정 파일 예시
+
+기본 설정은 코드에 내장되어 있고, 선택적으로 `config/runtime_settings.json`으로 override 할 수 있습니다.
+
+생성:
+
+```bash
+python scripts/init_runtime.py
+```
+
+예시 파일:
+
+- [config/runtime_settings.example.json](C:/Users/admin/Desktop/develop/codex/config/runtime_settings.example.json)
+
+핵심 가정:
+
+- 코인: `1h` bar, 24/7, bar close 기준 진입/청산
+- 미국주식/한국주식: `1d` predictor 유지, `pre-close` 윈도우에서 paper MOC proxy로 진입
+- 휴장일: `holidays` 패키지 기반 국가 휴일 + 주말
+- 반일장/특수 휴장일은 완전 정밀하게 모델링하지 않음
+
+## 운영 로직
+
+### 1) 후보 스캔
+
+- `watchlist + top_universe`를 주기적으로 스캔
+- 최소 히스토리 길이, 결측, 이상치, 유동성 검사
+- 기대수익, confidence, 비용, 변동성, 최근 성능으로 score 계산
+- 보유 중 / cooldown 종목은 scan row에 표시
+
+### 2) 진입 규칙
+
+- `min_expected_return_pct`
+- `min_confidence`
+- `max_expected_risk_pct`
+- `max_cost_bps`
+- 시장 open 필요
+- `max_open_positions`
+- `max_daily_new_entries`
+- `symbol_max_weight`
+- `asset_type_max_weight`
+- `max_same_direction_correlation`
+- `daily_loss_limit_pct`
+- `max_drawdown_limit_pct`
+
+### 3) 청산 규칙
+
+- stop loss
+- take profit
+- trailing stop
+- time stop
+- opposite signal exit
+- score decay exit
+
+### 4) 리스크 관리
+
+- 종목당 risk budget
+- 자산군별 risk budget
+- 계좌 총 risk budget
+- 일일 손실 한도
+- 최대 드로우다운 도달 시 신규 진입 중단
+
+### 5) 스케줄링
+
+- `scan job`
+- `entry decision job`
+- `exit management job`
+- `outcome resolution job`
+- `daily report job`
+- `retrain check job`
+
+각 job은:
+
+- `job_runs` 기반 idempotent run key 사용
+- 중복 실행 방지
+- 실패 시 error log 기록
+
+## 로컬 실행 방법
+
+설치:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 2) 실행
+초기화:
+
+```bash
+python scripts/init_runtime.py
+```
+
+DB만 초기화:
+
+```bash
+python -m jobs.scheduler --init-db
+```
+
+worker 1회 실행:
+
+```bash
+python -m jobs.scheduler --once
+```
+
+worker 루프 실행:
+
+```bash
+python -m jobs.scheduler
+```
+
+기존 Streamlit 앱:
 
 ```bash
 python -m streamlit run app.py
 ```
 
-실행 후 브라우저에서 앱이 열립니다.
+주의:
 
-## 3) 심볼 입력 예시
+- worker는 Streamlit과 분리된 별도 프로세스로 띄워야 합니다.
+- app은 read-only 모니터링 용도로 같은 DB를 읽는 구조를 전제로 합니다.
 
-- 코인: `BTC-USD`, `ETH-USD`, `SOL-USD`
-- 미국주식: `AAPL`, `NVDA`, `MSFT`
-- 한국주식:
-  - `005930` 처럼 6자리 숫자 입력 시 자동으로 `.KS`(KOSPI) / `.KQ`(KOSDAQ) 부여
-  - 이미 접미사가 있으면 그대로 사용 (`005930.KS`)
+## 테스트
 
-## 4) 화면에서 보는 값
+```bash
+python -m unittest discover -s tests -v
+```
 
-- 최근 종가
-- 내일 예측 종가
-- N일 기대 수익률
-- 실전 가정 백테스트 지표
-  - `승률(%)`, `기대값/거래(%)`, `누적수익률(%)`, `최대낙폭(%)`, `ProfitFactor`
-- 모델 성능
-  - `Baseline(RandomWalk)` 포함 비교
-  - `MAE`: 평균 절대 오차 (낮을수록 좋음)
-  - `MAPE(%)`: 평균 절대 백분율 오차 (낮을수록 좋음)
-  - `방향정확도(%)`: 상승/하락 방향을 맞춘 비율 (높을수록 좋음)
-- 구간 분리 성능
-  - `연구구간`(모델/규칙 탐색용)과 `최종 홀드아웃`(최종 점검용) 성능을 분리 표시
-- 레짐 분해 성능
-  - 변동성 구간(`LowVol`, `MidVol`, `HighVol`)별 승률/기대값/낙폭 확인
+## 운영 섹션
 
-## 5) 유망 종목 빠른 보기
+### pause / resume
 
-- 기본 후보를 여러 개 선택하고 한 번에 스캔할 수 있습니다.
-- 국내/해외는 `Top100 종목 선택(이름 기준)`에서 종목명을 직접 고를 수 있습니다.
-  - 종목코드를 몰라도 이름으로 선택 가능
-  - 자동 매핑 실패 종목은 별도 목록으로 안내
-  - 자동 매핑이 안 되는 일부 ETN/신규종목은 심볼 직접 입력으로 보완
-- 추가 심볼을 직접 입력해 함께 스캔할 수 있습니다.
-- 결과는 `유망도점수` 기준으로 정렬됩니다.
-  - 방향정확도, 예측 수익률, 오차, 거래기대값/낙폭을 함께 반영
+`control_flags.trading_paused`를 사용합니다.
 
-## 6) 검증/체결/분리 설정
+초기값:
 
-- `예측 타깃`:
-  - `수익률(return)` 또는 `가격(price)` 선택 가능 (기본: 수익률)
-- 검증 모드:
-  - `빠름(홀드아웃)`: 최근 구간을 테스트셋으로 분리해 평가
-  - `엄격(워크포워드 라이트)`: 테스트 구간에서 주기적으로 재학습하며 순차 평가
-- `Validation(가중치 산출) 일수`:
-  - 앙상블 가중치와 신호 임계값을 이 구간에서만 결정
-- `최종 홀드아웃(일)`:
-  - 연구구간과 완전히 분리해 마지막에만 성능 점검하는 구간
-- `Purging 일수` / `Embargo 일수`:
-  - 학습-평가 경계 주변 구간을 비워 누출 가능성을 줄이는 보수적 설정
-- `왕복 거래비용 가정(bps)`:
-  - 수수료/슬리피지/스프레드를 단일 비용으로 보수적으로 반영
-- `숏(공매도) 허용`:
-  - OFF면 `LONG/FLAT`만 사용
-- `최소 신호 강도(%)`:
-  - 약한 신호는 거래하지 않도록 하여 과도한 회전 억제
+- `0`: 신규 진입 허용
+- `1`: 신규 진입 중단
 
-## 7) 주의사항
+현재 구현에서는 DB flag를 기준으로 entry job이 차단됩니다.
 
-이 프로그램은 테스트/연구용입니다.  
-어떤 모델도 미래 가격을 보장하지 않으며, 실제 투자 의사결정에는 추가 검증이 필요합니다.
+### 재시작 복구
+
+- 주문, 포지션, 계좌 스냅샷은 모두 DB에 저장됩니다.
+- worker 재시작 후 `open_orders`, `open_positions`, `account_snapshots`를 읽어 복구합니다.
+
+### 모델 재평가 / 재학습
+
+- 즉시 온라인 학습은 하지 않습니다.
+- `services/retrainer.py`는 benchmark universe에 대해 batch 평가를 수행합니다.
+- promotion 조건을 통과하면 `model_registry.is_champion=1`로 승격합니다.
+- 현재 최소 버전은 “새 모델 생성”보다 “현행 predictor 버전 재평가 및 승격 체크”에 초점을 둡니다.
+
+## systemd 예시
+
+```ini
+[Unit]
+Description=Paper Trading Worker
+After=network.target
+
+[Service]
+WorkingDirectory=C:/Users/admin/Desktop/develop/codex
+ExecStart=python -m jobs.scheduler
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+## 장시간 운영 시 주의사항
+
+- `yfinance`는 무료 데이터이므로 지연/누락/제한 가능성이 있습니다.
+- 국가 공휴일 기반 휴장일 처리라서 거래소 특수 휴장일/반일장은 완전 정밀하지 않습니다.
+- 미국/한국주식은 `pre-close proxy fill` 가정이라 실제 MOC 체결과 다를 수 있습니다.
+- 코인 `1h` 데이터는 bar close 기준이며, 초단타 타이밍 시스템이 아닙니다.
+- worker는 단일 프로세스 기준입니다. 다중 worker를 돌리면 DB lock 충돌이 생길 수 있습니다.
+
+## 향후 바로 확장 가능한 것
+
+- `fills`에 부분 체결 history를 더 정교하게 확장
+- app에서 `monitoring/dashboard_hooks.py`를 직접 읽는 전용 관제 탭 추가
+- retrainer에 challenger artifact 저장/rollback 추가
+- 거래소 캘린더를 국가 휴일 근사치에서 더 정밀한 exchange calendar로 교체

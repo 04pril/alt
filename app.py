@@ -15,6 +15,7 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+from config.settings import load_settings
 from kis_paper import (
     KISPaperClient,
     KISPaperError,
@@ -24,6 +25,7 @@ from kis_paper import (
     load_equity_curve,
     load_order_log,
 )
+from monitoring.dashboard_hooks import load_dashboard_data
 from prediction_store import (
     attach_order_to_prediction,
     filter_prediction_history,
@@ -35,6 +37,7 @@ from prediction_store import (
     summarize_prediction_accuracy,
 )
 from predictor import extract_korean_stock_code, is_korean_stock_symbol, normalize_symbol, run_forecast
+from storage.repository import TradingRepository
 from top100_universe import (
     KR_NAME_ALIASES,
     KR_MANUAL_SYMBOLS,
@@ -1112,6 +1115,91 @@ def render_prediction_tracking_section(result, asset_type: str, korea_market: st
             st.dataframe(resolved_view, width="stretch", hide_index=True)
 
 
+def render_operations_monitor() -> None:
+    settings = load_settings()
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+
+    st.subheader("운영 모니터링")
+    st.caption("background worker가 저장한 예측/포지션/잡 상태를 읽기 전용으로 표시합니다.")
+    control_cols = st.columns([1.0, 1.0, 3.0])
+    if control_cols[0].button("신규 진입 중단", key="ops_pause"):
+        repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
+        st.rerun()
+    if control_cols[1].button("신규 진입 재개", key="ops_resume"):
+        repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
+        st.rerun()
+
+    data = load_dashboard_data(settings)
+    summary = data["summary"]
+    latest_account = summary.get("latest_account", {}) or {}
+    trade_performance = data["trade_performance"]
+    metrics = st.columns(6)
+    metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
+    metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
+    metrics[2].metric("오픈 주문", f"{int(summary.get('open_orders', 0))}")
+    metrics[3].metric("Today PnL", format_price_value(float(trade_performance.get("today_pnl", float('nan')))))
+    metrics[4].metric("누적 수익률", format_pct_value(float(trade_performance.get("total_return_pct", float("nan")))))
+    metrics[5].metric("최대 낙폭", format_pct_value(float(trade_performance.get("max_drawdown_pct", float("nan")))))
+    st.caption(f"trading_paused={repository.get_control_flag('trading_paused', '0')} · db={settings.storage.db_path}")
+
+    job_health = data["job_health"]
+    recent_errors = data["recent_errors"]
+    open_positions = data["open_positions"]
+    open_orders = data["open_orders"]
+    candidate_scans = data["candidate_scans"]
+    prediction_report = data["prediction_report"]
+    equity_curve = data["equity_curve"]
+
+    if not equity_curve.empty:
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
+                    y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
+                    mode="lines+markers",
+                    name="Equity",
+                )
+            ]
+        )
+        fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+        st.plotly_chart(fig, width="stretch")
+
+    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_errors = st.tabs(
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Recent Errors"]
+    )
+    with tab_jobs:
+        if job_health.empty:
+            st.caption("job_runs가 없습니다.")
+        else:
+            st.dataframe(job_health, width="stretch", hide_index=True)
+    with tab_positions:
+        if open_positions.empty and open_orders.empty:
+            st.caption("오픈 포지션/주문이 없습니다.")
+        else:
+            if not open_positions.empty:
+                st.caption("오픈 포지션")
+                st.dataframe(open_positions, width="stretch", hide_index=True)
+            if not open_orders.empty:
+                st.caption("오픈 주문")
+                st.dataframe(open_orders, width="stretch", hide_index=True)
+    with tab_predictions:
+        if prediction_report.empty:
+            st.caption("예측 ledger가 비어 있습니다.")
+        else:
+            st.dataframe(prediction_report.head(200), width="stretch", hide_index=True)
+    with tab_candidates:
+        if candidate_scans.empty:
+            st.caption("candidate_scans가 없습니다.")
+        else:
+            st.dataframe(candidate_scans.head(200), width="stretch", hide_index=True)
+    with tab_errors:
+        if recent_errors.empty:
+            st.caption("최근 ERROR 이벤트가 없습니다.")
+        else:
+            st.dataframe(recent_errors, width="stretch", hide_index=True)
+
+
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
     eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics
     eval_trade_metrics = (
@@ -2089,7 +2177,7 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
 
 st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
 
-st.title("코인 · 미국주식 · 한국주식 가격 예측기")
+st.title("Alt")
 st.caption("미국주식·코인은 Yahoo Finance, 한국주식 분석/모의매매는 KIS 우선(실패 시 네이버 fallback), 대시보드 대량 시세는 네이버 배치 조회를 사용합니다.")
 st.info("이 도구는 실험/학습 목적입니다. 어떤 모델도 미래 가격을 보장하지 않습니다.", icon="ℹ️")
 auto_mobile_detected = detect_mobile_client()
@@ -2159,12 +2247,12 @@ if pending_analysis_target:
 
 
 st.session_state.setdefault("ui_mode_choice", "자동")
-st.session_state.setdefault("sidebar_asset_type", "코인")
+st.session_state.setdefault("sidebar_asset_type", "한국주식")
 st.session_state.setdefault("sidebar_raw_symbol", default_symbol_for_asset(st.session_state["sidebar_asset_type"]))
 st.session_state.setdefault("sidebar_korea_market", "KOSPI")
 st.session_state.setdefault("sidebar_asset_type_prev", st.session_state["sidebar_asset_type"])
 if "active_view" not in st.session_state:
-    st.session_state["active_view"] = "종목 분석" if auto_mobile_detected else "대시보드"
+    st.session_state["active_view"] = "운영 모니터"
 st.session_state.setdefault("analysis_auto_run", False)
 st.session_state.setdefault("analysis_result", None)
 st.session_state.setdefault("analysis_result_symbol", "")
@@ -2191,7 +2279,7 @@ with st.sidebar:
         is_mobile_ui = ui_mode_choice == "모바일"
     st.caption(f"현재 적용 UI: {'모바일' if is_mobile_ui else 'PC'}")
 
-    asset_type = st.selectbox("자산 유형", ["코인", "미국주식", "한국주식"], key="sidebar_asset_type")
+    asset_type = st.selectbox("자산 유형", ["한국주식", "미국주식", "코인"], key="sidebar_asset_type")
     previous_asset_type = st.session_state.get("sidebar_asset_type_prev")
     if previous_asset_type != asset_type:
         st.session_state["sidebar_raw_symbol"] = default_symbol_for_asset(asset_type)
@@ -2273,9 +2361,11 @@ analysis_inputs = {
 }
 
 apply_responsive_css(is_mobile_ui=is_mobile_ui)
-st.radio("화면", ["대시보드", "종목 분석", PAPER_VIEW_NAME, "종목 스캔"], horizontal=True, key="active_view")
+st.radio("화면", ["운영 모니터", "대시보드", "종목 분석", PAPER_VIEW_NAME, "종목 스캔"], horizontal=True, key="active_view")
 
-if st.session_state["active_view"] == "대시보드":
+if st.session_state["active_view"] == "운영 모니터":
+    render_operations_monitor()
+elif st.session_state["active_view"] == "대시보드":
     st.subheader(f"{asset_type} 대시보드")
     st.caption("리스트에서 종목을 고르면 종목 분석 화면으로 이동해 바로 예측을 실행합니다.")
 

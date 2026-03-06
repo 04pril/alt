@@ -7,3 +7,4 @@ plotly>=5.20.0
 html5lib>=1.1
 requests>=2.32.0
 PyYAML>=6.0.2
+holidays>=0.63

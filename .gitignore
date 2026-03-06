@@ -1,3 +1,5 @@
 .paper_trading/
 .prediction_tracking/
 __pycache__/
+.runtime/
+config/runtime_settings.json

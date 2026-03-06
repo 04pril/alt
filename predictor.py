@@ -49,6 +49,7 @@ def quiet_external_call(fn):
 @dataclass
 class ForecastResult:
     symbol: str
+    timeframe: str
     price_data: pd.DataFrame
     test_frame: pd.DataFrame
     future_frame: pd.DataFrame
@@ -312,6 +313,24 @@ def _target_to_next_close(target: np.ndarray, current_close: np.ndarray, target_
 
 
 def _infer_future_index(index: pd.DatetimeIndex, periods: int) -> pd.DatetimeIndex:
+    if len(index) < 2:
+        weekend_ratio = float((index.weekday >= 5).mean()) if len(index) else 0.0
+        freq = "D" if weekend_ratio > 0.15 else "B"
+        return pd.date_range(start=index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
+
+    inferred = pd.infer_freq(index)
+    if inferred:
+        try:
+            return pd.date_range(start=index[-1] + pd.tseries.frequencies.to_offset(inferred), periods=periods, freq=inferred)
+        except Exception:
+            pass
+
+    deltas = index.to_series().diff().dropna()
+    if not deltas.empty:
+        step = deltas.median()
+        if pd.notna(step) and step <= pd.Timedelta(hours=12):
+            return pd.date_range(start=index[-1] + step, periods=periods, freq=step)
+
     weekend_ratio = float((index.weekday >= 5).mean()) if len(index) else 0.0
     freq = "D" if weekend_ratio > 0.15 else "B"
     return pd.date_range(start=index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
@@ -898,9 +917,10 @@ def _feature_row_from_history(history_raw: pd.DataFrame, lags: int, feature_cols
     return row.fillna(0.0)
 
 
-def run_forecast(
+def run_forecast_on_price_data(
     symbol: str,
-    years: int = 5,
+    price_data: pd.DataFrame,
+    timeframe: str = "1d",
     test_days: int = 60,
     forecast_days: int = 14,
     lags: int = 20,
@@ -936,7 +956,6 @@ def run_forecast(
         raise ValueError("ATR 손절/익절 배수는 0 이상이어야 합니다.")
 
     gap_days = int(purge_days + embargo_days)
-    price_data = download_price_data(symbol=symbol, years=years)
     dataset, feature_cols, raw_ohlcv = _build_dataset(price_data=price_data, lags=lags, target_mode=target_mode)
     if len(dataset) < 260:
         raise ValueError("데이터가 부족합니다. 조회 기간을 늘려 주세요.")
@@ -1266,6 +1285,7 @@ def run_forecast(
 
     return ForecastResult(
         symbol=symbol,
+        timeframe=timeframe,
         price_data=price_data,
         test_frame=test_frame,
         future_frame=future_frame,
@@ -1291,4 +1311,52 @@ def run_forecast(
         feature_version=FEATURE_VERSION,
         feature_hash=feature_hash,
         data_cutoff_at=pd.Timestamp(price_data.index.max()),
+    )
+
+
+def run_forecast(
+    symbol: str,
+    years: int = 5,
+    test_days: int = 60,
+    forecast_days: int = 14,
+    lags: int = 20,
+    validation_mode: str = "holdout",
+    retrain_every: int = 5,
+    round_trip_cost_bps: float = 8.0,
+    min_signal_strength_pct: float = 0.2,
+    final_holdout_days: int = 40,
+    purge_days: int = 2,
+    embargo_days: int = 1,
+    target_mode: str = "return",
+    validation_days: int = 40,
+    allow_short: bool = False,
+    trade_mode: str = "close_to_close",
+    target_daily_vol_pct: float = 1.0,
+    max_position_size: float = 1.0,
+    stop_loss_atr_mult: float = 1.5,
+    take_profit_atr_mult: float = 3.0,
+) -> ForecastResult:
+    price_data = download_price_data(symbol=symbol, years=years)
+    return run_forecast_on_price_data(
+        symbol=symbol,
+        price_data=price_data,
+        timeframe="1d",
+        test_days=test_days,
+        forecast_days=forecast_days,
+        lags=lags,
+        validation_mode=validation_mode,
+        retrain_every=retrain_every,
+        round_trip_cost_bps=round_trip_cost_bps,
+        min_signal_strength_pct=min_signal_strength_pct,
+        final_holdout_days=final_holdout_days,
+        purge_days=purge_days,
+        embargo_days=embargo_days,
+        target_mode=target_mode,
+        validation_days=validation_days,
+        allow_short=allow_short,
+        trade_mode=trade_mode,
+        target_daily_vol_pct=target_daily_vol_pct,
+        max_position_size=max_position_size,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
     )
