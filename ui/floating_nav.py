@@ -654,14 +654,14 @@ def theme_tokens(theme_mode: str) -> dict[str, str]:
     text_color = st.get_option("theme.textColor") or "#111827"
     base = theme_mode if theme_mode in {"light", "dark"} else str(st.get_option("theme.base") or "light")
     if base == "dark":
-        background = _hex_to_rgba(background_color, 0.76, "rgba(12, 18, 32, 0.76)")
-        background_secondary = _hex_to_rgba(secondary_background, 0.72, "rgba(18, 25, 40, 0.72)")
-        border = _hex_to_rgba(text_color, 0.12, "rgba(226, 232, 240, 0.12)")
-        text = _hex_to_rgba(text_color, 0.86, "rgba(226, 232, 240, 0.86)")
-        text_strong = _hex_to_rgba(text_color, 0.98, "rgba(248, 250, 252, 0.98)")
-        hover = _hex_to_rgba(text_color, 0.08, "rgba(255, 255, 255, 0.08)")
-        chip = _hex_to_rgba(text_color, 0.06, "rgba(255, 255, 255, 0.06)")
-        chip_hover = _hex_to_rgba(text_color, 0.12, "rgba(255, 255, 255, 0.12)")
+        background = "rgba(12, 18, 32, 0.76)"
+        background_secondary = "rgba(18, 25, 40, 0.72)"
+        border = "rgba(226, 232, 240, 0.12)"
+        text = "rgba(226, 232, 240, 0.86)"
+        text_strong = "rgba(248, 250, 252, 0.98)"
+        hover = "rgba(255, 255, 255, 0.08)"
+        chip = "rgba(255, 255, 255, 0.06)"
+        chip_hover = "rgba(255, 255, 255, 0.12)"
         shadow = "0 18px 42px rgba(2, 6, 23, 0.24), 0 6px 16px rgba(2, 6, 23, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.06)"
     else:
         background = _hex_to_rgba(background_color, 0.78, "rgba(255, 255, 255, 0.78)")

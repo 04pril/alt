@@ -61,16 +61,16 @@ class FloatingNavTest(unittest.TestCase):
     def test_theme_tokens_follow_streamlit_dark_theme(self, mock_get_option) -> None:
         options = {
             "theme.primaryColor": "#60a5fa",
-            "theme.backgroundColor": "#0f172a",
-            "theme.secondaryBackgroundColor": "#111827",
-            "theme.textColor": "#f8fafc",
+            "theme.backgroundColor": "#ffffff",
+            "theme.secondaryBackgroundColor": "#f8fafc",
+            "theme.textColor": "#111827",
             "theme.base": "dark",
         }
         mock_get_option.side_effect = lambda key: options.get(key)
         tokens = theme_tokens("dark")
         self.assertEqual(tokens["base"], "dark")
-        self.assertIn("15, 23, 42", tokens["background"])
-        self.assertIn("248, 250, 252", tokens["text"])
+        self.assertEqual(tokens["background"], "rgba(12, 18, 32, 0.76)")
+        self.assertEqual(tokens["text"], "rgba(226, 232, 240, 0.86)")
 
 
 if __name__ == "__main__":
