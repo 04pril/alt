@@ -1107,11 +1107,12 @@ def set_analysis_target(asset_type: str, raw_symbol: str, korea_market: str) -> 
     st.session_state["analysis_asset_type"] = asset_type
     st.session_state["analysis_raw_symbol"] = raw_symbol
     st.session_state["analysis_korea_market"] = korea_market
-    st.session_state["sidebar_asset_type"] = asset_type
-    st.session_state["sidebar_raw_symbol"] = raw_symbol
-    st.session_state["sidebar_korea_market"] = korea_market
-    st.session_state["sidebar_asset_type_prev"] = asset_type
-    st.session_state["active_view"] = "종목 분석"
+    st.session_state["pending_analysis_target"] = {
+        "asset_type": asset_type,
+        "raw_symbol": raw_symbol,
+        "korea_market": korea_market,
+        "active_view": "종목 분석",
+    }
     st.session_state["analysis_result"] = None
     st.session_state["analysis_result_symbol"] = ""
     st.session_state["analysis_result_forecast_days"] = 0
@@ -1273,6 +1274,15 @@ def default_symbol_for_asset(asset_type: str) -> str:
     if asset_type == "미국주식":
         return "AAPL"
     return "005930"
+
+
+pending_analysis_target = st.session_state.pop("pending_analysis_target", None)
+if pending_analysis_target:
+    st.session_state["sidebar_asset_type"] = str(pending_analysis_target["asset_type"])
+    st.session_state["sidebar_raw_symbol"] = str(pending_analysis_target["raw_symbol"])
+    st.session_state["sidebar_korea_market"] = str(pending_analysis_target["korea_market"])
+    st.session_state["sidebar_asset_type_prev"] = str(pending_analysis_target["asset_type"])
+    st.session_state["active_view"] = str(pending_analysis_target.get("active_view", "종목 분석"))
 
 
 st.session_state.setdefault("ui_mode_choice", "자동")
