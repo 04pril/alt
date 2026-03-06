@@ -6,7 +6,7 @@ import io
 import logging
 import re
 import warnings
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,25 @@ import requests
 import streamlit as st
 import yfinance as yf
 
+from kis_paper import (
+    KISPaperClient,
+    KISPaperError,
+    append_equity_snapshot,
+    append_order_log,
+    compute_equity_metrics,
+    load_equity_curve,
+    load_order_log,
+)
+from prediction_store import (
+    attach_order_to_prediction,
+    filter_prediction_history,
+    load_prediction_log,
+    load_model_registry,
+    prediction_id_for_run,
+    refresh_prediction_actuals,
+    save_prediction_snapshot,
+    summarize_prediction_accuracy,
+)
 from predictor import extract_korean_stock_code, is_korean_stock_symbol, normalize_symbol, run_forecast
 from top100_universe import (
     KR_NAME_ALIASES,
@@ -30,6 +49,10 @@ WATCHLIST_PRESETS: Dict[str, List[str]] = {
     "미국주식": ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "AMD"],
     "한국주식": ["005930", "000660", "035420", "005380", "035720", "068270", "247540", "373220"],
 }
+
+PAPER_VIEW_NAME = "모의매매"
+PAPER_ORDER_SIDE_LABELS = {"buy": "매수", "sell": "매도", "hold": "관망"}
+PAPER_ORDER_TYPE_OPTIONS = {"시장가": "market", "지정가": "limit"}
 
 VALIDATION_LABEL_TO_MODE = {
     "빠름(홀드아웃)": "holdout",
@@ -395,7 +418,7 @@ def resolve_single_top100_entries(scope: str, display_limit: int) -> Tuple[List[
     return rows, unresolved_names
 
 
-def first_valid_float(*values: object) -> float:
+def first_valid_float(*values: object, default: float = float("nan")) -> float:
     for value in values:
         try:
             number = float(value)
@@ -403,7 +426,7 @@ def first_valid_float(*values: object) -> float:
             continue
         if np.isfinite(number):
             return number
-    return float("nan")
+    return float(default)
 
 
 def default_currency_from_symbol(symbol: str) -> str:
@@ -435,6 +458,21 @@ def _build_kr_snapshot(symbol: str, item: Dict[str, object]) -> Dict[str, float 
 
 
 def fetch_single_kr_quote_snapshot(symbol: str) -> Dict[str, float | str]:
+    try:
+        kis_quote = KISPaperClient().get_quote(symbol_or_code=symbol)
+        current_price = first_valid_float(kis_quote.get("current_price"))
+        previous_close = first_valid_float(kis_quote.get("previous_close"))
+        change_pct = first_valid_float(kis_quote.get("change_pct"))
+        return {
+            "symbol": symbol,
+            "currency": "KRW",
+            "current_price": float(current_price) if np.isfinite(current_price) else float("nan"),
+            "previous_close": float(previous_close) if np.isfinite(previous_close) else float("nan"),
+            "change_pct": float(change_pct) if np.isfinite(change_pct) else float("nan"),
+        }
+    except Exception:
+        pass
+
     code = extract_korean_stock_code(symbol)
     response = requests.get(
         "https://polling.finance.naver.com/api/realtime",
@@ -794,6 +832,286 @@ def build_trade_sample_view(backtest_frame: pd.DataFrame, limit: int = 8) -> pd.
     return view
 
 
+def chart_window_days_from_label(label: str) -> int | None:
+    mapping: Dict[str, int | None] = {
+        "최근 3개월": 90,
+        "최근 6개월": 180,
+        "최근 1년": 365,
+        "최근 2년": 730,
+        "전체": None,
+    }
+    return mapping.get(label, 180)
+
+
+def compute_price_chart_range(result, window_days: int | None) -> Tuple[pd.Timestamp | None, pd.Timestamp | None]:
+    all_dates = pd.Index(result.price_data.index).append(pd.Index(result.future_frame.index))
+    if all_dates.empty:
+        return None, None
+    x_max = pd.Timestamp(all_dates.max())
+    if window_days is None:
+        x_min = pd.Timestamp(all_dates.min())
+    else:
+        candidate = x_max - pd.Timedelta(days=int(window_days))
+        price_min = pd.Timestamp(result.price_data.index.min())
+        x_min = max(candidate, price_min)
+    return x_min, x_max
+
+
+def compute_y_axis_range_for_window(result, x_min: pd.Timestamp | None, x_max: pd.Timestamp | None) -> List[float] | None:
+    series_list: List[pd.Series] = []
+    if x_min is not None and x_max is not None:
+        for frame, col in [
+            (result.price_data, "Close"),
+            (result.test_frame, "ensemble_pred"),
+            (result.final_holdout_frame, "ensemble_pred"),
+            (result.future_frame, "ensemble_pred"),
+            (result.future_frame, "lower_band_1sigma"),
+            (result.future_frame, "upper_band_1sigma"),
+        ]:
+            if frame is None or frame.empty or col not in frame.columns:
+                continue
+            sl = frame.loc[(frame.index >= x_min) & (frame.index <= x_max), col]
+            if not sl.empty:
+                series_list.append(pd.to_numeric(sl, errors="coerce"))
+    if not series_list:
+        return None
+    merged = pd.concat(series_list).dropna()
+    if merged.empty:
+        return None
+    y_min = float(merged.min())
+    y_max = float(merged.max())
+    pad = max((y_max - y_min) * 0.10, max(abs(y_max), 1.0) * 0.015)
+    return [y_min - pad, y_max + pad]
+
+
+def build_prediction_history_view(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return pd.DataFrame()
+    view = frame.copy()
+    for col in ["generated_at", "target_date", "resolved_at", "evaluated_at", "data_cutoff_at"]:
+        if col in view.columns:
+            view[col] = pd.to_datetime(view[col], errors="coerce")
+            view[col] = view[col].dt.strftime("%Y-%m-%d %H:%M").fillna("")
+    price_cols = ["current_price", "predicted_price", "actual_price", "abs_error_price", "paper_trade_pnl"]
+    ratio_cols = ["predicted_return", "actual_return", "threshold", "position_size", "paper_trade_return"]
+    percent_cols = ["ape_pct"]
+    for col in price_cols:
+        if col in view.columns:
+            view[col] = view[col].map(lambda v: format_price_value(float(v)) if np.isfinite(first_valid_float(v)) else "N/A")
+    for col in ratio_cols:
+        if col in view.columns:
+            view[col] = view[col].map(
+                lambda v: format_pct_value(float(v) * 100.0) if np.isfinite(first_valid_float(v)) else "N/A"
+            )
+    for col in percent_cols:
+        if col in view.columns:
+            view[col] = view[col].map(
+                lambda v: format_pct_value(float(v)) if np.isfinite(first_valid_float(v)) else "N/A"
+            )
+    if "directional_accuracy" in view.columns:
+        view["directional_accuracy"] = view["directional_accuracy"].map(
+            lambda v: "적중" if first_valid_float(v) >= 0.5 else ("비적중" if np.isfinite(first_valid_float(v)) else "N/A")
+        )
+    if "status" in view.columns:
+        view["status"] = view["status"].map(lambda v: "완료" if str(v) == "resolved" else "미해결")
+    if "confidence_score" in view.columns:
+        view["confidence_score"] = view["confidence_score"].map(
+            lambda v: format_pct_value(float(v) * 100.0) if np.isfinite(first_valid_float(v)) else "N/A"
+        )
+    keep_cols = [
+        "generated_at",
+        "prediction_id",
+        "forecast_horizon",
+        "target_date",
+        "status",
+        "signal",
+        "confidence_score",
+        "model_version",
+        "predicted_price",
+        "actual_price",
+        "predicted_return",
+        "actual_return",
+        "abs_error_price",
+        "ape_pct",
+        "directional_accuracy",
+        "paper_trade_return",
+    ]
+    keep_cols = [col for col in keep_cols if col in view.columns]
+    return view[keep_cols].rename(
+        columns={
+            "generated_at": "예측시각",
+            "prediction_id": "prediction_id",
+            "forecast_horizon": "예측일차",
+            "target_date": "대상일",
+            "status": "상태",
+            "signal": "시그널",
+            "confidence_score": "confidence",
+            "model_version": "모델버전",
+            "predicted_price": "예측종가",
+            "actual_price": "실제종가",
+            "predicted_return": "예상수익률",
+            "actual_return": "실제수익률",
+            "abs_error_price": "절대오차",
+            "ape_pct": "오차율(%)",
+            "directional_accuracy": "방향적중",
+            "paper_trade_return": "매매수익률",
+        }
+    )
+
+
+def render_prediction_tracking_section(result, asset_type: str, korea_market: str) -> None:
+    st.subheader("예측 기억 및 비교")
+    st.caption("예측은 immutable ledger에 append-only로 저장됩니다. outcome/evaluation은 만기 이후 별도 테이블에 확정됩니다.")
+    action_cols = st.columns([1.0, 1.0, 2.2])
+    if action_cols[0].button("이번 예측 저장", key=f"save_pred_{result.symbol}"):
+        try:
+            run_id = save_prediction_snapshot(asset_type=asset_type, korea_market=korea_market, result=result)
+        except Exception as exc:
+            st.error(f"예측 저장 실패: {exc}")
+        else:
+            st.success(f"예측을 저장했습니다. run_id={run_id}")
+    if action_cols[1].button("실제값 갱신", key=f"refresh_pred_{result.symbol}"):
+        try:
+            refresh_prediction_actuals(symbol=result.symbol)
+        except Exception as exc:
+            st.error(f"실제값 갱신 실패: {exc}")
+        else:
+            st.success("만기된 예측의 실제 종가를 갱신했습니다.")
+
+    try:
+        refresh_prediction_actuals(symbol=result.symbol)
+    except Exception:
+        pass
+
+    history_all = load_prediction_log()
+    history_symbol = filter_prediction_history(history_all, symbol=result.symbol)
+    summary_all = summarize_prediction_accuracy(history_all)
+    summary_symbol = summarize_prediction_accuracy(history_symbol)
+    unresolved_symbol = filter_prediction_history(history_symbol, status="unresolved")
+    resolved_symbol = filter_prediction_history(history_symbol, status="resolved")
+
+    metrics = st.columns(6)
+    metrics[0].metric("저장된 런", f"{int(summary_symbol['saved_runs'])}")
+    metrics[1].metric("저장된 예측행", f"{int(summary_symbol['saved_rows'])}")
+    metrics[2].metric("실제 비교 완료", f"{int(summary_symbol['matured_rows'])}", f"미해결 {len(unresolved_symbol)}건")
+    metrics[3].metric("Price MAE", format_price_value(summary_symbol["mae_price"]))
+    metrics[4].metric("MAPE", format_pct_value(summary_symbol["mape_pct"]))
+    metrics[5].metric("방향적중도", format_pct_value(summary_symbol["direction_acc_pct"]))
+    sub_metrics = st.columns(4)
+    sub_metrics[0].metric("Return MAE", format_pct_value(summary_symbol["mae_return_pct"]))
+    sub_metrics[1].metric("Price RMSE", format_price_value(summary_symbol["rmse_price"]))
+    sub_metrics[2].metric("Return RMSE", format_pct_value(summary_symbol["rmse_return_pct"]))
+    sub_metrics[3].metric("Brier", f"{summary_symbol['brier_score']:.4f}" if np.isfinite(summary_symbol["brier_score"]) else "N/A")
+    trade_eval_metrics = st.columns(2)
+    trade_eval_metrics[0].metric(
+        "평균 Target-Aligned 매매수익률",
+        format_pct_value(summary_symbol["avg_trade_return_pct"]) if np.isfinite(summary_symbol["avg_trade_return_pct"]) else "N/A",
+    )
+    trade_eval_metrics[1].metric(
+        "평균 Target-Aligned PnL",
+        format_price_value(summary_symbol["avg_trade_pnl"]) if np.isfinite(summary_symbol["avg_trade_pnl"]) else "N/A",
+    )
+
+    st.caption(
+        f"전체 누적 기준: 런 {int(summary_all['saved_runs'])}개 · 예측행 {int(summary_all['saved_rows'])}개 · "
+        f"실제 비교 완료 {int(summary_all['matured_rows'])}개"
+    )
+
+    if not resolved_symbol.empty:
+        matured = resolved_symbol.copy()
+        matured["target_date"] = pd.to_datetime(matured["target_date"], errors="coerce")
+        compare_fig = go.Figure()
+        compare_fig.add_trace(
+            go.Scatter(
+                x=matured["target_date"],
+                y=matured["predicted_price"],
+                mode="lines+markers",
+                name="저장된 예측종가",
+                line=dict(width=2, color="#ef4444"),
+            )
+        )
+        compare_fig.add_trace(
+            go.Scatter(
+                x=matured["target_date"],
+                y=matured["actual_price"],
+                mode="lines+markers",
+                name="실제 종가",
+                line=dict(width=2, color="#e5e7eb"),
+            )
+        )
+        compare_fig.update_layout(
+            height=280,
+            margin=dict(l=20, r=20, t=30, b=20),
+            hovermode="x unified",
+            legend=dict(orientation="h", y=1.02, x=0),
+        )
+        st.plotly_chart(compare_fig, width="stretch")
+    else:
+        st.info("아직 만기된 예측이 없어 실제 비교 차트가 없습니다.")
+
+    model_registry = load_model_registry()
+    if not resolved_symbol.empty:
+        model_perf = (
+            resolved_symbol.groupby("model_version", dropna=False)
+            .agg(
+                예측수=("prediction_id", "count"),
+                Price_MAE=("abs_error_price", "mean"),
+                Return_MAE=("abs_error_return", lambda s: float(pd.to_numeric(s, errors="coerce").mean()) * 100.0),
+                방향적중도=("directional_accuracy", lambda s: float(pd.to_numeric(s, errors="coerce").mean()) * 100.0),
+                Brier=("brier_score", "mean"),
+            )
+            .reset_index()
+            .rename(columns={"model_version": "모델버전"})
+        )
+        for col in ("Price_MAE", "Return_MAE", "방향적중도", "Brier"):
+            model_perf[col] = pd.to_numeric(model_perf[col], errors="coerce")
+        model_perf["Price_MAE"] = model_perf["Price_MAE"].map(
+            lambda v: format_price_value(float(v)) if np.isfinite(first_valid_float(v)) else "N/A"
+        )
+        model_perf["Return_MAE"] = model_perf["Return_MAE"].map(
+            lambda v: format_pct_value(float(v)) if np.isfinite(first_valid_float(v)) else "N/A"
+        )
+        model_perf["방향적중도"] = model_perf["방향적중도"].map(
+            lambda v: format_pct_value(float(v)) if np.isfinite(first_valid_float(v)) else "N/A"
+        )
+        model_perf["Brier"] = model_perf["Brier"].map(
+            lambda v: f"{float(v):.4f}" if np.isfinite(first_valid_float(v)) else "N/A"
+        )
+        st.caption("모델 버전별 성능 비교")
+        st.dataframe(model_perf, width="stretch", hide_index=True)
+
+    if not model_registry.empty:
+        registry_view = model_registry.copy()
+        registry_view["created_at"] = pd.to_datetime(registry_view["created_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M")
+        registry_view["is_champion"] = registry_view["is_champion"].map(lambda v: "Y" if int(first_valid_float(v, default=0.0)) == 1 else "")
+        registry_view = registry_view.rename(
+            columns={
+                "model_version": "모델버전",
+                "model_name": "모델명",
+                "feature_version": "피처버전",
+                "created_at": "등록시각",
+                "is_champion": "챔피언",
+                "notes": "메모",
+            }
+        )
+        with st.expander("모델 레지스트리", expanded=False):
+            st.dataframe(registry_view, width="stretch", hide_index=True)
+
+    unresolved_view = build_prediction_history_view(unresolved_symbol.head(40))
+    resolved_view = build_prediction_history_view(resolved_symbol.head(120))
+    tab_unresolved, tab_resolved = st.tabs(["미해결 예측", "확정된 예측"])
+    with tab_unresolved:
+        if unresolved_view.empty:
+            st.caption("미해결 예측이 없습니다.")
+        else:
+            st.dataframe(unresolved_view, width="stretch", hide_index=True)
+    with tab_resolved:
+        if resolved_view.empty:
+            st.caption("이 심볼에 확정된 예측 이력이 없습니다.")
+        else:
+            st.dataframe(resolved_view, width="stretch", hide_index=True)
+
+
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
     eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics
     eval_trade_metrics = (
@@ -841,7 +1159,7 @@ def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float |
     }
 
 
-def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None:
+def render_single_result(result, forecast_days: int, is_mobile_ui: bool, asset_type: str, korea_market: str) -> None:
     latest_close = result.latest_close
     last_pred = float(result.future_frame["ensemble_pred"].iloc[-1])
     next_pred = float(result.future_frame["ensemble_pred"].iloc[0])
@@ -903,6 +1221,28 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
     elif trade_mode == "open_to_close":
         st.caption("`open→close` 모드에서는 다음 시가를 알 수 없어서 예상 진입가는 현재 종가 기준 추정치로 표시합니다.")
 
+    symbol_key = re.sub(r"[^A-Za-z0-9]+", "_", str(result.symbol))
+    chart_control_cols = st.columns([1.3, 1.0, 1.2] if not is_mobile_ui else [1.0, 1.0, 1.0])
+    chart_range_label = chart_control_cols[0].selectbox(
+        "가격 차트 범위",
+        ["최근 3개월", "최근 6개월", "최근 1년", "최근 2년", "전체"],
+        index=1,
+        key=f"chart_range_{symbol_key}",
+    )
+    show_rangeslider = chart_control_cols[1].checkbox(
+        "하단 줌 바",
+        value=not is_mobile_ui,
+        key=f"chart_rangeslider_{symbol_key}",
+    )
+    show_full_context = chart_control_cols[2].checkbox(
+        "전체 기간도 보기",
+        value=False,
+        key=f"chart_full_context_{symbol_key}",
+    )
+
+    x_min, x_max = compute_price_chart_range(result=result, window_days=chart_window_days_from_label(chart_range_label))
+    y_range = compute_y_axis_range_for_window(result=result, x_min=x_min, x_max=x_max)
+
     eq_fig = go.Figure()
     eq_fig.add_trace(
         go.Scatter(
@@ -910,7 +1250,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=(result.trade_backtest["equity_curve"] - 1.0) * 100.0,
             mode="lines",
             name="연구구간",
-            line=dict(width=2),
+            line=dict(width=2, color="#3b82f6"),
         )
     )
     eq_fig.add_trace(
@@ -919,13 +1259,14 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=(result.final_holdout_trade_backtest["equity_curve"] - 1.0) * 100.0,
             mode="lines",
             name="최종홀드아웃",
-            line=dict(width=2, dash="dot"),
+            line=dict(width=2, dash="dot", color="#f59e0b"),
         )
     )
     eq_fig.update_layout(
-        height=260 if is_mobile_ui else 300,
+        height=230 if is_mobile_ui else 260,
         margin=dict(l=20, r=20, t=20, b=20),
         hovermode="x unified",
+        legend=dict(orientation="h", y=1.02, x=0),
         yaxis_title="누적수익률(%)",
     )
 
@@ -936,7 +1277,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=result.price_data["Close"],
             mode="lines",
             name="실제 종가",
-            line=dict(width=2),
+            line=dict(width=2, color="#e5e7eb"),
         )
     )
     fig.add_trace(
@@ -945,7 +1286,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=result.test_frame["ensemble_pred"],
             mode="lines",
             name="연구구간 예측",
-            line=dict(width=2),
+            line=dict(width=2, color="#3b82f6"),
         )
     )
     fig.add_trace(
@@ -954,7 +1295,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=result.final_holdout_frame["ensemble_pred"],
             mode="lines",
             name="최종홀드아웃 예측",
-            line=dict(width=2, dash="dot"),
+            line=dict(width=2, dash="dot", color="#fca5a5"),
         )
     )
     fig.add_trace(
@@ -963,7 +1304,8 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             y=result.future_frame["ensemble_pred"],
             mode="lines+markers",
             name="미래 예측",
-            line=dict(width=3),
+            line=dict(width=3, color="#ef4444"),
+            marker=dict(size=7),
         )
     )
     fig.add_trace(
@@ -988,20 +1330,48 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
         )
     )
     fig.update_layout(
-        height=430 if is_mobile_ui else 620,
+        height=460 if is_mobile_ui else 560,
         hovermode="x unified",
         legend=dict(orientation="h", y=1.02, x=0),
         margin=dict(l=20, r=20, t=10, b=20),
+        xaxis=dict(
+            range=[x_min, x_max] if x_min is not None and x_max is not None else None,
+            rangeslider=dict(visible=show_rangeslider, thickness=0.06),
+            rangeselector=dict(
+                buttons=[
+                    dict(count=3, label="3M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(step="all", label="ALL"),
+                ]
+            ),
+        ),
+        yaxis=dict(range=y_range),
     )
-    if is_mobile_ui:
-        st.plotly_chart(eq_fig, width="stretch")
-        st.plotly_chart(fig, width="stretch")
-    else:
-        chart_left, chart_right = st.columns([1.0, 1.35])
-        with chart_left:
-            st.plotly_chart(eq_fig, width="stretch")
-        with chart_right:
-            st.plotly_chart(fig, width="stretch")
+    st.caption("기본은 최근 구간 중심으로 확대해서 보여줍니다. 하단 줌 바나 범위 버튼으로 직접 조절할 수 있습니다.")
+    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(eq_fig, width="stretch")
+
+    if show_full_context:
+        full_fig = go.Figure(fig)
+        full_fig.update_layout(
+            height=320 if is_mobile_ui else 420,
+            xaxis=dict(
+                range=None,
+                rangeslider=dict(visible=True, thickness=0.06),
+                rangeselector=dict(
+                    buttons=[
+                        dict(count=6, label="6M", step="month", stepmode="backward"),
+                        dict(count=1, label="1Y", step="year", stepmode="backward"),
+                        dict(count=2, label="2Y", step="year", stepmode="backward"),
+                        dict(step="all", label="ALL"),
+                    ]
+                ),
+            ),
+            yaxis=dict(range=None),
+        )
+        with st.expander("전체 기간 차트", expanded=False):
+            st.plotly_chart(full_fig, width="stretch")
 
     trade_sample_view = build_trade_sample_view(result.trade_backtest)
     holdout_trade_sample_view = build_trade_sample_view(result.final_holdout_trade_backtest)
@@ -1082,6 +1452,9 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
         weight_table = weight_table.rename(columns={"model": "모델", "weight_pct": "연구구간 가중치(%)"})
         st.caption("앙상블 가중치")
         st.dataframe(weight_table, width="stretch", hide_index=True)
+
+    with st.expander("예측 기억 및 실제 비교", expanded=False):
+        render_prediction_tracking_section(result=result, asset_type=asset_type, korea_market=korea_market)
 
     future_view = result.future_frame.rename(
         columns={
@@ -1214,10 +1587,510 @@ def run_analysis_target(
     )
 
 
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def build_paper_symbol_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
+    entries = build_top100_entries(asset_type="한국주식")
+    resolved_pairs, unresolved = resolve_top100_entries(asset_type="한국주식", entries=entries)
+    resolved_map = {name: symbol for name, symbol in resolved_pairs}
+    catalog: List[Dict[str, str]] = []
+    for entry in entries:
+        name = str(entry["name"])
+        symbol = resolved_map.get(name)
+        if not symbol:
+            continue
+        catalog.append(
+            {
+                "rank": str(entry["rank"]),
+                "name": name,
+                "symbol": symbol,
+                "label": f"{int(entry['rank']):>3}. {name} ({symbol})",
+            }
+        )
+    return catalog, unresolved
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_paper_account_snapshot(refresh_token: int) -> Tuple[Dict[str, Any], pd.DataFrame]:
+    _ = refresh_token
+    client = KISPaperClient()
+    snapshot = client.get_account_snapshot()
+    return dict(snapshot.summary), snapshot.holdings.copy()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def fetch_paper_quote_snapshot(symbol: str, refresh_token: int) -> Dict[str, Any]:
+    _ = refresh_token
+    client = KISPaperClient()
+    return client.get_quote(symbol)
+
+
+def build_paper_trade_plan(
+    *,
+    symbol: str,
+    quote_snapshot: Dict[str, Any],
+    account_summary: Dict[str, Any],
+    holdings: pd.DataFrame,
+    analysis_result: Any | None,
+) -> Dict[str, Any]:
+    symbol_code = extract_korean_stock_code(symbol)
+    current_price = first_valid_float(quote_snapshot.get("current_price"))
+    cash = max(0.0, first_valid_float(account_summary.get("cash"), default=0.0))
+    holding_qty = 0
+    if not holdings.empty and "symbol_code" in holdings.columns:
+        matched = holdings.loc[holdings["symbol_code"].astype(str) == str(symbol_code)]
+        if not matched.empty:
+            holding_qty = int(first_valid_float(matched.iloc[0].get("보유수량"), default=0.0))
+
+    empty_plan = {
+        "side": "hold",
+        "side_label": PAPER_ORDER_SIDE_LABELS["hold"],
+        "predicted_move_pct": float("nan"),
+        "planned_signal": 0.0,
+        "position_size": 0.0,
+        "entry_estimate": current_price,
+        "stop_level": float("nan"),
+        "take_level": float("nan"),
+        "ensemble_pred": float("nan"),
+        "recommended_budget": 0.0,
+        "recommended_qty": 0,
+        "holding_qty": holding_qty,
+        "current_price": current_price,
+        "note": "예측 결과가 아직 없습니다.",
+    }
+    if analysis_result is None or getattr(analysis_result, "future_frame", pd.DataFrame()).empty:
+        return empty_plan
+
+    row = analysis_result.future_frame.iloc[0]
+    planned_signal = first_valid_float(row.get("planned_signal"), default=0.0)
+    position_size = abs(first_valid_float(row.get("position_size"), default=abs(planned_signal)))
+    predicted_move_pct = first_valid_float(row.get("ensemble_pred_return_pct"))
+    ensemble_pred = first_valid_float(row.get("ensemble_pred"))
+    entry_estimate = first_valid_float(row.get("entry_estimate"), default=current_price)
+    stop_level = first_valid_float(row.get("stop_level"))
+    take_level = first_valid_float(row.get("take_level"))
+    side = "buy" if planned_signal > 1e-9 else "sell" if planned_signal < -1e-9 else "hold"
+    note = ""
+
+    recommended_budget = 0.0
+    recommended_qty = 0
+    order_ref_price = current_price if np.isfinite(current_price) and current_price > 0 else entry_estimate
+    if side == "buy" and np.isfinite(order_ref_price) and order_ref_price > 0:
+        recommended_budget = cash * min(max(abs(planned_signal), 0.0), 1.0)
+        recommended_qty = int(np.floor(recommended_budget / order_ref_price))
+        if recommended_qty <= 0 and cash >= order_ref_price:
+            recommended_qty = 1
+        if recommended_qty <= 0:
+            note = "예수금 대비 추천 비중이 너무 작아 주문 수량이 0주입니다."
+    elif side == "sell":
+        if holding_qty <= 0:
+            side = "hold"
+            note = "하락 신호지만 보유 수량이 없어 숏 주문은 생략합니다."
+        else:
+            recommended_qty = max(1, int(np.floor(holding_qty * min(max(abs(planned_signal), 0.0), 1.0))))
+            recommended_qty = min(recommended_qty, holding_qty)
+            recommended_budget = recommended_qty * (order_ref_price if np.isfinite(order_ref_price) else 0.0)
+    else:
+        note = "신호가 임계값을 넘지 않아 관망입니다."
+
+    return {
+        "side": side,
+        "side_label": PAPER_ORDER_SIDE_LABELS[side],
+        "predicted_move_pct": predicted_move_pct,
+        "planned_signal": planned_signal,
+        "position_size": position_size,
+        "entry_estimate": entry_estimate,
+        "stop_level": stop_level,
+        "take_level": take_level,
+        "ensemble_pred": ensemble_pred,
+        "recommended_budget": recommended_budget,
+        "recommended_qty": int(recommended_qty),
+        "holding_qty": holding_qty,
+        "current_price": current_price,
+        "note": note,
+    }
+
+
+def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: bool) -> None:
+    st.subheader("모의매매")
+    st.caption("한국투자증권 모의계좌(KIS REST)로 국내주식 모의 주문을 넣고, 계좌 성과를 추적합니다.")
+
+    try:
+        kis_config = KISPaperClient().config
+    except KISPaperError as exc:
+        st.error(f"KIS 모의매매 설정 오류: {exc}")
+        return
+
+    st.info(
+        f"모의 계좌 `{kis_config.account_masked}` · 상품코드 `{kis_config.product_code}` · 도메인 `{kis_config.base_url}`",
+        icon="ℹ️",
+    )
+
+    catalog, unresolved = build_paper_symbol_catalog()
+    latest_analysis_symbol = str(st.session_state.get("analysis_result_symbol", "") or "")
+    if latest_analysis_symbol.endswith((".KS", ".KQ")) and all(item["symbol"] != latest_analysis_symbol for item in catalog):
+        catalog = [
+            {
+                "rank": "0",
+                "name": "최근 분석 종목",
+                "symbol": latest_analysis_symbol,
+                "label": f"최근 분석 종목 ({latest_analysis_symbol})",
+            }
+        ] + catalog
+    if not catalog:
+        st.error("모의매매에 사용할 국내 종목 목록을 준비하지 못했습니다.")
+        return
+
+    option_map = {item["label"]: item for item in catalog}
+    option_labels = list(option_map.keys())
+    if st.session_state.get("paper_symbol_label") not in option_map:
+        default_symbol = latest_analysis_symbol if latest_analysis_symbol.endswith((".KS", ".KQ")) else "005930.KS"
+        default_label = next((label for label, item in option_map.items() if item["symbol"] == default_symbol), option_labels[0])
+        st.session_state["paper_symbol_label"] = default_label
+    selected_entry = option_map[st.session_state["paper_symbol_label"]]
+    selected_market = "KOSDAQ" if str(selected_entry["symbol"]).endswith(".KQ") else "KOSPI"
+    if not str(st.session_state.get("paper_manual_symbol", "")).strip():
+        st.session_state["paper_market"] = selected_market
+
+    if is_mobile_ui:
+        st.selectbox("거래 종목", options=option_labels, key="paper_symbol_label")
+        st.text_input("직접 입력(선택사항)", key="paper_manual_symbol", placeholder="예: 005930 또는 005930.KS")
+        st.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="paper_market")
+        ctrl_cols = st.columns(3)
+    else:
+        sel_col, input_col, market_col = st.columns([3.5, 2.0, 1.3])
+        sel_col.selectbox("거래 종목", options=option_labels, key="paper_symbol_label")
+        input_col.text_input("직접 입력(선택사항)", key="paper_manual_symbol", placeholder="예: 005930 또는 005930.KS")
+        market_col.radio("시장", ["KOSPI", "KOSDAQ"], horizontal=True, key="paper_market")
+        ctrl_cols = st.columns([1.0, 1.0, 1.2])
+
+    selected_entry = option_map[st.session_state["paper_symbol_label"]]
+    paper_market = str(st.session_state.get("paper_market", selected_market))
+    manual_symbol = str(st.session_state.get("paper_manual_symbol", "") or "").strip()
+    if manual_symbol:
+        paper_symbol = normalize_symbol(asset_type="한국주식", raw_symbol=manual_symbol, korea_market=paper_market)
+        paper_name = manual_symbol
+    else:
+        paper_symbol = str(selected_entry["symbol"])
+        paper_name = str(selected_entry["name"])
+        paper_market = "KOSDAQ" if paper_symbol.endswith(".KQ") else "KOSPI"
+
+    if ctrl_cols[0].button("계좌 새로고침", key="paper_refresh_account"):
+        st.session_state["paper_account_refresh_token"] += 1
+    if ctrl_cols[1].button("현재가 새로고침", key="paper_refresh_quote"):
+        st.session_state["paper_quote_refresh_token"] += 1
+    run_paper_analysis = ctrl_cols[2].button("예측 갱신", key="paper_run_analysis", type="primary")
+
+    try:
+        account_summary, account_holdings = fetch_paper_account_snapshot(
+            refresh_token=int(st.session_state.get("paper_account_refresh_token", 0))
+        )
+        append_equity_snapshot(account_summary, account_holdings)
+        quote_snapshot = fetch_paper_quote_snapshot(
+            symbol=paper_symbol,
+            refresh_token=int(st.session_state.get("paper_quote_refresh_token", 0)),
+        )
+    except Exception as exc:
+        st.error(f"KIS 모의계좌 조회 실패: {exc}")
+        return
+
+    global_analysis_result = st.session_state.get("analysis_result")
+    active_analysis_result = None
+    if run_paper_analysis:
+        try:
+            with st.spinner(f"{paper_symbol} 예측 모델을 갱신하는 중..."):
+                paper_result = run_analysis_target(
+                    run_asset_type="한국주식",
+                    run_raw_symbol=paper_symbol,
+                    run_korea_market=paper_market,
+                    **analysis_inputs,
+                )
+        except Exception as exc:
+            st.error(f"모의매매 예측 실행 실패: {exc}")
+        else:
+            st.session_state["paper_analysis_result"] = paper_result
+            st.session_state["paper_analysis_symbol"] = paper_symbol
+            st.session_state["paper_analysis_forecast_days"] = int(analysis_inputs["forecast_days"])
+            try:
+                st.session_state["paper_prediction_run_id"] = save_prediction_snapshot(
+                    asset_type="한국주식",
+                    korea_market=paper_market,
+                    result=paper_result,
+                    notes="paper_analysis",
+                )
+            except Exception:
+                st.session_state["paper_prediction_run_id"] = ""
+            active_analysis_result = paper_result
+
+    if active_analysis_result is None:
+        saved_paper_symbol = str(st.session_state.get("paper_analysis_symbol", "") or "")
+        saved_paper_result = st.session_state.get("paper_analysis_result")
+        if saved_paper_result is not None and saved_paper_symbol == paper_symbol:
+            active_analysis_result = saved_paper_result
+        elif global_analysis_result is not None and latest_analysis_symbol == paper_symbol:
+            active_analysis_result = global_analysis_result
+
+    linked_prediction_run_id = ""
+    if active_analysis_result is not None:
+        if str(st.session_state.get("paper_analysis_symbol", "") or "") == paper_symbol:
+            linked_prediction_run_id = str(st.session_state.get("paper_prediction_run_id", "") or "")
+        elif latest_analysis_symbol == paper_symbol:
+            linked_prediction_run_id = str(st.session_state.get("analysis_prediction_run_id", "") or "")
+
+    plan = build_paper_trade_plan(
+        symbol=paper_symbol,
+        quote_snapshot=quote_snapshot,
+        account_summary=account_summary,
+        holdings=account_holdings,
+        analysis_result=active_analysis_result,
+    )
+
+    current_price = first_valid_float(quote_snapshot.get("current_price"))
+    change_pct = first_valid_float(quote_snapshot.get("change_pct"))
+    total_eval = first_valid_float(account_summary.get("total_eval"))
+    pnl_value = first_valid_float(account_summary.get("pnl"))
+    cash_value = first_valid_float(account_summary.get("cash"))
+    holding_count = int(first_valid_float(account_summary.get("holding_count"), default=0.0))
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("거래 종목", paper_name, paper_symbol)
+    metric_cols[1].metric("현재가", format_live_price(current_price, "KRW"), f"{change_pct:+.2f}%" if np.isfinite(change_pct) else None)
+    metric_cols[2].metric("총평가금액", format_live_price(total_eval, "KRW"), f"{pnl_value:+,.0f} KRW" if np.isfinite(pnl_value) else None)
+    metric_cols[3].metric("예수금", format_live_price(cash_value, "KRW"), f"보유 {holding_count}종목")
+
+    plan_col, order_col = st.columns([1.3, 1.0]) if not is_mobile_ui else (st.container(), st.container())
+
+    with plan_col:
+        st.markdown("**예측 기반 주문안**")
+        st.metric("추천 액션", plan["side_label"], f"{plan['predicted_move_pct']:+.2f}%" if np.isfinite(plan["predicted_move_pct"]) else None)
+        plan_metrics = st.columns(3)
+        plan_metrics[0].metric("예상 진입가", format_live_price(plan["entry_estimate"], "KRW"))
+        plan_metrics[1].metric("손절가", format_live_price(plan["stop_level"], "KRW"))
+        plan_metrics[2].metric("익절가", format_live_price(plan["take_level"], "KRW"))
+        plan_metrics_2 = st.columns(3)
+        plan_metrics_2[0].metric("예상 종가", format_live_price(plan["ensemble_pred"], "KRW"))
+        plan_metrics_2[1].metric("추천 수량", f"{int(plan['recommended_qty'])}주")
+        plan_metrics_2[2].metric("보유 수량", f"{int(plan['holding_qty'])}주")
+        st.caption(
+            f"계좌 예수금 기준 추천 배정금액: {format_live_price(plan['recommended_budget'], 'KRW')} · 신호 크기 {plan['planned_signal']:+.3f}"
+        )
+        if plan["note"]:
+            st.info(plan["note"])
+        if active_analysis_result is None:
+            st.caption("아직 이 종목의 예측 결과가 없어 주문안이 제한적입니다. `예측 갱신`을 눌러 계산하세요.")
+
+    with order_col:
+        st.markdown("**모의 주문 실행**")
+        suggested_side = plan["side"] if plan["side"] in {"buy", "sell"} else "buy"
+        side_labels = ["매수", "매도"]
+        default_side_index = 0 if suggested_side == "buy" else 1
+        side_label = st.selectbox("주문 방향", options=side_labels, index=default_side_index, key="paper_order_side")
+        side = "buy" if side_label == "매수" else "sell"
+        order_type_label = st.selectbox("주문 유형", options=list(PAPER_ORDER_TYPE_OPTIONS.keys()), index=0, key="paper_order_type")
+        order_type = PAPER_ORDER_TYPE_OPTIONS[order_type_label]
+        default_qty = max(1, int(plan["recommended_qty"] or 1))
+        order_qty = int(
+            st.number_input("주문 수량", min_value=1, value=default_qty, step=1, key="paper_order_qty")
+        )
+        default_limit_price = int(round(plan["entry_estimate"])) if np.isfinite(plan["entry_estimate"]) else int(round(current_price or 0.0))
+        limit_price = float(default_limit_price)
+        if order_type == "limit":
+            limit_price = float(
+                st.number_input(
+                    "지정가",
+                    min_value=0,
+                    value=max(0, default_limit_price),
+                    step=1,
+                    key="paper_limit_price",
+                )
+            )
+
+        can_submit = True
+        if side == "sell" and order_qty > int(plan["holding_qty"]):
+            can_submit = False
+            st.warning("매도 수량이 현재 보유 수량보다 많습니다.")
+        if side == "buy" and np.isfinite(current_price):
+            estimated_cost = order_qty * (limit_price if order_type == "limit" else current_price)
+            if estimated_cost > cash_value > 0:
+                st.warning("예수금보다 큰 주문입니다. KIS가 주문을 거절할 수 있습니다.")
+
+        consent = st.checkbox("KIS 모의계좌에 실제 API 주문을 전송하는 것에 동의합니다.", key="paper_order_consent")
+        if st.button(
+            "추천대로 모의주문 실행" if plan["recommended_qty"] > 0 else "모의주문 실행",
+            key="paper_submit_order",
+            type="primary",
+            disabled=(not consent) or (not can_submit),
+        ):
+            try:
+                prediction_id = prediction_id_for_run(linked_prediction_run_id, forecast_horizon=1) if linked_prediction_run_id else None
+                client = KISPaperClient()
+                order_result = client.place_cash_order(
+                    symbol_or_code=paper_symbol,
+                    side=side,
+                    quantity=order_qty,
+                    order_type=order_type,
+                    price=limit_price,
+                )
+                append_order_log(
+                    {
+                        "prediction_id": prediction_id,
+                        "requested_at": order_result["requested_at"],
+                        "symbol": paper_symbol,
+                        "symbol_code": order_result["symbol_code"],
+                        "name": paper_name,
+                        "side": side,
+                        "order_type": order_type,
+                        "quantity": order_qty,
+                        "requested_price": None if order_type == "market" else limit_price,
+                        "quote_price": current_price,
+                        "predicted_move_pct": plan["predicted_move_pct"],
+                        "entry_estimate": plan["entry_estimate"],
+                        "stop_level": plan["stop_level"],
+                        "take_level": plan["take_level"],
+                        "order_no": order_result["order_no"],
+                        "message": order_result["message"],
+                    }
+                )
+                if prediction_id and order_result.get("order_no"):
+                    attach_order_to_prediction(prediction_id=prediction_id, order_id=str(order_result["order_no"]))
+            except Exception as exc:
+                st.error(f"모의 주문 실패: {exc}")
+            else:
+                st.success(f"주문 접수 완료: {order_result['message'] or '모의투자 주문이 전송되었습니다.'}")
+                st.session_state["paper_account_refresh_token"] += 1
+                st.session_state["paper_quote_refresh_token"] += 1
+                st.rerun()
+
+    st.markdown("**보유 종목**")
+    if account_holdings.empty:
+        st.info("현재 모의계좌 보유 종목이 없습니다.")
+    else:
+        st.dataframe(account_holdings, width="stretch", hide_index=True)
+
+    equity_curve = load_equity_curve()
+    equity_metrics = compute_equity_metrics(equity_curve)
+    order_log = load_order_log(limit=200)
+
+    perf_cols = st.columns(4)
+    perf_cols[0].metric("에쿼티 샘플", f"{int(equity_metrics['samples'])}")
+    perf_cols[1].metric(
+        "누적 수익률",
+        f"{equity_metrics['total_return_pct']:+.2f}%" if np.isfinite(equity_metrics["total_return_pct"]) else "N/A",
+    )
+    perf_cols[2].metric(
+        "최대 낙폭",
+        f"{equity_metrics['max_drawdown_pct']:.2f}%" if np.isfinite(equity_metrics["max_drawdown_pct"]) else "N/A",
+    )
+    perf_cols[3].metric("주문 로그", f"{len(order_log)}건")
+
+    perf_cols_2 = st.columns(4)
+    perf_cols_2[0].metric("샤프", f"{equity_metrics['sharpe']:.2f}" if np.isfinite(equity_metrics["sharpe"]) else "N/A")
+    perf_cols_2[1].metric("소르티노", f"{equity_metrics['sortino']:.2f}" if np.isfinite(equity_metrics["sortino"]) else "N/A")
+    perf_cols_2[2].metric("Calmar", f"{equity_metrics['calmar']:.2f}" if np.isfinite(equity_metrics["calmar"]) else "N/A")
+    perf_cols_2[3].metric(
+        "노출비중",
+        format_pct_value(equity_metrics["exposure_pct"]) if np.isfinite(equity_metrics["exposure_pct"]) else "N/A",
+    )
+
+    perf_cols_3 = st.columns(4)
+    perf_cols_3[0].metric(
+        "기간 승률",
+        format_pct_value(equity_metrics["win_rate_pct"]) if np.isfinite(equity_metrics["win_rate_pct"]) else "N/A",
+    )
+    perf_cols_3[1].metric(
+        "Profit Factor",
+        f"{equity_metrics['profit_factor']:.2f}" if np.isfinite(equity_metrics["profit_factor"]) else "N/A",
+    )
+    perf_cols_3[2].metric(
+        "연속 손실",
+        f"{int(equity_metrics['max_consecutive_losses'])}" if np.isfinite(equity_metrics["max_consecutive_losses"]) else "N/A",
+    )
+    perf_cols_3[3].metric(
+        "최근 평가금액",
+        format_live_price(equity_metrics["latest_equity"], "KRW"),
+        None,
+    )
+
+    if not equity_curve.empty:
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=equity_curve["timestamp"],
+                    y=equity_curve["total_eval"],
+                    mode="lines+markers",
+                    name="총평가금액",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="모의계좌 에쿼티 곡선",
+            height=280 if is_mobile_ui else 340,
+            margin=dict(l=20, r=20, t=50, b=20),
+            yaxis_title="KRW",
+            xaxis_title="시각",
+        )
+        st.plotly_chart(fig, width="stretch")
+
+    with st.expander("주문 로그", expanded=not order_log.empty):
+        if order_log.empty:
+            st.caption("아직 기록된 주문이 없습니다.")
+        else:
+            order_view = order_log.copy()
+            if "requested_at" in order_view.columns:
+                order_view["requested_at"] = pd.to_datetime(order_view["requested_at"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M").fillna("")
+            order_view = order_view.rename(
+                columns={
+                    "requested_at": "시각",
+                    "prediction_id": "prediction_id",
+                    "order_id": "order_id",
+                    "name": "종목명",
+                    "symbol": "심볼",
+                    "side": "방향",
+                    "order_type": "유형",
+                    "quantity": "수량",
+                    "requested_price": "주문가",
+                    "quote_price": "현재가",
+                    "predicted_move_pct": "예상수익률(%)",
+                    "entry_estimate": "예상 진입가",
+                    "stop_level": "손절가",
+                    "take_level": "익절가",
+                    "order_no": "주문번호",
+                    "message": "메시지",
+                }
+            )
+            if "방향" in order_view.columns:
+                order_view["방향"] = order_view["방향"].map(PAPER_ORDER_SIDE_LABELS).fillna(order_view["방향"])
+            if "유형" in order_view.columns:
+                order_view["유형"] = order_view["유형"].map({"market": "시장가", "limit": "지정가"}).fillna(order_view["유형"])
+            preferred_cols = [
+                "시각",
+                "prediction_id",
+                "order_id",
+                "종목명",
+                "심볼",
+                "방향",
+                "유형",
+                "수량",
+                "주문가",
+                "현재가",
+                "예상수익률(%)",
+                "예상 진입가",
+                "손절가",
+                "익절가",
+                "주문번호",
+                "메시지",
+            ]
+            order_view = order_view[[col for col in preferred_cols if col in order_view.columns]]
+            st.dataframe(order_view, width="stretch", hide_index=True)
+
+    if unresolved:
+        with st.expander("국내 Top100 심볼 해석 실패"):
+            st.dataframe(pd.DataFrame({"종목명": unresolved}), width="stretch", hide_index=True)
+
+
 st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
 
 st.title("코인 · 미국주식 · 한국주식 가격 예측기")
-st.caption("미국주식·코인은 Yahoo Finance, 한국주식은 네이버 금융 데이터를 기반으로 앙상블 예측 결과를 시각화합니다.")
+st.caption("미국주식·코인은 Yahoo Finance, 한국주식 분석/모의매매는 KIS 우선(실패 시 네이버 fallback), 대시보드 대량 시세는 네이버 배치 조회를 사용합니다.")
 st.info("이 도구는 실험/학습 목적입니다. 어떤 모델도 미래 가격을 보장하지 않습니다.", icon="ℹ️")
 auto_mobile_detected = detect_mobile_client()
 
@@ -1296,6 +2169,16 @@ st.session_state.setdefault("analysis_auto_run", False)
 st.session_state.setdefault("analysis_result", None)
 st.session_state.setdefault("analysis_result_symbol", "")
 st.session_state.setdefault("analysis_result_forecast_days", 0)
+st.session_state.setdefault("analysis_prediction_run_id", "")
+st.session_state.setdefault("paper_analysis_result", None)
+st.session_state.setdefault("paper_analysis_symbol", "")
+st.session_state.setdefault("paper_analysis_forecast_days", 0)
+st.session_state.setdefault("paper_prediction_run_id", "")
+st.session_state.setdefault("paper_account_refresh_token", 0)
+st.session_state.setdefault("paper_quote_refresh_token", 0)
+st.session_state.setdefault("paper_symbol_label", "")
+st.session_state.setdefault("paper_manual_symbol", "")
+st.session_state.setdefault("paper_market", "KOSPI")
 st.session_state.setdefault("dashboard_quote_refresh_token", 0)
 st.session_state.setdefault("dashboard_initialized", not auto_mobile_detected)
 
@@ -1368,8 +2251,29 @@ with st.sidebar:
             "포지션 크기는 신호강도와 변동성 타깃에 따라 자동 조절됩니다. ATR 손절/익절은 일봉 근사이며, 같은 날 둘 다 닿으면 손절 우선으로 처리합니다."
         )
 
+analysis_inputs = {
+    "years": years,
+    "test_days": test_days,
+    "forecast_days": forecast_days,
+    "validation_mode": validation_mode,
+    "retrain_every": retrain_every,
+    "round_trip_cost_bps": round_trip_cost_bps,
+    "min_signal_strength_pct": min_signal_strength_pct,
+    "final_holdout_days": final_holdout_days,
+    "purge_days": purge_days,
+    "embargo_days": embargo_days,
+    "target_mode": target_mode,
+    "validation_days": validation_days,
+    "allow_short": allow_short,
+    "trade_mode": trade_mode,
+    "target_daily_vol_pct": target_daily_vol_pct,
+    "max_position_size": max_position_size,
+    "stop_loss_atr_mult": stop_loss_atr_mult,
+    "take_profit_atr_mult": take_profit_atr_mult,
+}
+
 apply_responsive_css(is_mobile_ui=is_mobile_ui)
-st.radio("화면", ["대시보드", "종목 분석", "종목 스캔"], horizontal=True, key="active_view")
+st.radio("화면", ["대시보드", "종목 분석", PAPER_VIEW_NAME, "종목 스캔"], horizontal=True, key="active_view")
 
 if st.session_state["active_view"] == "대시보드":
     st.subheader(f"{asset_type} 대시보드")
@@ -1570,6 +2474,15 @@ elif st.session_state["active_view"] == "종목 분석":
             st.session_state["analysis_result"] = analysis_result
             st.session_state["analysis_result_symbol"] = normalized_symbol
             st.session_state["analysis_result_forecast_days"] = forecast_days
+            try:
+                st.session_state["analysis_prediction_run_id"] = save_prediction_snapshot(
+                    asset_type=run_asset_type,
+                    korea_market=run_korea_market,
+                    result=analysis_result,
+                    notes="analysis_page_auto_save",
+                )
+            except Exception:
+                st.session_state["analysis_prediction_run_id"] = ""
 
     saved_result = st.session_state.get("analysis_result")
     saved_symbol = str(st.session_state.get("analysis_result_symbol", ""))
@@ -1580,7 +2493,16 @@ elif st.session_state["active_view"] == "종목 분석":
     else:
         if saved_symbol != normalized_symbol:
             st.info(f"현재 설정은 `{normalized_symbol}` 이고, 아래 결과는 최근 실행한 `{saved_symbol}` 기준입니다.")
-        render_single_result(result=saved_result, forecast_days=saved_forecast_days, is_mobile_ui=is_mobile_ui)
+        render_single_result(
+            result=saved_result,
+            forecast_days=saved_forecast_days,
+            is_mobile_ui=is_mobile_ui,
+            asset_type=run_asset_type,
+            korea_market=run_korea_market,
+        )
+
+elif st.session_state["active_view"] == PAPER_VIEW_NAME:
+    render_paper_trading_page(analysis_inputs=analysis_inputs, is_mobile_ui=is_mobile_ui)
 
 else:
     st.subheader("종목 스캔")

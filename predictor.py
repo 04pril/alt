@@ -4,6 +4,8 @@ import contextlib
 import io
 import logging
 import ast
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -18,12 +20,20 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+try:
+    from kis_paper import KISPaperClient
+except Exception:  # pragma: no cover - optional local KIS config
+    KISPaperClient = None
+
 
 MIN_TRAIN_DAYS = 120
 MIN_VAL_DAYS = 20
 MIN_TEST_DAYS = 20
 MIN_HOLDOUT_DAYS = 20
 NAVER_HEADERS = {"User-Agent": "Mozilla/5.0"}
+MODEL_NAME = "ensemble"
+MODEL_VERSION = "2026-03-06_02"
+FEATURE_VERSION = "fv2"
 
 
 def quiet_external_call(fn):
@@ -56,6 +66,14 @@ class ForecastResult:
     validation_summary: pd.DataFrame
     validation_frame: pd.DataFrame
     validation_metrics: pd.DataFrame
+    target_mode: str
+    trade_mode: str
+    signal_threshold_pct: float
+    model_name: str
+    model_version: str
+    feature_version: str
+    feature_hash: str
+    data_cutoff_at: pd.Timestamp
 
 
 def normalize_symbol(asset_type: str, raw_symbol: str, korea_market: str = "KOSPI") -> str:
@@ -86,6 +104,12 @@ def extract_korean_stock_code(symbol: str) -> str:
 
 
 def download_kr_price_data(symbol: str, years: int) -> pd.DataFrame:
+    if KISPaperClient is not None:
+        try:
+            return KISPaperClient().get_daily_history(symbol_or_code=symbol, years=years)
+        except Exception:
+            pass
+
     code = extract_korean_stock_code(symbol)
     end = pd.Timestamp.now(tz="Asia/Seoul").normalize()
     start = end - pd.DateOffset(years=years, days=10)
@@ -254,6 +278,18 @@ def _build_dataset(price_data: pd.DataFrame, lags: int, target_mode: str) -> Tup
 
     feature_cols = [c for c in data.columns if c not in {"target", "next_close"}]
     return data, feature_cols, raw
+
+
+def _feature_hash(dataset: pd.DataFrame, feature_cols: List[str]) -> str:
+    if dataset.empty or not feature_cols:
+        return ""
+    row = dataset.iloc[-1][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    payload = {
+        "feature_cols": feature_cols,
+        "latest_row": {key: float(value) for key, value in row.items()},
+        "feature_version": FEATURE_VERSION,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
 
 def _safe_mape(actual: np.ndarray, pred: np.ndarray) -> float:
@@ -1226,6 +1262,8 @@ def run_forecast(
         ]
     )
 
+    feature_hash = _feature_hash(dataset=dataset, feature_cols=feature_cols)
+
     return ForecastResult(
         symbol=symbol,
         price_data=price_data,
@@ -1245,4 +1283,12 @@ def run_forecast(
         validation_summary=validation_summary,
         validation_frame=validation_frame,
         validation_metrics=validation_metrics,
+        target_mode=target_mode,
+        trade_mode=trade_mode,
+        signal_threshold_pct=float(tuned_threshold),
+        model_name=MODEL_NAME,
+        model_version=MODEL_VERSION,
+        feature_version=FEATURE_VERSION,
+        feature_hash=feature_hash,
+        data_cutoff_at=pd.Timestamp(price_data.index.max()),
     )
