@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import html
+import io
+import logging
 import re
+import warnings
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -44,11 +48,13 @@ TRADE_METRIC_LABELS = {
     "round_trip_cost_bps_assumed": "왕복비용(bps)",
     "signal_threshold_pct": "최소신호강도(%)",
     "allow_short": "숏허용(1/0)",
+    "avg_position_abs_pct": "평균포지션크기(%)",
 }
 
 VALIDATION_ITEM_LABELS = {
     "validation_mode": "검증모드",
     "target_mode": "타깃모드",
+    "trade_mode": "매매손익기준",
     "gap_days_total": "총 갭일수(purge+embargo)",
     "purge_days": "purge 일수",
     "embargo_days": "embargo 일수",
@@ -57,6 +63,10 @@ VALIDATION_ITEM_LABELS = {
     "final_holdout_days": "최종 홀드아웃 일수",
     "selected_signal_threshold_pct": "선택된 신호강도(%)",
     "allow_short": "숏허용(1/0)",
+    "target_daily_vol_pct": "목표일변동성(%)",
+    "max_position_size": "최대포지션크기(배)",
+    "stop_loss_atr_mult": "ATR 손절 배수",
+    "take_profit_atr_mult": "ATR 익절 배수",
     "vol_low_threshold_pct": "저변동성 경계(%)",
     "vol_high_threshold_pct": "고변동성 경계(%)",
 }
@@ -145,13 +155,24 @@ def to_validation_view(summary_df: pd.DataFrame) -> pd.DataFrame:
     return view
 
 
+def quiet_external_call(fn):
+    previous_disable = logging.root.manager.disable
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module=r"bs4\..*")
+        logging.disable(logging.CRITICAL)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                return fn()
+        finally:
+            logging.disable(previous_disable)
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     try:
-        df = pd.read_html(
-            "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
-            encoding="euc-kr",
-        )[0]
+        df = quiet_external_call(
+            lambda: pd.read_html("https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13")[0]
+        )
     except Exception:
         return {}
 
@@ -172,7 +193,7 @@ def search_symbol_from_yf(query: str, market_hint: str) -> str | None:
         return None
 
     try:
-        quotes = yf.Search(q, max_results=12).quotes
+        quotes = quiet_external_call(lambda: yf.Search(q, max_results=12).quotes)
     except Exception:
         return None
     if not quotes:
@@ -369,7 +390,7 @@ def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
     currency = ""
 
     try:
-        fast_info = ticker.fast_info or {}
+        fast_info = quiet_external_call(lambda: ticker.fast_info) or {}
         current_price = first_valid_float(
             fast_info.get("last_price"),
             fast_info.get("regular_market_price"),
@@ -388,7 +409,7 @@ def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
 
     if np.isnan(current_price) or np.isnan(previous_close):
         try:
-            hist = ticker.history(period="5d", interval="1d", auto_adjust=False)
+            hist = quiet_external_call(lambda: ticker.history(period="5d", interval="1d", auto_adjust=False))
         except Exception:
             hist = pd.DataFrame()
 
@@ -405,7 +426,7 @@ def fetch_single_quote_snapshot(symbol: str) -> Dict[str, float | str]:
 
     if np.isnan(current_price) or np.isnan(previous_close) or not currency:
         try:
-            info = ticker.info
+            info = quiet_external_call(lambda: ticker.info)
         except Exception:
             info = {}
 
@@ -589,6 +610,66 @@ def build_single_picker_options(rows: List[Dict[str, str | int | float | None]])
     return options
 
 
+def summary_item_value(summary_df: pd.DataFrame, key: str, default: float | str = "") -> float | str:
+    row = summary_df.loc[summary_df["item"] == key, "value"]
+    if row.empty:
+        return default
+    value = row.iloc[0]
+    if isinstance(default, float):
+        try:
+            value = float(value)
+        except Exception:
+            return default
+        if np.isnan(value):
+            return default
+    return value
+
+
+def format_price_value(value: float) -> str:
+    return f"{value:,.2f}" if np.isfinite(value) else "N/A"
+
+
+def format_pct_value(value: float) -> str:
+    return f"{value:+.2f}%" if np.isfinite(value) else "N/A"
+
+
+def build_trade_sample_view(backtest_frame: pd.DataFrame, limit: int = 8) -> pd.DataFrame:
+    if backtest_frame.empty:
+        return pd.DataFrame()
+
+    trade_rows = backtest_frame.loc[backtest_frame["signal"].abs() > 1e-12].copy()
+    if trade_rows.empty:
+        return pd.DataFrame()
+
+    view = trade_rows.tail(limit).copy()
+    for col in ["signal", "predicted_move_pct", "entry_price", "stop_level", "take_level", "exit_price", "gross_return", "net_return"]:
+        if col in view.columns:
+            if col in {"gross_return", "net_return"}:
+                view[col] = view[col].map(lambda v: f"{float(v) * 100.0:+.2f}%" if np.isfinite(float(v)) else "N/A")
+            elif col == "signal":
+                view[col] = view[col].map(lambda v: f"{float(v):+.2f}" if np.isfinite(float(v)) else "N/A")
+            elif col == "predicted_move_pct":
+                view[col] = view[col].map(lambda v: format_pct_value(float(v)))
+            else:
+                view[col] = view[col].map(lambda v: format_price_value(float(v)))
+
+    keep_cols = [c for c in ["signal_label", "signal", "predicted_move_pct", "entry_price", "stop_level", "take_level", "exit_price", "exit_reason", "net_return"] if c in view.columns]
+    view = view[keep_cols].rename(
+        columns={
+            "signal_label": "방향",
+            "signal": "포지션",
+            "predicted_move_pct": "예상변화율",
+            "entry_price": "진입가",
+            "stop_level": "손절가",
+            "take_level": "익절가",
+            "exit_price": "청산가",
+            "exit_reason": "청산사유",
+            "net_return": "순수익률",
+        }
+    )
+    return view
+
+
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
     eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics
     eval_trade_metrics = (
@@ -641,6 +722,21 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
     last_pred = float(result.future_frame["ensemble_pred"].iloc[-1])
     next_pred = float(result.future_frame["ensemble_pred"].iloc[0])
     expected_return = (last_pred / latest_close - 1.0) * 100.0
+    trade_mode = str(summary_item_value(result.validation_summary, "trade_mode", "close_to_close"))
+    next_plan = result.future_frame.iloc[0]
+    planned_signal = float(next_plan.get("planned_signal", 0.0))
+    position_size = float(next_plan.get("position_size", 0.0))
+    entry_estimate = float(next_plan.get("entry_estimate", float("nan")))
+    stop_level = float(next_plan.get("stop_level", float("nan")))
+    take_level = float(next_plan.get("take_level", float("nan")))
+    atr_now = float(next_plan.get("atr_14", float("nan")))
+    next_move_pct = float(next_plan.get("ensemble_pred_return_pct", float("nan")))
+    if planned_signal > 1e-12:
+        plan_direction = "LONG"
+    elif planned_signal < -1e-12:
+        plan_direction = "SHORT"
+    else:
+        plan_direction = "FLAT"
 
     if is_mobile_ui:
         top_row_1 = st.columns(2)
@@ -656,49 +752,90 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
         c3.metric(f"{forecast_days}일 기대 수익률", f"{expected_return:+.2f}%")
         c4.metric("검증모드", "워크포워드" if result.validation_mode == "walk_forward" else "홀드아웃")
 
+    st.subheader("다음 거래 계획")
+    if is_mobile_ui:
+        plan_top = st.columns(2)
+        plan_mid = st.columns(2)
+        plan_bot = st.columns(2)
+        plan_top[0].metric("방향", plan_direction, f"포지션 {position_size:.2f}배")
+        plan_top[1].metric("예상 변화율", format_pct_value(next_move_pct), trade_mode)
+        plan_mid[0].metric("예상 진입가", format_price_value(entry_estimate))
+        plan_mid[1].metric("손절가", format_price_value(stop_level))
+        plan_bot[0].metric("익절가", format_price_value(take_level))
+        plan_bot[1].metric("ATR(14)", format_price_value(atr_now))
+    else:
+        plan_cols = st.columns(6)
+        plan_cols[0].metric("방향", plan_direction, f"포지션 {position_size:.2f}배")
+        plan_cols[1].metric("예상 변화율", format_pct_value(next_move_pct), trade_mode)
+        plan_cols[2].metric("예상 진입가", format_price_value(entry_estimate))
+        plan_cols[3].metric("손절가", format_price_value(stop_level))
+        plan_cols[4].metric("익절가", format_price_value(take_level))
+        plan_cols[5].metric("ATR(14)", format_price_value(atr_now))
+
+    if plan_direction == "FLAT":
+        st.caption("현재 기준으로는 최소 신호 강도 미만이라 신규 진입보다 관망에 가깝습니다.")
+    elif trade_mode == "open_to_close":
+        st.caption("`open→close` 모드에서는 다음 시가를 알 수 없어서 예상 진입가는 현재 종가 기준 추정치로 표시합니다.")
+
     st.subheader("검증 설정 요약")
-    st.dataframe(to_validation_view(result.validation_summary), use_container_width=True, hide_index=True)
+    st.dataframe(to_validation_view(result.validation_summary), width="stretch", hide_index=True)
 
     if is_mobile_ui:
         st.subheader("모델 성능")
         st.caption("Validation")
-        st.dataframe(to_model_view(result.validation_metrics), use_container_width=True, hide_index=True)
+        st.dataframe(to_model_view(result.validation_metrics), width="stretch", hide_index=True)
         st.caption("연구구간")
-        st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
+        st.dataframe(to_model_view(result.metrics), width="stretch", hide_index=True)
         st.caption("최종 홀드아웃")
-        st.dataframe(to_model_view(result.final_holdout_metrics), use_container_width=True, hide_index=True)
+        st.dataframe(to_model_view(result.final_holdout_metrics), width="stretch", hide_index=True)
     else:
         left, mid, right = st.columns(3)
         with left:
             st.subheader("Validation 모델 성능")
-            st.dataframe(to_model_view(result.validation_metrics), use_container_width=True, hide_index=True)
+            st.dataframe(to_model_view(result.validation_metrics), width="stretch", hide_index=True)
         with mid:
             st.subheader("연구구간 모델 성능")
-            st.dataframe(to_model_view(result.metrics), use_container_width=True, hide_index=True)
+            st.dataframe(to_model_view(result.metrics), width="stretch", hide_index=True)
         with right:
             st.subheader("최종 홀드아웃 모델 성능")
-            st.dataframe(to_model_view(result.final_holdout_metrics), use_container_width=True, hide_index=True)
+            st.dataframe(to_model_view(result.final_holdout_metrics), width="stretch", hide_index=True)
 
     weight_table = result.metrics[result.metrics["model"].isin(result.weights.keys())][["model"]].copy().assign(
         weight_pct=lambda df: df["model"].map(result.weights).fillna(0.0) * 100.0
     )
     weight_table = weight_table.rename(columns={"model": "모델", "weight_pct": "연구구간 가중치(%)"})
-    st.dataframe(weight_table, use_container_width=True, hide_index=True)
+    st.dataframe(weight_table, width="stretch", hide_index=True)
 
     if is_mobile_ui:
         st.subheader("거래 백테스트")
         st.caption("연구구간")
-        st.dataframe(to_trade_view(result.trade_metrics), use_container_width=True, hide_index=True)
+        st.dataframe(to_trade_view(result.trade_metrics), width="stretch", hide_index=True)
+        trade_sample_view = build_trade_sample_view(result.trade_backtest)
+        if not trade_sample_view.empty:
+            st.caption("연구구간 최근 거래 샘플")
+            st.dataframe(trade_sample_view, width="stretch")
         st.caption("최종 홀드아웃")
-        st.dataframe(to_trade_view(result.final_holdout_trade_metrics), use_container_width=True, hide_index=True)
+        st.dataframe(to_trade_view(result.final_holdout_trade_metrics), width="stretch", hide_index=True)
+        holdout_trade_sample_view = build_trade_sample_view(result.final_holdout_trade_backtest)
+        if not holdout_trade_sample_view.empty:
+            st.caption("최종 홀드아웃 최근 거래 샘플")
+            st.dataframe(holdout_trade_sample_view, width="stretch")
     else:
         bt_left, bt_right = st.columns(2)
         with bt_left:
             st.subheader("연구구간 거래 백테스트")
-            st.dataframe(to_trade_view(result.trade_metrics), use_container_width=True, hide_index=True)
+            st.dataframe(to_trade_view(result.trade_metrics), width="stretch", hide_index=True)
+            trade_sample_view = build_trade_sample_view(result.trade_backtest)
+            if not trade_sample_view.empty:
+                st.caption("최근 거래 샘플")
+                st.dataframe(trade_sample_view, width="stretch")
         with bt_right:
             st.subheader("최종 홀드아웃 거래 백테스트")
-            st.dataframe(to_trade_view(result.final_holdout_trade_metrics), use_container_width=True, hide_index=True)
+            st.dataframe(to_trade_view(result.final_holdout_trade_metrics), width="stretch", hide_index=True)
+            holdout_trade_sample_view = build_trade_sample_view(result.final_holdout_trade_backtest)
+            if not holdout_trade_sample_view.empty:
+                st.caption("최근 거래 샘플")
+                st.dataframe(holdout_trade_sample_view, width="stretch")
 
     st.subheader("변동성 레짐별 성과 분해")
     if result.regime_metrics.empty:
@@ -719,7 +856,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
                 "avg_volatility_pct": "평균변동성(%)",
             }
         )
-        st.dataframe(regime_view, use_container_width=True, hide_index=True)
+        st.dataframe(regime_view, width="stretch", hide_index=True)
 
     st.subheader("연구구간 vs 최종 홀드아웃 누적수익률")
     eq_fig = go.Figure()
@@ -747,7 +884,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
         hovermode="x unified",
         yaxis_title="누적수익률(%)",
     )
-    st.plotly_chart(eq_fig, use_container_width=True)
+    st.plotly_chart(eq_fig, width="stretch")
 
     st.subheader("가격 추이 + 예측")
     fig = go.Figure()
@@ -814,12 +951,18 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
         legend=dict(orientation="h", y=1.02, x=0),
         margin=dict(l=20, r=20, t=10, b=20),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.subheader("미래 예측 상세")
     future_view = result.future_frame.rename(
         columns={
             "ensemble_pred": "앙상블예측",
+            "entry_estimate": "예상진입가",
+            "stop_level": "손절가",
+            "take_level": "익절가",
+            "planned_signal": "계획신호",
+            "position_size": "포지션크기",
+            "atr_14": "ATR(14)",
             "Ridge_pred": "Ridge예측",
             "RandomForest_pred": "RandomForest예측",
             "GradientBoosting_pred": "GradientBoosting예측",
@@ -827,7 +970,7 @@ def render_single_result(result, forecast_days: int, is_mobile_ui: bool) -> None
             "upper_band_1sigma": "상단밴드(1σ)",
         }
     )
-    st.dataframe(future_view, use_container_width=True)
+    st.dataframe(future_view, width="stretch")
 
 
 st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
@@ -854,6 +997,11 @@ def run_cached(
     target_mode: str,
     validation_days: int,
     allow_short: bool,
+    trade_mode: str,
+    target_daily_vol_pct: float,
+    max_position_size: float,
+    stop_loss_atr_mult: float,
+    take_profit_atr_mult: float,
 ):
     return run_forecast(
         symbol=symbol,
@@ -870,6 +1018,11 @@ def run_cached(
         target_mode=target_mode,
         validation_days=validation_days,
         allow_short=allow_short,
+        trade_mode=trade_mode,
+        target_daily_vol_pct=target_daily_vol_pct,
+        max_position_size=max_position_size,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
     )
 
 
@@ -918,6 +1071,12 @@ with st.sidebar:
 
     round_trip_cost_bps = st.slider("왕복 거래비용 가정(bps)", min_value=0.0, max_value=50.0, value=8.0, step=0.5)
     allow_short = st.checkbox("숏(공매도) 허용", value=False)
+    trade_mode_label = st.selectbox("매매 손익 계산 기준", ["close→close(권장)", "open→close(기존)"], index=0)
+    trade_mode = "close_to_close" if trade_mode_label.startswith("close") else "open_to_close"
+    target_daily_vol_pct = st.slider("목표 일변동성(%)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+    max_position_size = st.slider("최대 포지션 크기(배)", min_value=0.1, max_value=1.5, value=1.0, step=0.1)
+    stop_loss_atr_mult = st.slider("ATR 손절 배수", min_value=0.0, max_value=5.0, value=1.5, step=0.1)
+    take_profit_atr_mult = st.slider("ATR 익절 배수", min_value=0.0, max_value=8.0, value=3.0, step=0.1)
     min_signal_strength_pct = st.slider(
         "최소 신호 강도(%)",
         min_value=0.0,
@@ -925,7 +1084,7 @@ with st.sidebar:
         value=0.2,
         step=0.05,
     )
-    st.caption("신호 강도 이하 구간은 거래하지 않아 과도한 회전을 줄입니다.")
+    st.caption("포지션 크기는 신호강도와 변동성 타겟에 따라 자동 조절됩니다. ATR 손절/익절은 일봉 근사이며, 같은 날 둘 다 닿으면 손절 우선으로 처리합니다.")
 
     st.divider()
     st.subheader("단일 종목")
@@ -1039,7 +1198,7 @@ with tab_single:
         st.warning("검색/필터 조건에 맞는 종목이 없거나 자동 해석된 심볼이 없습니다.")
 
     if not mobile_mode:
-        st.dataframe(build_snapshot_view_df(filtered_rows), use_container_width=True, height=420, hide_index=True)
+        st.dataframe(build_snapshot_view_df(filtered_rows), width="stretch", height=420, hide_index=True)
         with st.expander("카드형 리스트 보기"):
             render_top100_snapshot_cards(rows=filtered_rows)
     else:
@@ -1047,7 +1206,7 @@ with tab_single:
 
     if unresolved_single_names:
         with st.expander("심볼 자동 해석 실패 종목"):
-            st.dataframe(pd.DataFrame({"종목명": unresolved_single_names}), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame({"종목명": unresolved_single_names}), width="stretch", hide_index=True)
 
     if mobile_mode:
         run_single_top = st.button(
@@ -1095,6 +1254,11 @@ with tab_single:
                     target_mode=target_mode,
                     validation_days=validation_days,
                     allow_short=allow_short,
+                    trade_mode=trade_mode,
+                    target_daily_vol_pct=target_daily_vol_pct,
+                    max_position_size=max_position_size,
+                    stop_loss_atr_mult=stop_loss_atr_mult,
+                    take_profit_atr_mult=take_profit_atr_mult,
                 )
         except Exception as exc:
             st.error(f"실행 중 오류: {exc}")
@@ -1181,7 +1345,7 @@ with tab_scan:
         if unresolved_names:
             unresolved_frame = pd.DataFrame({"미해결 종목명": unresolved_names})
             st.warning("일부 종목은 티커를 자동으로 찾지 못했습니다. 아래 목록은 직접 심볼 입력이 필요합니다.")
-            st.dataframe(unresolved_frame, use_container_width=True, hide_index=True)
+            st.dataframe(unresolved_frame, width="stretch", hide_index=True)
 
         if not resolved_pairs:
             st.error("스캔할 심볼이 없습니다. Top100 선택 또는 심볼 직접 입력을 확인해 주세요.")
@@ -1213,6 +1377,11 @@ with tab_scan:
                         target_mode=target_mode,
                         validation_days=validation_days,
                         allow_short=allow_short,
+                        trade_mode=trade_mode,
+                        target_daily_vol_pct=target_daily_vol_pct,
+                        max_position_size=max_position_size,
+                        stop_loss_atr_mult=stop_loss_atr_mult,
+                        take_profit_atr_mult=take_profit_atr_mult,
                     )
                     row = build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days)
                     row["종목명"] = display_name
@@ -1268,15 +1437,15 @@ with tab_scan:
                     yaxis_title="점수",
                     xaxis_title="종목",
                 )
-                st.plotly_chart(score_fig, use_container_width=True)
+                st.plotly_chart(score_fig, width="stretch")
 
                 st.subheader("전체 스캔 결과")
-                st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.dataframe(summary, width="stretch", hide_index=True)
             else:
                 st.warning("정상 분석된 종목이 없습니다. 심볼 형식이나 인터넷 연결 상태를 확인해 주세요.")
 
             if errors:
                 st.subheader("실패한 항목")
-                st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
     else:
         st.write("종목을 선택하고 **유망 종목 스캔 실행**을 눌러 주세요.")

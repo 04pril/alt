@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -18,6 +21,16 @@ MIN_TRAIN_DAYS = 120
 MIN_VAL_DAYS = 20
 MIN_TEST_DAYS = 20
 MIN_HOLDOUT_DAYS = 20
+
+
+def quiet_external_call(fn):
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fn()
+    finally:
+        logging.disable(previous_disable)
 
 
 @dataclass
@@ -59,13 +72,15 @@ def download_price_data(symbol: str, years: int = 5) -> pd.DataFrame:
     if years < 1:
         raise ValueError("조회 기간(years)은 1 이상이어야 합니다.")
 
-    frame = yf.download(
-        symbol,
-        period=f"{years}y",
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        threads=False,
+    frame = quiet_external_call(
+        lambda: yf.download(
+            symbol,
+            period=f"{years}y",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
     )
     if frame.empty:
         raise ValueError("가격 데이터를 불러오지 못했습니다. 심볼을 확인해 주세요.")
@@ -367,7 +382,7 @@ def _trade_metric_rows(
     signal_threshold_pct: float,
     allow_short: bool,
 ) -> List[Dict[str, float]]:
-    trade_flag = (signal != 0.0).astype(float)
+    trade_flag = (signal.abs() > 1e-12).astype(float)
     trade_returns = net_return[trade_flag > 0].dropna()
     trades = int(len(trade_returns))
 
@@ -383,6 +398,7 @@ def _trade_metric_rows(
     net_cum_return_pct = float((equity_curve.iloc[-1] - 1.0) * 100.0) if len(equity_curve) else 0.0
     max_drawdown_pct = float(((equity_curve / equity_curve.cummax()) - 1.0).min() * 100.0) if len(equity_curve) else 0.0
     exposure_pct = float(trade_flag.mean() * 100.0) if len(trade_flag) else 0.0
+    avg_position_abs_pct = float(signal.abs().mean() * 100.0) if len(signal) else 0.0
 
     return [
         {"metric": "trades", "value": float(trades)},
@@ -397,7 +413,122 @@ def _trade_metric_rows(
         {"metric": "round_trip_cost_bps_assumed", "value": float(round_trip_cost_bps)},
         {"metric": "signal_threshold_pct", "value": float(signal_threshold_pct)},
         {"metric": "allow_short", "value": float(1.0 if allow_short else 0.0)},
+        {"metric": "avg_position_abs_pct", "value": avg_position_abs_pct},
     ]
+
+
+def _atr_series(price_data: pd.DataFrame, window: int = 14) -> pd.Series:
+    high = price_data["High"].astype(float)
+    low = price_data["Low"].astype(float)
+    close = price_data["Close"].astype(float)
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.rolling(window).mean()
+
+
+def _apply_atr_stops_and_targets(
+    entry_price: pd.Series,
+    base_exit_price: pd.Series,
+    session_open: pd.Series,
+    session_high: pd.Series,
+    session_low: pd.Series,
+    atr_value: pd.Series,
+    signal: pd.Series,
+    stop_loss_atr_mult: float,
+    take_profit_atr_mult: float,
+) -> pd.DataFrame:
+    exit_price = base_exit_price.astype(float).copy()
+    stop_level = pd.Series(np.nan, index=entry_price.index, dtype=float)
+    take_level = pd.Series(np.nan, index=entry_price.index, dtype=float)
+    stop_hit = pd.Series(False, index=entry_price.index, dtype=bool)
+    take_hit = pd.Series(False, index=entry_price.index, dtype=bool)
+    exit_reason = pd.Series("close", index=entry_price.index, dtype="object")
+
+    if stop_loss_atr_mult <= 0 and take_profit_atr_mult <= 0:
+        return pd.DataFrame(
+            {
+                "exit_price": exit_price,
+                "stop_level": stop_level,
+                "take_level": take_level,
+                "stop_hit": stop_hit,
+                "take_hit": take_hit,
+                "exit_reason": exit_reason,
+            }
+        )
+
+    for idx in entry_price.index:
+        size = float(signal.loc[idx])
+        if abs(size) <= 1e-12:
+            continue
+
+        entry = float(entry_price.loc[idx])
+        base_exit = float(base_exit_price.loc[idx]) if pd.notna(base_exit_price.loc[idx]) else np.nan
+        day_open = float(session_open.loc[idx]) if pd.notna(session_open.loc[idx]) else np.nan
+        day_high = float(session_high.loc[idx]) if pd.notna(session_high.loc[idx]) else np.nan
+        day_low = float(session_low.loc[idx]) if pd.notna(session_low.loc[idx]) else np.nan
+        atr = float(atr_value.loc[idx]) if pd.notna(atr_value.loc[idx]) else np.nan
+        if not np.isfinite(entry) or not np.isfinite(base_exit) or not np.isfinite(day_high) or not np.isfinite(day_low):
+            continue
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+
+        is_long = size > 0
+
+        current_stop = np.nan
+        current_take = np.nan
+        current_stop_hit = False
+        current_take_hit = False
+        chosen_exit = base_exit
+        chosen_reason = "close"
+
+        if stop_loss_atr_mult > 0:
+            current_stop = entry - atr * stop_loss_atr_mult if is_long else entry + atr * stop_loss_atr_mult
+            current_stop_hit = day_low <= current_stop if is_long else day_high >= current_stop
+
+        if take_profit_atr_mult > 0:
+            current_take = entry + atr * take_profit_atr_mult if is_long else entry - atr * take_profit_atr_mult
+            current_take_hit = day_high >= current_take if is_long else day_low <= current_take
+
+        if current_stop_hit and current_take_hit:
+            if is_long:
+                chosen_exit = min(day_open, current_stop) if np.isfinite(day_open) else current_stop
+            else:
+                chosen_exit = max(day_open, current_stop) if np.isfinite(day_open) else current_stop
+            chosen_reason = "stop_priority"
+        elif current_stop_hit:
+            if is_long:
+                chosen_exit = min(day_open, current_stop) if np.isfinite(day_open) else current_stop
+            else:
+                chosen_exit = max(day_open, current_stop) if np.isfinite(day_open) else current_stop
+            chosen_reason = "stop_loss"
+        elif current_take_hit:
+            chosen_exit = current_take
+            chosen_reason = "take_profit"
+
+        exit_price.loc[idx] = float(chosen_exit)
+        stop_level.loc[idx] = current_stop
+        take_level.loc[idx] = current_take
+        stop_hit.loc[idx] = bool(current_stop_hit)
+        take_hit.loc[idx] = bool(current_take_hit)
+        exit_reason.loc[idx] = chosen_reason
+
+    return pd.DataFrame(
+        {
+            "exit_price": exit_price,
+            "stop_level": stop_level,
+            "take_level": take_level,
+            "stop_hit": stop_hit,
+            "take_hit": take_hit,
+            "exit_reason": exit_reason,
+        }
+    )
 
 
 def _simulate_trade_backtest(
@@ -406,39 +537,92 @@ def _simulate_trade_backtest(
     round_trip_cost_bps: float,
     signal_threshold_pct: float,
     allow_short: bool,
+    trade_mode: str,
+    target_daily_vol_pct: float,
+    max_position_size: float,
+    stop_loss_atr_mult: float,
+    take_profit_atr_mult: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    next_open = price_data["Open"].shift(-1).reindex(eval_frame.index)
-    next_close = price_data["Close"].shift(-1).reindex(eval_frame.index)
+    if trade_mode == "close_to_close":
+        entry_price = price_data["Close"].reindex(eval_frame.index)
+        session_open = price_data["Open"].shift(-1).reindex(eval_frame.index)
+        session_high = price_data["High"].shift(-1).reindex(eval_frame.index)
+        session_low = price_data["Low"].shift(-1).reindex(eval_frame.index)
+        base_exit_price = price_data["Close"].shift(-1).reindex(eval_frame.index)
+    elif trade_mode == "open_to_close":
+        session_open = price_data["Open"].shift(-1).reindex(eval_frame.index)
+        session_high = price_data["High"].shift(-1).reindex(eval_frame.index)
+        session_low = price_data["Low"].shift(-1).reindex(eval_frame.index)
+        entry_price = session_open.copy()
+        base_exit_price = price_data["Close"].shift(-1).reindex(eval_frame.index)
+    else:
+        raise ValueError("trade_mode는 'close_to_close' 또는 'open_to_close'만 지원합니다.")
 
     predicted_move_pct = (eval_frame["ensemble_pred"] / eval_frame["current_close"] - 1.0) * 100.0
     if allow_short:
-        raw_signal = np.where(
+        raw_direction = np.where(
             predicted_move_pct > signal_threshold_pct,
             1.0,
             np.where(predicted_move_pct < -signal_threshold_pct, -1.0, 0.0),
         )
     else:
-        raw_signal = np.where(predicted_move_pct > signal_threshold_pct, 1.0, 0.0)
-    signal = pd.Series(raw_signal, index=eval_frame.index, dtype=float)
+        raw_direction = np.where(predicted_move_pct > signal_threshold_pct, 1.0, 0.0)
 
-    valid = next_open.notna() & next_close.notna()
+    volatility = price_data["Close"].pct_change().rolling(20).std().reindex(eval_frame.index)
+    if target_daily_vol_pct <= 0:
+        vol_scale = pd.Series(1.0, index=eval_frame.index, dtype=float)
+    else:
+        target_vol = float(target_daily_vol_pct / 100.0)
+        vol_scale = target_vol / volatility.replace(0.0, np.nan)
+        vol_scale = vol_scale.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    strength_den = max(float(signal_threshold_pct), 0.25)
+    signal_strength = (predicted_move_pct.abs() / strength_den).clip(lower=0.0, upper=1.0)
+    size = (vol_scale * signal_strength).clip(lower=0.0, upper=max(0.0, float(max_position_size)))
+    signal = pd.Series(raw_direction, index=eval_frame.index, dtype=float) * size
+
+    valid = entry_price.notna() & base_exit_price.notna()
     signal = signal.where(valid, 0.0)
 
-    day_move = (next_close - next_open) / next_open
+    atr_values = _atr_series(price_data=price_data).reindex(eval_frame.index)
+    exit_plan = _apply_atr_stops_and_targets(
+        entry_price=entry_price,
+        base_exit_price=base_exit_price,
+        session_open=session_open,
+        session_high=session_high,
+        session_low=session_low,
+        atr_value=atr_values,
+        signal=signal,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
+    )
+    exit_price = exit_plan["exit_price"]
+
+    day_move = _safe_series_div(exit_price - entry_price, entry_price).replace([np.inf, -np.inf], np.nan)
     gross_return = signal * day_move
-    trade_flag = (signal != 0.0).astype(float)
-    net_cost = trade_flag * (round_trip_cost_bps / 10000.0)
+    net_cost = signal.abs() * (round_trip_cost_bps / 10000.0)
     net_return = gross_return - net_cost
     equity_curve = (1.0 + net_return.fillna(0.0)).cumprod()
 
+    signal_label = np.where(signal > 0.0, "LONG", np.where(signal < 0.0, "SHORT", "FLAT"))
     backtest_frame = pd.DataFrame(
         index=eval_frame.index,
         data={
             "signal": signal,
-            "signal_label": signal.map({1.0: "LONG", -1.0: "SHORT", 0.0: "FLAT"}),
+            "signal_label": signal_label,
             "predicted_move_pct": predicted_move_pct,
-            "next_open": next_open,
-            "next_close": next_close,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "session_open": session_open,
+            "session_high": session_high,
+            "session_low": session_low,
+            "atr_14": atr_values,
+            "stop_level": exit_plan["stop_level"],
+            "take_level": exit_plan["take_level"],
+            "stop_hit": exit_plan["stop_hit"],
+            "take_hit": exit_plan["take_hit"],
+            "exit_reason": exit_plan["exit_reason"],
+            "trade_mode": trade_mode,
             "gross_return": gross_return,
             "net_return": net_return,
             "equity_curve": equity_curve,
@@ -473,6 +657,11 @@ def _pick_signal_threshold(
     base_threshold_pct: float,
     round_trip_cost_bps: float,
     allow_short: bool,
+    trade_mode: str,
+    target_daily_vol_pct: float,
+    max_position_size: float,
+    stop_loss_atr_mult: float,
+    take_profit_atr_mult: float,
 ) -> float:
     candidates = [0.0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.8, 1.0]
     if base_threshold_pct > 0:
@@ -493,6 +682,11 @@ def _pick_signal_threshold(
             round_trip_cost_bps=round_trip_cost_bps,
             signal_threshold_pct=t,
             allow_short=allow_short,
+            trade_mode=trade_mode,
+            target_daily_vol_pct=target_daily_vol_pct,
+            max_position_size=max_position_size,
+            stop_loss_atr_mult=stop_loss_atr_mult,
+            take_profit_atr_mult=take_profit_atr_mult,
         )
         expectancy = _metric_from_frame(m, "expectancy_pct")
         net_ret = _metric_from_frame(m, "net_cum_return_pct")
@@ -614,6 +808,11 @@ def run_forecast(
     target_mode: str = "return",
     validation_days: int = 40,
     allow_short: bool = False,
+    trade_mode: str = "close_to_close",
+    target_daily_vol_pct: float = 1.0,
+    max_position_size: float = 1.0,
+    stop_loss_atr_mult: float = 1.5,
+    take_profit_atr_mult: float = 3.0,
 ) -> ForecastResult:
     if purge_days < 0 or embargo_days < 0:
         raise ValueError("purge_days / embargo_days는 0 이상이어야 합니다.")
@@ -621,6 +820,14 @@ def run_forecast(
         raise ValueError("validation_mode는 'holdout' 또는 'walk_forward'만 지원합니다.")
     if target_mode not in {"return", "price"}:
         raise ValueError("target_mode는 'return' 또는 'price'만 지원합니다.")
+    if trade_mode not in {"close_to_close", "open_to_close"}:
+        raise ValueError("trade_mode는 'close_to_close' 또는 'open_to_close'만 지원합니다.")
+    if target_daily_vol_pct < 0:
+        raise ValueError("target_daily_vol_pct는 0 이상이어야 합니다.")
+    if max_position_size < 0:
+        raise ValueError("max_position_size는 0 이상이어야 합니다.")
+    if stop_loss_atr_mult < 0 or take_profit_atr_mult < 0:
+        raise ValueError("ATR 손절/익절 배수는 0 이상이어야 합니다.")
 
     gap_days = int(purge_days + embargo_days)
     price_data = download_price_data(symbol=symbol, years=years)
@@ -686,6 +893,11 @@ def run_forecast(
         base_threshold_pct=min_signal_strength_pct,
         round_trip_cost_bps=round_trip_cost_bps,
         allow_short=allow_short,
+        trade_mode=trade_mode,
+        target_daily_vol_pct=target_daily_vol_pct,
+        max_position_size=max_position_size,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
     )
 
     # 2) research test: no weight tuning here
@@ -743,6 +955,11 @@ def run_forecast(
         round_trip_cost_bps=round_trip_cost_bps,
         signal_threshold_pct=tuned_threshold,
         allow_short=allow_short,
+        trade_mode=trade_mode,
+        target_daily_vol_pct=target_daily_vol_pct,
+        max_position_size=max_position_size,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
     )
 
     # 3) final holdout (strictly separated)
@@ -789,6 +1006,11 @@ def run_forecast(
         round_trip_cost_bps=round_trip_cost_bps,
         signal_threshold_pct=tuned_threshold,
         allow_short=allow_short,
+        trade_mode=trade_mode,
+        target_daily_vol_pct=target_daily_vol_pct,
+        max_position_size=max_position_size,
+        stop_loss_atr_mult=stop_loss_atr_mult,
+        take_profit_atr_mult=take_profit_atr_mult,
     )
 
     # regime decomposition
@@ -842,6 +1064,35 @@ def run_forecast(
 
         ensemble_target = float(sum(weights.get(name, 0.0) * model_pred_target[name] for name in model_pred_target))
         ensemble_close = float(_target_to_next_close(np.array([ensemble_target]), np.array([current_close]), target_mode)[0])
+        predicted_move_pct = (ensemble_close / current_close - 1.0) * 100.0
+
+        if allow_short:
+            raw_direction = 1.0 if predicted_move_pct > tuned_threshold else (-1.0 if predicted_move_pct < -tuned_threshold else 0.0)
+        else:
+            raw_direction = 1.0 if predicted_move_pct > tuned_threshold else 0.0
+
+        recent_close_hist = raw_history["close"].astype(float)
+        recent_vol = float(recent_close_hist.pct_change().rolling(20).std().iloc[-1]) if len(recent_close_hist) >= 20 else np.nan
+        if np.isfinite(recent_vol) and recent_vol > 0 and target_daily_vol_pct > 0:
+            vol_scale = float(target_daily_vol_pct / 100.0) / recent_vol
+        else:
+            vol_scale = 1.0 if target_daily_vol_pct <= 0 else 0.0
+        strength_den = max(float(tuned_threshold), 0.25)
+        signal_strength = float(np.clip(abs(predicted_move_pct) / strength_den, 0.0, 1.0))
+        position_size = float(np.clip(vol_scale * signal_strength, 0.0, max(0.0, float(max_position_size))))
+        planned_signal = raw_direction * position_size
+
+        atr_now = float(_atr_series(raw_history.rename(columns=str.capitalize)).iloc[-1]) if len(raw_history) >= 14 else np.nan
+        entry_estimate = current_close
+        stop_level = np.nan
+        take_level = np.nan
+        if abs(planned_signal) > 1e-12 and np.isfinite(atr_now) and atr_now > 0:
+            if planned_signal > 0:
+                stop_level = entry_estimate - atr_now * stop_loss_atr_mult if stop_loss_atr_mult > 0 else np.nan
+                take_level = entry_estimate + atr_now * take_profit_atr_mult if take_profit_atr_mult > 0 else np.nan
+            else:
+                stop_level = entry_estimate + atr_now * stop_loss_atr_mult if stop_loss_atr_mult > 0 else np.nan
+                take_level = entry_estimate - atr_now * take_profit_atr_mult if take_profit_atr_mult > 0 else np.nan
 
         scale = float(np.sqrt(step))
         lower_q = max(1e-9, ensemble_close * (1.0 + float(q10) * scale))
@@ -852,7 +1103,13 @@ def run_forecast(
         future_records.append(
             {
                 "ensemble_pred": ensemble_close,
-                "ensemble_pred_return_pct": (ensemble_close / current_close - 1.0) * 100.0,
+                "ensemble_pred_return_pct": predicted_move_pct,
+                "entry_estimate": entry_estimate,
+                "planned_signal": planned_signal,
+                "position_size": position_size,
+                "stop_level": stop_level,
+                "take_level": take_level,
+                "atr_14": atr_now,
                 "lower_band_q10": lower_q,
                 "upper_band_q90": upper_q,
                 "lower_band_1sigma": lower_s,
@@ -881,6 +1138,7 @@ def run_forecast(
         [
             {"item": "validation_mode", "value": validation_mode},
             {"item": "target_mode", "value": target_mode},
+            {"item": "trade_mode", "value": trade_mode},
             {"item": "gap_days_total", "value": float(gap_days)},
             {"item": "purge_days", "value": float(purge_days)},
             {"item": "embargo_days", "value": float(embargo_days)},
@@ -889,6 +1147,10 @@ def run_forecast(
             {"item": "final_holdout_days", "value": float(final_holdout_days)},
             {"item": "selected_signal_threshold_pct", "value": float(tuned_threshold)},
             {"item": "allow_short", "value": float(1.0 if allow_short else 0.0)},
+            {"item": "target_daily_vol_pct", "value": float(target_daily_vol_pct)},
+            {"item": "max_position_size", "value": float(max_position_size)},
+            {"item": "stop_loss_atr_mult", "value": float(stop_loss_atr_mult)},
+            {"item": "take_profit_atr_mult", "value": float(take_profit_atr_mult)},
             {"item": "vol_low_threshold_pct", "value": float(vol_low)},
             {"item": "vol_high_threshold_pct", "value": float(vol_high)},
         ]
