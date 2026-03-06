@@ -5,7 +5,10 @@ import html
 import io
 import logging
 import re
+import subprocess
+import sys
 import warnings
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
@@ -13,6 +16,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 from config.settings import load_settings
@@ -56,6 +60,21 @@ WATCHLIST_PRESETS: Dict[str, List[str]] = {
 PAPER_VIEW_NAME = "모의매매"
 PAPER_ORDER_SIDE_LABELS = {"buy": "매수", "sell": "매도", "hold": "관망"}
 PAPER_ORDER_TYPE_OPTIONS = {"시장가": "market", "지정가": "limit"}
+GLOBAL_DATA_PROVIDER_TEXT = (
+    "미국주식·코인은 Yahoo Finance, 한국주식 분석은 KIS 우선(실패 시 네이버 fallback), "
+    "대시보드 대량 시세는 네이버 배치 조회를 사용합니다."
+)
+GLOBAL_DISCLAIMER_TEXT = (
+    "실험/학습 목적 도구입니다. 예측 정확도와 매매 성과는 다를 수 있으며, 어떤 모델도 미래 가격을 보장하지 않습니다."
+)
+VIEW_CODE_TO_LABEL = {
+    "monitor": "운영 모니터",
+    "dashboard": "대시보드",
+    "analysis": "종목 분석",
+    "paper": PAPER_VIEW_NAME,
+    "scan": "종목 스캔",
+}
+VIEW_LABEL_TO_CODE = {label: code for code, label in VIEW_CODE_TO_LABEL.items()}
 
 VALIDATION_LABEL_TO_MODE = {
     "빠름(홀드아웃)": "holdout",
@@ -712,6 +731,51 @@ def apply_responsive_css(is_mobile_ui: bool) -> None:
               padding-left: 0.8rem !important;
               padding-right: 0.8rem !important;
             }
+            .alt-page-title {
+              margin: 0.1rem 0 0.9rem 0 !important;
+              font-size: 3rem !important;
+              line-height: 1.0 !important;
+              font-weight: 800 !important;
+              letter-spacing: -0.04em;
+              color: inherit;
+            }
+            .alt-status-badge {
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              padding: 0.28rem 0.62rem;
+              border-radius: 999px;
+              font-size: 0.74rem;
+              font-weight: 800;
+              letter-spacing: 0.01em;
+              border: 1px solid transparent;
+            }
+            .alt-status-running {
+              background: rgba(16, 185, 129, 0.14);
+              border-color: rgba(16, 185, 129, 0.35);
+              color: #6ee7b7;
+            }
+            .alt-status-paused {
+              background: rgba(245, 158, 11, 0.14);
+              border-color: rgba(245, 158, 11, 0.35);
+              color: #fcd34d;
+            }
+            .alt-status-stopped {
+              background: rgba(239, 68, 68, 0.14);
+              border-color: rgba(239, 68, 68, 0.35);
+              color: #fca5a5;
+            }
+            .alt-global-footer {
+              margin-top: 2.1rem;
+              padding-top: 1.0rem;
+              border-top: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            .alt-global-footer p {
+              margin: 0.2rem 0;
+              font-size: 0.76rem;
+              line-height: 1.45;
+              color: #94a3b8;
+            }
             h1 { font-size: 1.4rem !important; }
             h2, h3 { font-size: 1.08rem !important; }
             [data-testid="stMetricLabel"] { font-size: 0.78rem !important; }
@@ -737,10 +801,562 @@ def apply_responsive_css(is_mobile_ui: bool) -> None:
               padding-left: 1.4rem !important;
               padding-right: 1.4rem !important;
             }
+            .alt-page-title {
+              margin: 0.1rem 0 1.0rem 0 !important;
+              font-size: 4rem !important;
+              line-height: 0.98 !important;
+              font-weight: 800 !important;
+              letter-spacing: -0.05em;
+              color: inherit;
+            }
+            .alt-status-badge {
+              display: inline-flex;
+              align-items: center;
+              justify-content: center;
+              padding: 0.32rem 0.72rem;
+              border-radius: 999px;
+              font-size: 0.76rem;
+              font-weight: 800;
+              letter-spacing: 0.01em;
+              border: 1px solid transparent;
+            }
+            .alt-status-running {
+              background: rgba(16, 185, 129, 0.14);
+              border-color: rgba(16, 185, 129, 0.35);
+              color: #6ee7b7;
+            }
+            .alt-status-paused {
+              background: rgba(245, 158, 11, 0.14);
+              border-color: rgba(245, 158, 11, 0.35);
+              color: #fcd34d;
+            }
+            .alt-status-stopped {
+              background: rgba(239, 68, 68, 0.14);
+              border-color: rgba(239, 68, 68, 0.35);
+              color: #fca5a5;
+            }
+            .alt-global-footer {
+              margin-top: 2.4rem;
+              padding-top: 1.15rem;
+              border-top: 1px solid rgba(148, 163, 184, 0.18);
+            }
+            .alt-global-footer p {
+              margin: 0.22rem 0;
+              font-size: 0.8rem;
+              line-height: 1.5;
+              color: #94a3b8;
+            }
             </style>
             """,
             unsafe_allow_html=True,
         )
+
+
+def format_heartbeat_age_text(seconds: object) -> str:
+    value = first_valid_float(seconds)
+    if not np.isfinite(value):
+        return "heartbeat 없음"
+    total_seconds = int(max(value, 0.0))
+    if total_seconds < 60:
+        return f"{total_seconds}초 전 heartbeat"
+    total_minutes = total_seconds // 60
+    if total_minutes < 60:
+        return f"{total_minutes}분 전 heartbeat"
+    total_hours, rem_minutes = divmod(total_minutes, 60)
+    if total_hours < 24:
+        return f"{total_hours}시간 {rem_minutes}분 전 heartbeat" if rem_minutes else f"{total_hours}시간 전 heartbeat"
+    total_days, rem_hours = divmod(total_hours, 24)
+    return f"{total_days}일 {rem_hours}시간 전 heartbeat" if rem_hours else f"{total_days}일 전 heartbeat"
+
+
+def auto_trading_status_text(auto_trading_status: Dict[str, Any]) -> str:
+    state = str(auto_trading_status.get("state", "stopped")).lower()
+    reason = str(auto_trading_status.get("reason", "") or "")
+    heartbeat_text = format_heartbeat_age_text(auto_trading_status.get("heartbeat_age_seconds"))
+    heartbeat_kst = str(auto_trading_status.get("heartbeat_at_kst", "") or "")
+    if state == "running":
+        return f"{heartbeat_kst} · {heartbeat_text}" if heartbeat_kst else heartbeat_text
+    if state == "paused":
+        base = f"{heartbeat_kst} · {heartbeat_text}" if heartbeat_kst else heartbeat_text
+        return f"{base} · 신규 진입 중단"
+    if reason and heartbeat_kst:
+        return f"{heartbeat_kst} · {reason}"
+    return reason or heartbeat_text
+
+
+def auto_trading_badge_html(auto_trading_status: Dict[str, Any]) -> str:
+    state = str(auto_trading_status.get("state", "stopped")).lower()
+    label = str(auto_trading_status.get("label", "Stopped") or "Stopped")
+    state_class = {
+        "running": "alt-status-running",
+        "paused": "alt-status-paused",
+        "stopped": "alt-status-stopped",
+    }.get(state, "alt-status-stopped")
+    return f'<span class="alt-status-badge {state_class}">{html.escape(label)}</span>'
+
+
+def current_view_code() -> str:
+    return VIEW_LABEL_TO_CODE.get(str(st.session_state.get("active_view", "운영 모니터")), "monitor")
+
+
+def sync_active_view_from_query_params() -> None:
+    try:
+        raw_value = st.query_params.get("view", "")
+    except Exception:
+        return
+    if isinstance(raw_value, list):
+        raw_value = raw_value[0] if raw_value else ""
+    view_label = VIEW_CODE_TO_LABEL.get(str(raw_value).strip())
+    if view_label:
+        st.session_state["active_view"] = view_label
+
+
+def sync_query_params_from_active_view() -> None:
+    desired = current_view_code()
+    try:
+        current = st.query_params.get("view", "")
+    except Exception:
+        return
+    if isinstance(current, list):
+        current = current[0] if current else ""
+    current = str(current).strip()
+    if current != desired:
+        st.query_params["view"] = desired
+
+
+def restart_background_worker() -> Tuple[bool, str]:
+    workspace = Path(__file__).resolve().parent
+    python_executable = Path(sys.executable)
+
+    if sys.platform.startswith("win"):
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$python = '{str(python_executable).replace("'", "''")}'
+$cwd = '{str(workspace).replace("'", "''")}'
+Get-CimInstance Win32_Process |
+  Where-Object {{
+    $_.CommandLine -and $_.CommandLine -like '*-m jobs.scheduler*'
+  }} |
+  ForEach-Object {{
+    try {{
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+    }} catch {{
+    }}
+  }}
+Start-Sleep -Milliseconds 800
+Start-Process -FilePath $python -ArgumentList '-m','jobs.scheduler' -WorkingDirectory $cwd -WindowStyle Hidden | Out-Null
+"""
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(workspace),
+        )
+        if completed.returncode == 0:
+            return True, "worker 재시작 요청을 보냈습니다."
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        return False, stderr or "worker 재시작에 실패했습니다."
+
+    return False, "worker 재시작 버튼은 현재 Windows 환경에서만 지원합니다."
+
+
+def render_top_nav_bar(active_view: str, auto_trading_status: Dict[str, Any], is_mobile_ui: bool) -> None:
+    visual_links: List[str] = []
+    hit_links: List[str] = []
+    for code, label in VIEW_CODE_TO_LABEL.items():
+        active_class = "is-active" if label == active_view else ""
+        visual_links.append(
+            f'<span class="alt-toolbar-link {active_class}" data-view="{html.escape(code)}">{html.escape(label)}</span>'
+        )
+        hit_links.append(
+            f'<button type="button" class="alt-toolbar-hit-link" data-view="{html.escape(code)}" aria-label="{html.escape(label)}">{html.escape(label)}</button>'
+        )
+    badge_html = auto_trading_badge_html(auto_trading_status).replace("alt-status-badge", "alt-status-badge alt-toolbar-badge")
+    visual_toolbar_inner = (
+        '<div class="alt-toolbar-nav-inner">'
+        '<span class="alt-toolbar-mini-brand" aria-hidden="true">Alt</span>'
+        f"{''.join(visual_links)}"
+        f'<span class="alt-toolbar-status">{badge_html}</span>'
+        "</div>"
+    )
+    hit_toolbar_inner = (
+        '<div class="alt-toolbar-hit-inner">'
+        '<span class="alt-toolbar-hit-brand" aria-hidden="true">Alt</span>'
+        f"{''.join(hit_links)}"
+        "</div>"
+    )
+    escaped_visual_toolbar_inner = visual_toolbar_inner.replace("\\", "\\\\").replace("`", "\\`")
+    escaped_hit_toolbar_inner = hit_toolbar_inner.replace("\\", "\\\\").replace("`", "\\`")
+    components.html(
+        f"""
+        <script>
+        (function () {{
+          const doc = window.parent.document;
+          let style = doc.getElementById("alt-toolbar-nav-style");
+          if (!style) {{
+            style = doc.createElement("style");
+            style.id = "alt-toolbar-nav-style";
+            style.textContent = `
+              #alt-toolbar-visual-host {{
+                position: absolute;
+                left: 1rem;
+                right: 16.5rem;
+                top: 50%;
+                transform: translateY(-50%);
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                overflow: hidden;
+                pointer-events: none !important;
+                z-index: 1000;
+              }}
+              #alt-toolbar-click-layer {{
+                position: fixed;
+                left: 0;
+                right: 0;
+                top: 0;
+                height: 3.5rem;
+                pointer-events: none !important;
+                z-index: 10001;
+              }}
+              #alt-toolbar-click-host {{
+                position: absolute;
+                left: 1rem;
+                right: 16.5rem;
+                top: 50%;
+                transform: translateY(-50%);
+                display: flex;
+                align-items: center;
+                justify-content: flex-start;
+                overflow: hidden;
+                pointer-events: auto !important;
+              }}
+              header[data-testid="stHeader"] {{
+                background: rgba(248, 250, 252, 0.88) !important;
+                backdrop-filter: blur(10px);
+                -webkit-backdrop-filter: blur(10px);
+                border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+                overflow: visible !important;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-nav-inner,
+              #alt-toolbar-click-host .alt-toolbar-hit-inner {{
+                display: inline-flex;
+                align-items: center;
+                gap: 0.3rem;
+                min-width: 0;
+                flex-wrap: nowrap;
+                overflow-x: auto;
+                scrollbar-width: none;
+              }}
+              #alt-toolbar-click-host .alt-toolbar-hit-inner {{
+                pointer-events: auto !important;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-nav-inner::-webkit-scrollbar,
+              #alt-toolbar-click-host .alt-toolbar-hit-inner::-webkit-scrollbar {{
+                display: none;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-mini-brand,
+              #alt-toolbar-click-host .alt-toolbar-hit-brand {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 0.92rem;
+                font-weight: 900;
+                letter-spacing: -0.03em;
+                max-width: 0;
+                opacity: 0;
+                transform: translateX(-8px);
+                margin-right: 0;
+                overflow: hidden;
+                transition: max-width 0.22s ease, opacity 0.22s ease, transform 0.22s ease, margin-right 0.22s ease;
+                white-space: nowrap;
+                flex: 0 0 auto;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-mini-brand {{
+                color: rgba(15, 23, 42, 0.92);
+              }}
+              #alt-toolbar-click-host .alt-toolbar-hit-brand {{
+                color: transparent;
+                user-select: none;
+              }}
+              #alt-toolbar-visual-host.show-brand .alt-toolbar-mini-brand,
+              #alt-toolbar-click-host.show-brand .alt-toolbar-hit-brand {{
+                max-width: 2.4rem;
+                opacity: 1;
+                transform: translateX(0);
+                margin-right: 0.55rem;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-link {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                white-space: nowrap;
+                color: rgba(49, 51, 63, 0.86);
+                font-size: 0.9rem;
+                font-weight: 700;
+                padding: 0.18rem 0.42rem;
+                border-radius: 999px;
+                transition: background 0.16s ease, color 0.16s ease;
+              }}
+              #alt-toolbar-click-host .alt-toolbar-hit-link {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                white-space: nowrap;
+                font-size: 0.9rem;
+                font-weight: 700;
+                padding: 0.18rem 0.42rem;
+                border-radius: 999px;
+                border: 0;
+                background: transparent;
+                color: transparent;
+                opacity: 0;
+                cursor: pointer;
+                pointer-events: auto !important;
+                appearance: none;
+                -webkit-appearance: none;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-link.is-active {{
+                background: rgba(59, 130, 246, 0.12);
+                color: rgb(29, 78, 216);
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-status {{
+                display: inline-flex;
+                align-items: center;
+                margin-left: 0.35rem;
+                flex: 0 0 auto;
+              }}
+              #alt-toolbar-visual-host .alt-toolbar-badge {{
+                font-size: 0.78rem;
+                padding: 0.18rem 0.5rem;
+              }}
+              @media (max-width: 980px) {{
+                #alt-toolbar-visual-host,
+                #alt-toolbar-click-host {{
+                  right: 9.5rem;
+                }}
+                #alt-toolbar-visual-host .alt-toolbar-link,
+                #alt-toolbar-click-host .alt-toolbar-hit-link {{
+                  font-size: 0.82rem;
+                  padding: 0.15rem 0.35rem;
+                }}
+                #alt-toolbar-visual-host .alt-toolbar-status {{
+                  display: none;
+                }}
+              }}
+              @media (max-width: 680px) {{
+                #alt-toolbar-visual-host,
+                #alt-toolbar-click-host {{
+                  right: 6.2rem;
+                }}
+              }}
+            `;
+            doc.head.appendChild(style);
+          }}
+
+          const header = doc.querySelector('header[data-testid="stHeader"]');
+          if (!header) return;
+          if (getComputedStyle(header).position === "static") {{
+            header.style.position = "sticky";
+          }}
+
+          let visualHost = doc.getElementById("alt-toolbar-visual-host");
+          if (!visualHost) {{
+            visualHost = doc.createElement("div");
+            visualHost.id = "alt-toolbar-visual-host";
+            header.appendChild(visualHost);
+          }} else if (visualHost.parentElement !== header) {{
+            header.appendChild(visualHost);
+          }}
+
+          let clickLayer = doc.getElementById("alt-toolbar-click-layer");
+          if (!clickLayer) {{
+            clickLayer = doc.createElement("div");
+            clickLayer.id = "alt-toolbar-click-layer";
+            doc.body.appendChild(clickLayer);
+          }}
+
+          let clickHost = doc.getElementById("alt-toolbar-click-host");
+          if (!clickHost) {{
+            clickHost = doc.createElement("div");
+            clickHost.id = "alt-toolbar-click-host";
+            clickLayer.appendChild(clickHost);
+          }} else if (clickHost.parentElement !== clickLayer) {{
+            clickLayer.appendChild(clickHost);
+          }}
+
+          visualHost.innerHTML = `{escaped_visual_toolbar_inner}`;
+          clickHost.innerHTML = `{escaped_hit_toolbar_inner}`;
+          clickHost.querySelectorAll('.alt-toolbar-hit-link').forEach((link) => {{
+            if (!(link instanceof HTMLButtonElement)) return;
+            const view = link.getAttribute('data-view');
+            if (!view) return;
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('view', view);
+            link.onclick = (event) => {{
+              event.preventDefault();
+              event.stopPropagation();
+              window.parent.location.assign(url.toString());
+            }};
+          }});
+
+          const updateLayout = () => {{
+            const headerRect = header.getBoundingClientRect();
+            let leftPx = window.parent.innerWidth <= 680 ? 40 : 52;
+            let rightPx = window.parent.innerWidth <= 680 ? 70 : window.parent.innerWidth <= 980 ? 120 : 180;
+            const sidebarNode = doc.querySelector('[data-testid="stSidebar"]');
+            let sidebarRect = null;
+            let sidebarIsOpen = false;
+            if (sidebarNode instanceof HTMLElement) {{
+              const rect = sidebarNode.getBoundingClientRect();
+              const visibleWidth = Math.max(0, Math.min(rect.right, window.parent.innerWidth) - Math.max(rect.left, 0));
+              if (rect.width >= 180 && visibleWidth >= 180 && rect.right > headerRect.left + 120) {{
+                sidebarRect = rect;
+                sidebarIsOpen = true;
+              }}
+            }}
+
+            let leftControlRect = null;
+            const preferredLeftControls = [
+              '[data-testid="collapsedControl"]',
+              'button[aria-label*="sidebar" i]',
+              'button[title*="sidebar" i]',
+              'button[kind="header"]',
+            ];
+            for (const selector of preferredLeftControls) {{
+              const node = header.querySelector(selector);
+              if (node instanceof HTMLElement) {{
+                const rect = node.getBoundingClientRect();
+                if (
+                  rect.width >= 18 &&
+                  rect.width <= 72 &&
+                  rect.height >= 18 &&
+                  rect.height <= 72 &&
+                  rect.left < headerRect.left + headerRect.width * 0.35
+                ) {{
+                  leftControlRect = rect;
+                  break;
+                }}
+              }}
+            }}
+
+            const headerButtons = Array.from(header.querySelectorAll('button, [role="button"]'))
+              .filter((el) => !visualHost.contains(el) && el instanceof HTMLElement)
+              .map((el) => el.getBoundingClientRect())
+              .filter(
+                (rect) =>
+                  rect.width >= 18 &&
+                  rect.width <= 72 &&
+                  rect.height >= 18 &&
+                  rect.height <= 72 &&
+                  rect.left < headerRect.left + headerRect.width * 0.45
+              )
+              .sort((a, b) => a.right - b.right);
+
+            if (!leftControlRect && headerButtons.length > 0) {{
+              leftControlRect = headerButtons[0];
+            }}
+
+            if (sidebarIsOpen && sidebarRect) {{
+              leftPx = Math.max(Math.round(sidebarRect.right - headerRect.left + 12), window.parent.innerWidth <= 680 ? 12 : 16);
+            }} else if (leftControlRect) {{
+              leftPx = Math.max(Math.round(leftControlRect.right - headerRect.left + 10), leftPx);
+            }}
+
+            const toolbar = header.querySelector('div[data-testid="stToolbar"]');
+            if (toolbar instanceof HTMLElement) {{
+              const toolbarRect = toolbar.getBoundingClientRect();
+              rightPx = Math.max(Math.round(headerRect.right - toolbarRect.left + 12), rightPx);
+            }}
+
+            if (clickLayer instanceof HTMLElement) {{
+              clickLayer.style.top = `${{Math.max(0, Math.round(headerRect.top))}}px`;
+              clickLayer.style.height = `${{Math.max(44, Math.round(headerRect.height))}}px`;
+            }}
+            visualHost.style.left = `${{leftPx}}px`;
+            visualHost.style.right = `${{rightPx}}px`;
+            clickHost.style.left = `${{leftPx}}px`;
+            clickHost.style.right = `${{rightPx}}px`;
+          }};
+
+          if (window.parent.__altToolbarResizeHandler) {{
+            window.parent.removeEventListener('resize', window.parent.__altToolbarResizeHandler);
+          }}
+          window.parent.__altToolbarResizeHandler = () => window.parent.requestAnimationFrame(updateLayout);
+          window.parent.addEventListener('resize', window.parent.__altToolbarResizeHandler);
+
+          if (window.parent.__altToolbarResizeObserver) {{
+            try {{
+              window.parent.__altToolbarResizeObserver.disconnect();
+            }} catch (error) {{}}
+          }}
+          const resizeObserver = new window.parent.ResizeObserver(() => window.parent.requestAnimationFrame(updateLayout));
+          resizeObserver.observe(header);
+          const sidebar = doc.querySelector('[data-testid="stSidebar"]');
+          if (sidebar instanceof HTMLElement) {{
+            resizeObserver.observe(sidebar);
+          }}
+          window.parent.__altToolbarResizeObserver = resizeObserver;
+
+          updateLayout();
+          window.parent.setTimeout(updateLayout, 60);
+          window.parent.setTimeout(updateLayout, 260);
+
+          const titleAnchor = doc.getElementById("alt-page-title-anchor");
+          if (window.parent.__altToolbarTitleObserver) {{
+            try {{
+              window.parent.__altToolbarTitleObserver.disconnect();
+            }} catch (error) {{}}
+          }}
+          if (titleAnchor && window.parent.IntersectionObserver) {{
+            const observer = new window.parent.IntersectionObserver(
+              (entries) => {{
+                const entry = entries[0];
+                if (entry && entry.isIntersecting) {{
+                  visualHost.classList.remove("show-brand");
+                  clickHost.classList.remove("show-brand");
+                }} else {{
+                  visualHost.classList.add("show-brand");
+                  clickHost.classList.add("show-brand");
+                }}
+              }},
+              {{
+                threshold: 0.15,
+                rootMargin: "-6px 0px 0px 0px",
+              }}
+            );
+            observer.observe(titleAnchor);
+            window.parent.__altToolbarTitleObserver = observer;
+          }}
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def render_global_footer() -> None:
+    st.markdown(
+        f"""
+        <div class="alt-global-footer">
+          <p>{html.escape(GLOBAL_DATA_PROVIDER_TEXT)}</p>
+          <p>{html.escape(GLOBAL_DISCLAIMER_TEXT)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_page_header() -> None:
+    st.markdown(
+        """
+        <div id="alt-page-title-anchor"></div>
+        <h1 class="alt-page-title">Alt</h1>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def build_snapshot_view_df(rows: List[Dict[str, str | int | float | None]]) -> pd.DataFrame:
@@ -1115,8 +1731,8 @@ def render_prediction_tracking_section(result, asset_type: str, korea_market: st
             st.dataframe(resolved_view, width="stretch", hide_index=True)
 
 
-def render_operations_monitor() -> None:
-    settings = load_settings()
+def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
+    settings = settings or load_settings()
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
 
@@ -1130,10 +1746,10 @@ def render_operations_monitor() -> None:
         repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
         st.rerun()
 
-    data = load_dashboard_data(settings)
+    data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
-    latest_account = summary.get("latest_account", {}) or {}
     trade_performance = data["trade_performance"]
+    auto_trading_status = data.get("auto_trading_status", {})
     metrics = st.columns(6)
     metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
     metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
@@ -1141,7 +1757,10 @@ def render_operations_monitor() -> None:
     metrics[3].metric("Today PnL", format_price_value(float(trade_performance.get("today_pnl", float('nan')))))
     metrics[4].metric("누적 수익률", format_pct_value(float(trade_performance.get("total_return_pct", float("nan")))))
     metrics[5].metric("최대 낙폭", format_pct_value(float(trade_performance.get("max_drawdown_pct", float("nan")))))
-    st.caption(f"trading_paused={repository.get_control_flag('trading_paused', '0')} · db={settings.storage.db_path}")
+    st.caption(
+        f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
+        f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
+    )
 
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
@@ -2176,10 +2795,6 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
 
 
 st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
-
-st.title("Alt")
-st.caption("미국주식·코인은 Yahoo Finance, 한국주식 분석/모의매매는 KIS 우선(실패 시 네이버 fallback), 대시보드 대량 시세는 네이버 배치 조회를 사용합니다.")
-st.info("이 도구는 실험/학습 목적입니다. 어떤 모델도 미래 가격을 보장하지 않습니다.", icon="ℹ️")
 auto_mobile_detected = detect_mobile_client()
 
 
@@ -2253,6 +2868,8 @@ st.session_state.setdefault("sidebar_korea_market", "KOSPI")
 st.session_state.setdefault("sidebar_asset_type_prev", st.session_state["sidebar_asset_type"])
 if "active_view" not in st.session_state:
     st.session_state["active_view"] = "운영 모니터"
+if pending_analysis_target is None:
+    sync_active_view_from_query_params()
 st.session_state.setdefault("analysis_auto_run", False)
 st.session_state.setdefault("analysis_result", None)
 st.session_state.setdefault("analysis_result_symbol", "")
@@ -2339,6 +2956,17 @@ with st.sidebar:
             "포지션 크기는 신호강도와 변동성 타깃에 따라 자동 조절됩니다. ATR 손절/익절은 일봉 근사이며, 같은 날 둘 다 닿으면 손절 우선으로 처리합니다."
         )
 
+    st.caption("운영 도구")
+    if st.button("worker 재시작", key="sidebar_restart_worker", width="stretch"):
+        ok, message = restart_background_worker()
+        st.session_state["worker_restart_feedback"] = {"ok": ok, "message": message}
+    feedback = st.session_state.get("worker_restart_feedback")
+    if isinstance(feedback, dict) and feedback.get("message"):
+        if feedback.get("ok"):
+            st.success(str(feedback["message"]))
+        else:
+            st.error(str(feedback["message"]))
+
 analysis_inputs = {
     "years": years,
     "test_days": test_days,
@@ -2361,10 +2989,19 @@ analysis_inputs = {
 }
 
 apply_responsive_css(is_mobile_ui=is_mobile_ui)
-st.radio("화면", ["운영 모니터", "대시보드", "종목 분석", PAPER_VIEW_NAME, "종목 스캔"], horizontal=True, key="active_view")
+runtime_settings = load_settings()
+dashboard_data = load_dashboard_data(runtime_settings)
+active_view = str(st.session_state.get("active_view", "운영 모니터"))
+sync_query_params_from_active_view()
+render_top_nav_bar(
+    active_view=active_view,
+    auto_trading_status=dashboard_data.get("auto_trading_status", {}),
+    is_mobile_ui=is_mobile_ui,
+)
+render_page_header()
 
 if st.session_state["active_view"] == "운영 모니터":
-    render_operations_monitor()
+    render_operations_monitor(settings=runtime_settings, dashboard_data=dashboard_data)
 elif st.session_state["active_view"] == "대시보드":
     st.subheader(f"{asset_type} 대시보드")
     st.caption("리스트에서 종목을 고르면 종목 분석 화면으로 이동해 바로 예측을 실행합니다.")
@@ -2763,3 +3400,5 @@ else:
                 st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
     else:
         st.info("종목을 선택하고 스캔 실행을 누르세요.")
+
+render_global_footer()

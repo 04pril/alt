@@ -16,6 +16,7 @@ from jobs.tasks import (
     retrain_check_job,
     scan_job,
 )
+from storage.repository import utc_now_iso
 
 
 def _bucket_key(dt: datetime, minutes: int) -> str:
@@ -46,6 +47,7 @@ def _run_guarded(context, job_name: str, run_key: str, fn):
 def run_once(settings_path: str | None = None) -> None:
     context = build_task_context(settings_path)
     settings = context.settings
+    context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), "scheduler loop heartbeat")
     for asset_type, schedule in settings.asset_schedules.items():
         now = datetime.now(ZoneInfo(schedule.timezone))
         _run_guarded(

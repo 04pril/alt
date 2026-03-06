@@ -794,6 +794,25 @@ class TradingRepository:
                 params=[int(limit)],
             )
 
+    def latest_job_heartbeat(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    job_run_id,
+                    job_name,
+                    status,
+                    scheduled_at,
+                    started_at,
+                    finished_at,
+                    COALESCE(finished_at, started_at, scheduled_at) AS heartbeat_at
+                FROM job_runs
+                ORDER BY COALESCE(finished_at, started_at, scheduled_at) DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else {}
+
     def recent_system_events(self, level: str | None = None, limit: int = 50) -> pd.DataFrame:
         query = "SELECT * FROM system_events"
         params: List[Any] = []
