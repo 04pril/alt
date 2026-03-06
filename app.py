@@ -168,15 +168,30 @@ def quiet_external_call(fn):
             logging.disable(previous_disable)
 
 
+def normalize_kr_name_key(text: str) -> str:
+    normalized = str(text).strip().upper()
+    normalized = re.sub(r"\s+", "", normalized)
+    normalized = re.sub(r"[^0-9A-Z가-힣]+", "", normalized)
+    return normalized
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     try:
-        df = quiet_external_call(
-            lambda: pd.read_html("https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13")[0]
+        response = requests.get(
+            "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=20,
         )
+        response.raise_for_status()
+        response.encoding = "euc-kr"
+        tables = quiet_external_call(lambda: pd.read_html(io.StringIO(response.text)))
     except Exception:
         return {}
+    if not tables:
+        return {}
 
+    df = tables[0]
     name_col, market_col, code_col = df.columns[:3]
     frame = df[[name_col, market_col, code_col]].copy()
     frame.columns = ["name", "market", "code"]
@@ -184,7 +199,16 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     frame["market"] = frame["market"].astype(str).str.strip()
     frame["code"] = frame["code"].astype(str).str.strip().str.zfill(6)
     frame = frame.drop_duplicates(subset=["name"], keep="first")
-    return frame.set_index("name")[["market", "code"]].to_dict("index")
+
+    out: Dict[str, Dict[str, str]] = {}
+    for row in frame.to_dict("records"):
+        name = str(row["name"]).strip()
+        market = str(row["market"]).strip()
+        code = str(row["code"]).strip()
+        payload = {"market": market, "code": code}
+        out.setdefault(name, payload)
+        out.setdefault(normalize_kr_name_key(name), payload)
+    return out
 
 
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
@@ -232,13 +256,14 @@ def resolve_kr_name_to_symbol(name: str) -> str | None:
 
     name_map = load_krx_name_map()
     for candidate in candidate_names:
-        if candidate in name_map:
-            code = name_map[candidate]["code"]
-            market = name_map[candidate]["market"]
-            suffix = ".KQ" if "코스닥" in market else ".KS"
-            return f"{code}{suffix}".upper()
+        for key in [candidate, normalize_kr_name_key(candidate)]:
+            if key in name_map:
+                code = name_map[key]["code"]
+                market = name_map[key]["market"]
+                suffix = ".KQ" if "코스닥" in market else ".KS"
+                return f"{code}{suffix}".upper()
 
-    return search_symbol_from_yf(query=alias or name, market_hint="KR")
+    return None
 
 
 def resolve_us_name_to_symbol(name: str, symbol_hint: str | None) -> str | None:
@@ -1185,7 +1210,7 @@ def run_analysis_target(
 st.set_page_config(page_title="멀티마켓 가격 예측기", layout="wide")
 
 st.title("코인 · 미국주식 · 한국주식 가격 예측기")
-st.caption("Yahoo Finance 데이터를 기반으로 앙상블 모델 예측 결과를 시각화합니다.")
+st.caption("미국주식·코인은 Yahoo Finance, 한국주식은 네이버 금융 데이터를 기반으로 앙상블 예측 결과를 시각화합니다.")
 st.info("이 도구는 실험/학습 목적입니다. 어떤 모델도 미래 가격을 보장하지 않습니다.", icon="ℹ️")
 auto_mobile_detected = detect_mobile_client()
 
