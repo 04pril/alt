@@ -20,6 +20,7 @@ import streamlit.components.v1 as components
 import yfinance as yf
 
 from config.settings import load_settings
+from jobs.tasks import build_task_context
 from kis_paper import (
     KISPaperClient,
     KISPaperError,
@@ -1735,21 +1736,52 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     settings = settings or load_settings()
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
+    repository.initialize_runtime_flags()
 
-    st.subheader("운영 모니터링")
-    st.caption("background worker가 저장한 예측/포지션/잡 상태를 읽기 전용으로 표시합니다.")
-    control_cols = st.columns([1.0, 1.0, 3.0])
+    st.subheader("운영 모니터")
+    st.caption("background worker가 저장한 예측, 주문, 포지션, 계좌 상태를 읽기 전용으로 표시합니다.")
+
+    control_cols = st.columns([1.0, 1.0, 1.0, 2.0])
     if control_cols[0].button("신규 진입 중단", key="ops_pause"):
-        repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
+        repository.set_entry_paused(True, "set from streamlit monitor")
         st.rerun()
     if control_cols[1].button("신규 진입 재개", key="ops_resume"):
-        repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
+        repository.set_entry_paused(False, "set from streamlit monitor")
         st.rerun()
+    if control_cols[2].button("Broker Sync", key="ops_broker_sync"):
+        try:
+            context = build_task_context()
+            result = context.paper_broker.sync_state(force=True)
+            st.session_state["ops_broker_sync_feedback"] = {"ok": True, "message": result}
+        except Exception as exc:
+            st.session_state["ops_broker_sync_feedback"] = {"ok": False, "message": str(exc)}
+
+    requery_order_id = control_cols[3].text_input("주문 재조회 ID", key="ops_requery_order_id", placeholder="ord_xxx")
+    if control_cols[3].button("주문 재조회", key="ops_requery_order"):
+        try:
+            if not str(requery_order_id).strip():
+                raise ValueError("order_id를 입력하세요.")
+            context = build_task_context()
+            result = context.paper_broker.reconcile_order(str(requery_order_id).strip())
+            st.session_state["ops_requery_feedback"] = {"ok": True, "message": result}
+        except Exception as exc:
+            st.session_state["ops_requery_feedback"] = {"ok": False, "message": str(exc)}
+
+    broker_feedback = st.session_state.get("ops_broker_sync_feedback")
+    if isinstance(broker_feedback, dict) and broker_feedback.get("message"):
+        (st.success if broker_feedback.get("ok") else st.error)(str(broker_feedback["message"]))
+    requery_feedback = st.session_state.get("ops_requery_feedback")
+    if isinstance(requery_feedback, dict) and requery_feedback.get("message"):
+        (st.success if requery_feedback.get("ok") else st.error)(str(requery_feedback["message"]))
 
     data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
     trade_performance = data["trade_performance"]
     auto_trading_status = data.get("auto_trading_status", {})
+    kis_sync_status = data.get("kis_sync_status", {})
+    broker_modes = data.get("broker_modes", {})
+    control_flags = data.get("control_flags", {})
+
     metrics = st.columns(6)
     metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
     metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
@@ -1762,8 +1794,30 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
     )
 
+    broker_mode_view = pd.DataFrame(
+        [{"자산군": asset_type, "broker_mode": mode} for asset_type, mode in broker_modes.items()]
+    )
+    kis_status_view = pd.DataFrame(
+        [
+            {"항목": "entry_paused", "값": control_flags.get("entry_paused")},
+            {"항목": "worker_paused", "값": control_flags.get("worker_paused")},
+            {"항목": "exit_only_mode", "값": control_flags.get("exit_only_mode")},
+            {"항목": "kis_last_sync_status", "값": kis_sync_status.get("last_sync_status", "")},
+            {"항목": "kis_last_sync_at", "값": kis_sync_status.get("last_sync_at", "")},
+            {"항목": "kis_last_sync_message", "값": kis_sync_status.get("last_sync_message", "")},
+        ]
+    )
+    left_meta, right_meta = st.columns([1.1, 2.0])
+    with left_meta:
+        st.caption("자산군별 Broker Mode")
+        st.dataframe(broker_mode_view, width="stretch", hide_index=True)
+    with right_meta:
+        st.caption("KIS / Control Flags")
+        st.dataframe(kis_status_view, width="stretch", hide_index=True)
+
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
+    recent_broker_errors = data.get("recent_broker_errors", pd.DataFrame())
     open_positions = data["open_positions"]
     open_orders = data["open_orders"]
     candidate_scans = data["candidate_scans"]
@@ -1785,16 +1839,16 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         st.plotly_chart(fig, width="stretch")
 
     tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_errors = st.tabs(
-        ["Job Health", "Open Positions", "Predictions", "Candidates", "Recent Errors"]
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Broker / Recent Errors"]
     )
     with tab_jobs:
         if job_health.empty:
-            st.caption("job_runs가 없습니다.")
+            st.caption("job_runs가 비어 있습니다.")
         else:
             st.dataframe(job_health, width="stretch", hide_index=True)
     with tab_positions:
         if open_positions.empty and open_orders.empty:
-            st.caption("오픈 포지션/주문이 없습니다.")
+            st.caption("오픈 포지션과 오픈 주문이 없습니다.")
         else:
             if not open_positions.empty:
                 st.caption("오픈 포지션")
@@ -1804,20 +1858,24 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
                 st.dataframe(open_orders, width="stretch", hide_index=True)
     with tab_predictions:
         if prediction_report.empty:
-            st.caption("예측 ledger가 비어 있습니다.")
+            st.caption("prediction ledger가 아직 비어 있습니다.")
         else:
             st.dataframe(prediction_report.head(200), width="stretch", hide_index=True)
     with tab_candidates:
         if candidate_scans.empty:
-            st.caption("candidate_scans가 없습니다.")
+            st.caption("candidate_scans가 비어 있습니다.")
         else:
             st.dataframe(candidate_scans.head(200), width="stretch", hide_index=True)
     with tab_errors:
-        if recent_errors.empty:
-            st.caption("최근 ERROR 이벤트가 없습니다.")
+        if recent_broker_errors.empty and recent_errors.empty:
+            st.caption("최근 오류가 없습니다.")
         else:
-            st.dataframe(recent_errors, width="stretch", hide_index=True)
-
+            if not recent_broker_errors.empty:
+                st.caption("최근 broker 오류")
+                st.dataframe(recent_broker_errors, width="stretch", hide_index=True)
+            if not recent_errors.empty:
+                st.caption("최근 system 오류")
+                st.dataframe(recent_errors, width="stretch", hide_index=True)
 
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
     eval_metrics = result.final_holdout_metrics if not result.final_holdout_metrics.empty else result.metrics

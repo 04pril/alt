@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
-from typing import Dict, Iterable, Tuple
+from typing import Callable, Dict, Iterable, Tuple
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -10,9 +10,10 @@ import pandas as pd
 import yfinance as yf
 
 from config.settings import AssetScheduleConfig, RuntimeSettings
+from kis_paper import KISPaperClient
 from predictor import download_kr_price_data
 
-try:  # optional but recommended
+try:
     import holidays
 except Exception:  # pragma: no cover
     holidays = None
@@ -32,8 +33,15 @@ class MarketQuote:
 
 
 class MarketDataService:
-    def __init__(self, settings: RuntimeSettings):
+    def __init__(self, settings: RuntimeSettings, kis_client_factory: Callable[[], KISPaperClient] | None = None):
         self.settings = settings
+        self._kis_client_factory = kis_client_factory or (lambda: KISPaperClient(config_path=settings.broker.kis_config_path))
+        self._kis_client_instance: KISPaperClient | None = None
+
+    def _kis_client(self) -> KISPaperClient:
+        if self._kis_client_instance is None:
+            self._kis_client_instance = self._kis_client_factory()
+        return self._kis_client_instance
 
     def schedule(self, asset_type: str) -> AssetScheduleConfig:
         return self.settings.asset_schedules[asset_type]
@@ -88,6 +96,12 @@ class MarketDataService:
             return "pre_close"
         return "open"
 
+    def quote_source(self, asset_type: str, purpose: str = "execution") -> str:
+        broker_mode = self.settings.broker_mode_for(asset_type)
+        if asset_type == "한국주식" and broker_mode == "kis_paper" and purpose == "execution":
+            return "kis_paper"
+        return "bars"
+
     def _period_for(self, timeframe: str, lookback_bars: int) -> str:
         if timeframe == "1d":
             years = max(2, int(np.ceil(lookback_bars / 252.0)) + 1)
@@ -112,6 +126,11 @@ class MarketDataService:
     def get_bars(self, symbol: str, asset_type: str, timeframe: str, lookback_bars: int) -> pd.DataFrame:
         if asset_type == "한국주식" and timeframe == "1d":
             years = max(2, int(np.ceil(lookback_bars / 252.0)) + 1)
+            if self.settings.broker_mode_for(asset_type) == "kis_paper":
+                try:
+                    return self._kis_client().get_daily_history(symbol_or_code=symbol, years=years).tail(lookback_bars + 5)
+                except Exception:
+                    pass
             return download_kr_price_data(symbol=symbol, years=years).tail(lookback_bars + 5)
 
         period = self._period_for(timeframe, lookback_bars)
@@ -125,10 +144,26 @@ class MarketDataService:
         )
         frame = self._normalize_frame(frame)
         if frame.empty:
-            raise ValueError(f"시세 데이터가 비어 있습니다: {symbol} {timeframe}")
+            raise ValueError(f"empty market data: {symbol} {timeframe}")
         return frame.tail(lookback_bars + 5)
 
-    def latest_quote(self, symbol: str, asset_type: str, timeframe: str) -> MarketQuote:
+    def latest_quote(self, symbol: str, asset_type: str, timeframe: str, purpose: str = "execution") -> MarketQuote:
+        # Training bars and execution quotes are intentionally decoupled:
+        # predictor research stays on the configured timeframe, while live execution can
+        # use a fresher broker quote source for the same asset.
+        if self.quote_source(asset_type=asset_type, purpose=purpose) == "kis_paper":
+            quote = self._kis_client().get_quote(symbol)
+            return MarketQuote(
+                symbol=symbol,
+                asset_type=asset_type,
+                timeframe=timeframe,
+                price=float(quote.get("current_price", np.nan)),
+                high=float(quote.get("high_price", np.nan)),
+                low=float(quote.get("low_price", np.nan)),
+                open=float(quote.get("open_price", np.nan)),
+                volume=float(quote.get("volume", np.nan)),
+                timestamp=pd.Timestamp.now(tz="Asia/Seoul"),
+            )
         frame = self.get_bars(symbol=symbol, asset_type=asset_type, timeframe=timeframe, lookback_bars=5)
         row = frame.iloc[-1]
         return MarketQuote(

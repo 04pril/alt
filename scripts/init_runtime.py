@@ -14,7 +14,10 @@ from jobs.tasks import build_task_context
 def main() -> int:
     write_example_settings()
     context = build_task_context()
-    context.repository.set_control_flag("trading_paused", "0", "initialized")
+    context.repository.initialize_runtime_flags()
+    context.repository.set_entry_paused(False, "initialized")
+    context.repository.set_worker_paused(False, "initialized")
+    context.repository.set_exit_only_mode(False, "initialized")
     context.repository.log_event("INFO", "init_runtime", "initialized", "runtime storage initialized", {})
     return 0
 

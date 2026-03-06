@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -16,11 +17,37 @@ import yaml
 
 SEOUL_TZ = timezone(timedelta(hours=9))
 DATA_DIR = Path(".paper_trading")
-TOKEN_CACHE_PATH = DATA_DIR / "kis_token_cache.json"
 ORDER_LOG_PATH = DATA_DIR / "orders.jsonl"
 EQUITY_LOG_PATH = DATA_DIR / "equity_curve.csv"
 MIN_REQUEST_INTERVAL_SEC = 0.35
-_LAST_REQUEST_MONOTONIC = 0.0
+
+
+class RequestThrottle:
+    def __init__(
+        self,
+        min_interval_seconds: float,
+        *,
+        monotonic_fn=time.monotonic,
+        sleep_fn=time.sleep,
+    ):
+        self.min_interval_seconds = float(min_interval_seconds)
+        self._monotonic_fn = monotonic_fn
+        self._sleep_fn = sleep_fn
+        self._lock = threading.Lock()
+        self._last_request_monotonic = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = self._monotonic_fn()
+            elapsed = now - self._last_request_monotonic
+            if elapsed < self.min_interval_seconds:
+                self._sleep_fn(self.min_interval_seconds - elapsed)
+            self._last_request_monotonic = self._monotonic_fn()
+
+
+# Default policy is process-wide so concurrent client instances in one worker
+# still serialize KIS requests. Tests can inject an instance-level limiter.
+PROCESS_RATE_LIMITER = RequestThrottle(MIN_REQUEST_INTERVAL_SEC)
 
 
 class KISPaperError(RuntimeError):
@@ -129,23 +156,29 @@ def load_kis_paper_config(config_path: str | Path = "kis_devlp.yaml") -> KISPape
 
 
 class KISPaperClient:
-    def __init__(self, config_path: str | Path = "kis_devlp.yaml"):
+    def __init__(
+        self,
+        config_path: str | Path = "kis_devlp.yaml",
+        *,
+        data_dir: str | Path | None = None,
+        session: requests.Session | None = None,
+        rate_limiter: RequestThrottle | None = None,
+    ):
         self.config = load_kis_paper_config(config_path=config_path)
-        _ensure_data_dir()
+        self.data_dir = Path(data_dir) if data_dir is not None else DATA_DIR
+        self.token_cache_path = self.data_dir / "kis_token_cache.json"
+        self.session = session or requests.Session()
+        self.rate_limiter = rate_limiter or PROCESS_RATE_LIMITER
+        self.data_dir.mkdir(parents=True, exist_ok=True)
 
     def _throttle(self) -> None:
-        global _LAST_REQUEST_MONOTONIC
-        now = time.monotonic()
-        elapsed = now - _LAST_REQUEST_MONOTONIC
-        if elapsed < MIN_REQUEST_INTERVAL_SEC:
-            time.sleep(MIN_REQUEST_INTERVAL_SEC - elapsed)
-        _LAST_REQUEST_MONOTONIC = time.monotonic()
+        self.rate_limiter.wait()
 
     def _read_token_cache(self) -> Dict[str, Any] | None:
-        if not TOKEN_CACHE_PATH.exists():
+        if not self.token_cache_path.exists():
             return None
         try:
-            payload = json.loads(TOKEN_CACHE_PATH.read_text(encoding="utf-8"))
+            payload = json.loads(self.token_cache_path.read_text(encoding="utf-8"))
         except Exception:
             return None
         if payload.get("config_id") != self.config.config_id:
@@ -163,7 +196,7 @@ class KISPaperClient:
         return payload if token else None
 
     def _write_token_cache(self, access_token: str, expires_at: str) -> None:
-        TOKEN_CACHE_PATH.write_text(
+        self.token_cache_path.write_text(
             json.dumps(
                 {
                     "config_id": self.config.config_id,
@@ -193,7 +226,7 @@ class KISPaperClient:
             "accept": "application/json",
             "user-agent": self.config.user_agent,
         }
-        response = requests.post(
+        response = self.session.post(
             f"{self.config.base_url}/oauth2/tokenP",
             headers=headers,
             data=json.dumps(payload),
@@ -233,7 +266,7 @@ class KISPaperClient:
 
     def _get_hashkey(self, body: Dict[str, Any], token: str) -> str:
         self._throttle()
-        response = requests.post(
+        response = self.session.post(
             f"{self.config.base_url}/uapi/hashkey",
             headers=self._headers(token=token),
             data=json.dumps(body),
@@ -265,7 +298,7 @@ class KISPaperClient:
 
         if method.upper() == "POST":
             self._throttle()
-            response = requests.post(
+            response = self.session.post(
                 f"{self.config.base_url}{api_path}",
                 headers=headers,
                 data=json.dumps(body or {}),
@@ -273,7 +306,7 @@ class KISPaperClient:
             )
         else:
             self._throttle()
-            response = requests.get(
+            response = self.session.get(
                 f"{self.config.base_url}{api_path}",
                 headers=headers,
                 params=params or {},
@@ -434,18 +467,29 @@ class KISPaperClient:
 
         holdings = pd.DataFrame(all_rows)
         if holdings.empty:
-            holdings = pd.DataFrame(columns=["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"])
+            holdings = pd.DataFrame(
+                columns=[
+                    "symbol_code",
+                    "name",
+                    "holding_qty",
+                    "avg_price",
+                    "market_price",
+                    "pnl",
+                    "return_pct",
+                    "eval_amount",
+                ]
+            )
         else:
             holdings["symbol_code"] = holdings.get("pdno", "")
-            holdings["종목명"] = holdings.get("prdt_name", "")
-            holdings["보유수량"] = pd.to_numeric(holdings.get("hldg_qty", 0), errors="coerce").fillna(0).astype(int)
-            holdings["매입평균가"] = pd.to_numeric(holdings.get("pchs_avg_pric", 0), errors="coerce")
-            holdings["현재가"] = pd.to_numeric(holdings.get("prpr", 0), errors="coerce")
-            holdings["평가손익"] = pd.to_numeric(holdings.get("evlu_pfls_amt", 0), errors="coerce")
-            holdings["수익률(%)"] = pd.to_numeric(holdings.get("evlu_pfls_rt", 0), errors="coerce")
-            holdings["평가금액"] = pd.to_numeric(holdings.get("evlu_amt", 0), errors="coerce")
-            holdings = holdings.loc[holdings["보유수량"] > 0].reset_index(drop=True)
-            holdings = holdings[["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"]]
+            holdings["name"] = holdings.get("prdt_name", "")
+            holdings["holding_qty"] = pd.to_numeric(holdings.get("hldg_qty", 0), errors="coerce").fillna(0).astype(int)
+            holdings["avg_price"] = pd.to_numeric(holdings.get("pchs_avg_pric", 0), errors="coerce")
+            holdings["market_price"] = pd.to_numeric(holdings.get("prpr", 0), errors="coerce")
+            holdings["pnl"] = pd.to_numeric(holdings.get("evlu_pfls_amt", 0), errors="coerce")
+            holdings["return_pct"] = pd.to_numeric(holdings.get("evlu_pfls_rt", 0), errors="coerce")
+            holdings["eval_amount"] = pd.to_numeric(holdings.get("evlu_amt", 0), errors="coerce")
+            holdings = holdings.loc[holdings["holding_qty"] > 0].reset_index(drop=True)
+            holdings = holdings[["symbol_code", "name", "holding_qty", "avg_price", "market_price", "pnl", "return_pct", "eval_amount"]]
 
         cash = _pick_numeric(summary_raw, ["dnca_tot_amt"])
         stock_eval = _pick_numeric(summary_raw, ["scts_evlu_amt", "evlu_amt_smtl_amt"])

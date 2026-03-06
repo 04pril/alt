@@ -13,8 +13,10 @@ class OutcomeResolver:
         self.repository = repository
         self.market_data_service = market_data_service
 
-    def resolve(self, limit: int = 500) -> int:
+    def resolve(self, limit: int = 500, symbol: str | None = None) -> int:
         unresolved = self.repository.unresolved_predictions(limit=limit)
+        if symbol and not unresolved.empty:
+            unresolved = unresolved[unresolved["symbol"].astype(str) == str(symbol)]
         if unresolved.empty:
             return 0
         resolved_count = 0

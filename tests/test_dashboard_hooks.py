@@ -70,7 +70,7 @@ class DashboardHooksTest(unittest.TestCase):
             repo.initialize()
             now = datetime(2026, 3, 6, 12, 0, tzinfo=timezone.utc)
             self._insert_job_heartbeat(repo, (now - timedelta(seconds=30)).isoformat().replace("+00:00", "Z"))
-            repo.set_control_flag("trading_paused", "1", "test")
+            repo.set_entry_paused(True, "test")
             status = compute_auto_trading_status(repo, loop_sleep_seconds=30, now=now)
             self.assertEqual(status["label"], "Paused")
 

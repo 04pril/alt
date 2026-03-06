@@ -12,13 +12,14 @@ from storage.repository import TradingRepository
 
 
 class RiskEngineTest(unittest.TestCase):
-    def test_paused_flag_blocks_entry(self) -> None:
+    def test_entry_paused_flag_blocks_entry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = RuntimeSettings()
             settings.storage.db_path = f"{tmp}/runtime.sqlite3"
             repo = TradingRepository(settings.storage.db_path)
             repo.initialize()
-            repo.set_control_flag("trading_paused", "1", "test")
+            repo.initialize_runtime_flags()
+            repo.set_entry_paused(True, "test")
             engine = RiskEngine(settings, repo)
             signal = SignalDecision(
                 symbol="BTC-USD",
@@ -46,7 +47,7 @@ class RiskEngineTest(unittest.TestCase):
             )
             decision = engine.evaluate_entry(signal, correlation_matrix=pd.DataFrame(), market_is_open=True)
             self.assertFalse(decision.allowed)
-            self.assertEqual(decision.reason, "paused")
+            self.assertEqual(decision.reason, "entry_paused")
 
 
 if __name__ == "__main__":

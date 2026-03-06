@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Mapping
 
 
+logger = logging.getLogger(__name__)
 DEFAULT_SETTINGS_PATH = Path("config/runtime_settings.json")
+
+
+class SettingsMergeError(ValueError):
+    pass
 
 
 @dataclass
@@ -35,8 +41,8 @@ class AssetScheduleConfig:
 
 @dataclass
 class UniverseSettings:
-    watchlist: List[str] = field(default_factory=list)
-    top_universe: List[str] = field(default_factory=list)
+    watchlist: list[str] = field(default_factory=list)
+    top_universe: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +109,13 @@ class BrokerSettings:
     max_volume_participation: float = 0.05
     allow_partial_fills: bool = True
     default_order_type: str = "market"
+    kis_config_path: str = "kis_devlp.yaml"
+    asset_broker_mode: Dict[str, str] = field(
+        default_factory=lambda: {"코인": "sim", "미국주식": "sim", "한국주식": "kis_paper"}
+    )
+    broker_short_support: Dict[str, bool] = field(
+        default_factory=lambda: {"sim": True, "kis_paper": False}
+    )
 
 
 @dataclass
@@ -111,12 +124,13 @@ class SchedulerSettings:
     retry_backoff_seconds: int = 30
     max_retry_count: int = 3
     lock_owner: str = "paper-worker"
+    job_lease_timeout_seconds: int = 180
 
 
 @dataclass
 class RetrainingSettings:
     cadence: str = "weekly"
-    benchmark_symbols: List[str] = field(default_factory=lambda: ["BTC-USD", "AAPL", "005930.KS"])
+    benchmark_symbols: list[str] = field(default_factory=lambda: ["BTC-USD", "AAPL", "005930.KS"])
     promotion_min_directional_accuracy_pct: float = 52.0
     promotion_max_mae_pct: float = 5.0
     promotion_min_trade_return_pct: float = 0.0
@@ -133,7 +147,6 @@ class RuntimeSettings:
     retraining: RetrainingSettings = field(default_factory=RetrainingSettings)
     asset_schedules: Dict[str, AssetScheduleConfig] = field(
         default_factory=lambda: {
-            # Assumption: crypto uses 1h bars and can trade on each bar close 24/7.
             "코인": AssetScheduleConfig(
                 asset_type="코인",
                 timeframe="1h",
@@ -150,7 +163,6 @@ class RuntimeSettings:
                 forecast_horizon_bars=1,
                 min_history_bars=400,
             ),
-            # Assumption: US equities generate signals in the pre-close window and fill with a paper MOC price proxy.
             "미국주식": AssetScheduleConfig(
                 asset_type="미국주식",
                 timeframe="1d",
@@ -168,7 +180,6 @@ class RuntimeSettings:
                 pre_close_buffer_minutes=20,
                 min_history_bars=320,
             ),
-            # Assumption: KR equities also trade using a pre-close paper MOC proxy to avoid target/open-close mismatch.
             "한국주식": AssetScheduleConfig(
                 asset_type="한국주식",
                 timeframe="1d",
@@ -208,34 +219,87 @@ class RuntimeSettings:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    def broker_mode_for(self, asset_type: str) -> str:
+        return str(self.broker.asset_broker_mode.get(asset_type, "sim"))
 
-def _merge_dataclass(instance: Any, overrides: Dict[str, Any]) -> Any:
+    def asset_types_for_broker_mode(self, broker_mode: str) -> list[str]:
+        return [asset_type for asset_type, mode in self.broker.asset_broker_mode.items() if str(mode) == str(broker_mode)]
+
+    def broker_supports_short(self, broker_mode: str) -> bool:
+        return bool(self.broker.broker_short_support.get(broker_mode, False))
+
+    def short_allowed_for(self, asset_type: str) -> bool:
+        return bool(self.strategy.allow_short and self.broker_supports_short(self.broker_mode_for(asset_type)))
+
+
+def _merge_error(path: str, message: str, *, strict: bool, warn_unknown: bool) -> None:
+    full_message = f"settings override error at '{path}': {message}" if path else f"settings override error: {message}"
+    if strict:
+        raise SettingsMergeError(full_message)
+    if warn_unknown:
+        logger.warning(full_message)
+
+
+def _merge_dataclass(instance: Any, overrides: Mapping[str, Any], *, path: str = "", strict: bool = False, warn_unknown: bool = True) -> Any:
+    valid_fields = getattr(instance, "__dataclass_fields__", {})
     for key, value in overrides.items():
+        current_path = f"{path}.{key}" if path else str(key)
+        if key not in valid_fields:
+            _merge_error(current_path, "unknown key", strict=strict, warn_unknown=warn_unknown)
+            continue
         current = getattr(instance, key)
-        if hasattr(current, "__dataclass_fields__") and isinstance(value, dict):
-            setattr(instance, key, _merge_dataclass(current, value))
-        elif isinstance(current, dict) and isinstance(value, dict):
+        if hasattr(current, "__dataclass_fields__"):
+            if not isinstance(value, Mapping):
+                _merge_error(current_path, f"expected object, got {type(value).__name__}", strict=strict, warn_unknown=warn_unknown)
+                continue
+            setattr(
+                instance,
+                key,
+                _merge_dataclass(current, value, path=current_path, strict=strict, warn_unknown=warn_unknown),
+            )
+            continue
+        if isinstance(current, dict) and isinstance(value, Mapping):
             if current and all(hasattr(v, "__dataclass_fields__") for v in current.values()):
-                merged: Dict[str, Any] = {}
+                merged = dict(current)
                 for sub_key, sub_value in value.items():
-                    base_value = current.get(sub_key)
+                    sub_path = f"{current_path}.{sub_key}"
+                    base_value = merged.get(sub_key)
                     if base_value is None:
+                        _merge_error(sub_path, "unknown key", strict=strict, warn_unknown=warn_unknown)
                         continue
-                    merged[sub_key] = _merge_dataclass(base_value, sub_value) if isinstance(sub_value, dict) else sub_value
-                current.update(merged)
+                    if isinstance(sub_value, Mapping):
+                        merged[sub_key] = _merge_dataclass(
+                            base_value,
+                            sub_value,
+                            path=sub_path,
+                            strict=strict,
+                            warn_unknown=warn_unknown,
+                        )
+                    else:
+                        merged[sub_key] = sub_value
+                setattr(instance, key, merged)
             else:
-                current.update(value)
-        else:
-            setattr(instance, key, value)
+                merged = dict(current)
+                known_subkeys = set(current.keys())
+                for sub_key, sub_value in value.items():
+                    sub_path = f"{current_path}.{sub_key}"
+                    if known_subkeys and sub_key not in known_subkeys:
+                        _merge_error(sub_path, "unknown key", strict=strict, warn_unknown=warn_unknown)
+                        if strict:
+                            continue
+                    merged[sub_key] = sub_value
+                setattr(instance, key, merged)
+            continue
+        setattr(instance, key, value)
     return instance
 
 
-def load_settings(path: str | Path | None = None) -> RuntimeSettings:
+def load_settings(path: str | Path | None = None, *, strict: bool = False, warn_unknown: bool = True) -> RuntimeSettings:
     settings = RuntimeSettings()
     source_path = Path(path) if path else DEFAULT_SETTINGS_PATH
     if source_path.exists():
         raw = json.loads(source_path.read_text(encoding="utf-8"))
-        settings = _merge_dataclass(settings, raw)
+        settings = _merge_dataclass(settings, raw, strict=strict, warn_unknown=warn_unknown)
     return settings
 
 

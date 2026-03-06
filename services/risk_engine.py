@@ -43,12 +43,18 @@ class RiskEngine:
         risk = self.settings.risk
         state = self._latest_account_state()
         today = str(pd.Timestamp.utcnow().date())
-        if self.repository.get_control_flag("trading_paused", "0") == "1":
-            return RiskDecision(False, "paused", 0, 0.0, 0.0)
+        if self.repository.get_control_flag_bool("worker_paused", False):
+            return RiskDecision(False, "worker_paused", 0, 0.0, 0.0)
+        if self.repository.get_control_flag_bool("entry_paused", False):
+            return RiskDecision(False, "entry_paused", 0, 0.0, 0.0)
+        if self.repository.get_control_flag_bool("exit_only_mode", False):
+            return RiskDecision(False, "exit_only_mode", 0, 0.0, 0.0)
         if not market_is_open:
             return RiskDecision(False, "market_closed", 0, 0.0, 0.0)
         if signal.signal == "FLAT":
             return RiskDecision(False, "flat_signal", 0, 0.0, 0.0)
+        if signal.signal == "SHORT" and not self.settings.short_allowed_for(signal.asset_type):
+            return RiskDecision(False, "short_not_supported", 0, 0.0, 0.0)
         if signal.expected_return * 100.0 < strategy.min_expected_return_pct:
             return RiskDecision(False, "expected_return_too_low", 0, 0.0, 0.0)
         if signal.confidence < strategy.min_confidence:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config.settings import load_settings
@@ -26,28 +26,48 @@ def _bucket_key(dt: datetime, minutes: int) -> str:
 
 
 def _run_guarded(context, job_name: str, run_key: str, fn):
-    job_run_id = context.repository.begin_job_run(
+    lease = context.repository.begin_job_run(
         job_name=job_name,
         run_key=run_key,
-        scheduled_at=datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        scheduled_at=datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         lock_owner=context.settings.scheduler.lock_owner,
+        lease_timeout_seconds=context.settings.scheduler.job_lease_timeout_seconds,
+        max_retry_count=context.settings.scheduler.max_retry_count,
     )
-    if job_run_id is None:
+    if lease is None:
         return None
-    try:
-        result = fn()
-    except Exception as exc:  # pragma: no cover - exercised in runtime
-        context.repository.finish_job_run(job_run_id, status="failed", error_message=str(exc), metrics={})
-        context.repository.log_event("ERROR", "scheduler", "job_failed", f"{job_name} failed", {"error": str(exc)})
-        return None
-    context.repository.finish_job_run(job_run_id, status="completed", metrics=result if isinstance(result, dict) else {})
-    return result
+    job_run_id = str(lease["job_run_id"])
+    attempt = int(lease.get("retry_count", 0))
+    while True:
+        try:
+            result = fn()
+        except Exception as exc:  # pragma: no cover - exercised in runtime
+            if attempt >= context.settings.scheduler.max_retry_count:
+                context.repository.finish_job_run(job_run_id, status="failed", error_message=str(exc), metrics={})
+                context.repository.log_event("ERROR", "scheduler", "job_failed", f"{job_name} failed", {"error": str(exc), "attempt": attempt})
+                return None
+            attempt += 1
+            context.repository.mark_job_retry(job_run_id, retry_count=attempt, error_message=str(exc))
+            context.repository.log_event(
+                "WARNING",
+                "scheduler",
+                "job_retry",
+                f"{job_name} retry scheduled",
+                {"error": str(exc), "attempt": attempt, "run_key": run_key},
+            )
+            time.sleep(max(context.settings.scheduler.retry_backoff_seconds, 1) * attempt)
+            continue
+        context.repository.finish_job_run(job_run_id, status="completed", metrics=result if isinstance(result, dict) else {})
+        return result
 
 
 def run_once(settings_path: str | None = None) -> None:
     context = build_task_context(settings_path)
     settings = context.settings
     context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), "scheduler loop heartbeat")
+    if context.repository.get_control_flag_bool("worker_paused", False):
+        context.repository.log_event("INFO", "scheduler", "worker_paused", "worker loop skipped due to worker_paused", {})
+        return
     for asset_type, schedule in settings.asset_schedules.items():
         now = datetime.now(ZoneInfo(schedule.timezone))
         _run_guarded(
@@ -65,25 +85,25 @@ def run_once(settings_path: str | None = None) -> None:
     _run_guarded(
         context,
         job_name="exit_management",
-        run_key=_bucket_key(datetime.utcnow(), 15),
+        run_key=_bucket_key(datetime.now(timezone.utc), 15),
         fn=lambda: exit_management_job(context),
     )
     _run_guarded(
         context,
         job_name="outcome_resolution",
-        run_key=_bucket_key(datetime.utcnow(), 60),
+        run_key=_bucket_key(datetime.now(timezone.utc), 60),
         fn=lambda: outcome_resolution_job(context),
     )
     _run_guarded(
         context,
         job_name="daily_report",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(datetime.now(timezone.utc).date()),
         fn=lambda: daily_report_job(context),
     )
     _run_guarded(
         context,
         job_name="retrain_check",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(datetime.now(timezone.utc).date()),
         fn=lambda: retrain_check_job(context),
     )
 

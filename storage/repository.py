@@ -280,6 +280,18 @@ def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:20]}"
 
 
+def parse_utc_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
 class TradingRepository:
     def __init__(self, db_path: str):
         self.db_path = Path(db_path)
@@ -319,6 +331,44 @@ class TradingRepository:
             row = conn.execute("SELECT flag_value FROM control_flags WHERE flag_name = ?", (flag_name,)).fetchone()
         return str(row["flag_value"]) if row else default
 
+    def get_control_flag_bool(self, flag_name: str, default: bool = False) -> bool:
+        raw = self.get_control_flag(flag_name, "1" if default else "0").strip().lower()
+        return raw in {"1", "true", "y", "yes", "on"}
+
+    def initialize_runtime_flags(self) -> None:
+        defaults = {
+            "entry_paused": ("0", "initialized"),
+            "worker_paused": ("0", "initialized"),
+            "exit_only_mode": ("0", "initialized"),
+            "trading_paused": ("0", "legacy alias initialized"),
+            "worker_heartbeat_at": ("", "initialized"),
+            "broker_kis_last_sync_at": ("", "initialized"),
+            "broker_kis_last_sync_status": ("never", "initialized"),
+            "broker_kis_last_sync_message": ("", "initialized"),
+        }
+        for flag_name, (flag_value, notes) in defaults.items():
+            with self.connect() as conn:
+                row = conn.execute("SELECT flag_name FROM control_flags WHERE flag_name = ?", (flag_name,)).fetchone()
+                if row is None:
+                    conn.execute(
+                        """
+                        INSERT INTO control_flags(flag_name, flag_value, updated_at, notes)
+                        VALUES(?, ?, ?, ?)
+                        """,
+                        (flag_name, flag_value, utc_now_iso(), notes),
+                    )
+
+    def set_entry_paused(self, paused: bool, notes: str = "") -> None:
+        value = "1" if paused else "0"
+        self.set_control_flag("entry_paused", value, notes or ("entry paused" if paused else "entry resumed"))
+        self.set_control_flag("trading_paused", value, "legacy alias synced with entry_paused")
+
+    def set_worker_paused(self, paused: bool, notes: str = "") -> None:
+        self.set_control_flag("worker_paused", "1" if paused else "0", notes or ("worker paused" if paused else "worker resumed"))
+
+    def set_exit_only_mode(self, enabled: bool, notes: str = "") -> None:
+        self.set_control_flag("exit_only_mode", "1" if enabled else "0", notes or ("exit_only enabled" if enabled else "exit_only disabled"))
+
     def insert_system_event(self, record: SystemEventRecord) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -342,28 +392,68 @@ class TradingRepository:
             )
         )
 
-    def begin_job_run(self, job_name: str, run_key: str, scheduled_at: str, lock_owner: str) -> str | None:
+    def begin_job_run(
+        self,
+        job_name: str,
+        run_key: str,
+        scheduled_at: str,
+        lock_owner: str,
+        *,
+        lease_timeout_seconds: int = 180,
+        max_retry_count: int = 3,
+    ) -> Dict[str, Any] | None:
         with self.connect() as conn:
             existing = conn.execute(
-                "SELECT job_run_id, status FROM job_runs WHERE job_name = ? AND run_key = ?",
+                "SELECT job_run_id, status, retry_count, started_at, scheduled_at FROM job_runs WHERE job_name = ? AND run_key = ?",
                 (job_name, run_key),
             ).fetchone()
-            if existing and str(existing["status"]) in {"running", "completed"}:
+            if not existing:
+                job_run_id = make_id("job")
+                conn.execute(
+                    """
+                    INSERT INTO job_runs(job_run_id, job_name, run_key, scheduled_at, started_at, finished_at, status, retry_count, lock_owner, error_message, metrics_json)
+                    VALUES(?, ?, ?, ?, ?, NULL, 'running', 0, ?, '', '{}')
+                    """,
+                    (job_run_id, job_name, run_key, scheduled_at, utc_now_iso(), lock_owner),
+                )
+                return {"job_run_id": job_run_id, "retry_count": 0, "recovered_stale": False}
+
+            status = str(existing["status"])
+            retry_count = int(existing["retry_count"] or 0)
+            started_at = parse_utc_timestamp(existing["started_at"] or existing["scheduled_at"])
+            is_stale = False
+            if status == "running" and started_at is not None:
+                age_seconds = max((datetime.now(timezone.utc) - started_at).total_seconds(), 0.0)
+                is_stale = age_seconds > max(int(lease_timeout_seconds), 1)
+
+            if status == "completed":
                 return None
-            job_run_id = str(existing["job_run_id"]) if existing else make_id("job")
+            if status == "running" and not is_stale:
+                return None
+            if retry_count >= max_retry_count:
+                return None
+
+            next_retry_count = retry_count + (1 if status == "failed" or is_stale else 0)
             conn.execute(
                 """
-                INSERT INTO job_runs(job_run_id, job_name, run_key, scheduled_at, started_at, status, retry_count, lock_owner, error_message, metrics_json)
-                VALUES(?, ?, ?, ?, ?, 'running', 0, ?, '', '{}')
-                ON CONFLICT(job_name, run_key) DO UPDATE SET
-                    started_at=excluded.started_at,
-                    status='running',
-                    lock_owner=excluded.lock_owner,
-                    error_message=''
+                UPDATE job_runs
+                SET started_at = ?, finished_at = NULL, status = 'running', retry_count = ?, lock_owner = ?, error_message = ''
+                WHERE job_run_id = ?
                 """,
-                (job_run_id, job_name, run_key, scheduled_at, utc_now_iso(), lock_owner),
+                (utc_now_iso(), next_retry_count, lock_owner, str(existing["job_run_id"])),
             )
-        return job_run_id
+        return {"job_run_id": str(existing["job_run_id"]), "retry_count": next_retry_count, "recovered_stale": is_stale}
+
+    def mark_job_retry(self, job_run_id: str, retry_count: int, error_message: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE job_runs
+                SET started_at = ?, finished_at = NULL, status = 'running', retry_count = ?, error_message = ?
+                WHERE job_run_id = ?
+                """,
+                (utc_now_iso(), int(retry_count), error_message, job_run_id),
+            )
 
     def finish_job_run(self, job_run_id: str, status: str, error_message: str = "", metrics: Dict[str, Any] | None = None) -> None:
         with self.connect() as conn:
@@ -589,6 +679,23 @@ class TradingRepository:
                 asdict(record),
             )
 
+    def get_order(self, order_id: str) -> Dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_order_frame(self, order_id: str) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query("SELECT * FROM orders WHERE order_id = ?", conn, params=[order_id])
+
+    def find_order_by_broker_order_id(self, broker_order_id: str) -> Dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE broker_order_id = ? ORDER BY created_at DESC LIMIT 1",
+                (broker_order_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def update_order(
         self,
         order_id: str,
@@ -630,14 +737,30 @@ class TradingRepository:
                 conn,
             )
 
+    def recent_orders(self, limit: int = 200) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?",
+                conn,
+                params=[int(limit)],
+            )
+
     def insert_fill(self, record: FillRecord) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO fills(fill_id, created_at, order_id, symbol, side, quantity, fill_price, fees, slippage_bps, status, raw_json)
+                INSERT OR IGNORE INTO fills(fill_id, created_at, order_id, symbol, side, quantity, fill_price, fees, slippage_bps, status, raw_json)
                 VALUES(:fill_id, :created_at, :order_id, :symbol, :side, :quantity, :fill_price, :fees, :slippage_bps, :status, :raw_json)
                 """,
                 asdict(record),
+            )
+
+    def fills_for_order(self, order_id: str) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM fills WHERE order_id = ? ORDER BY created_at ASC",
+                conn,
+                params=[order_id],
             )
 
     def upsert_position(self, record: PositionRecord) -> None:
@@ -740,6 +863,14 @@ class TradingRepository:
                 params=[int(limit)],
             )
 
+    def latest_account_snapshot_by_source(self, source: str) -> Dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM account_snapshots WHERE source = ? ORDER BY created_at DESC LIMIT 1",
+                (source,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def count_daily_entries(self, created_date: str) -> int:
         with self.connect() as conn:
             row = conn.execute(
@@ -747,7 +878,7 @@ class TradingRepository:
                 SELECT COUNT(*) AS cnt
                 FROM orders
                 WHERE substr(created_at, 1, 10) = ?
-                  AND side IN ('buy', 'sell')
+                  AND reason = 'entry'
                   AND status IN ('new', 'partially_filled', 'filled')
                 """,
                 (created_date,),
@@ -773,7 +904,14 @@ class TradingRepository:
             unresolved = conn.execute("SELECT COUNT(*) AS cnt FROM predictions WHERE status = 'unresolved'").fetchone()
             open_positions = conn.execute("SELECT COUNT(*) AS cnt FROM positions WHERE status = 'open'").fetchone()
             open_orders = conn.execute("SELECT COUNT(*) AS cnt FROM orders WHERE status IN ('new', 'partially_filled')").fetchone()
-            latest_account = conn.execute("SELECT * FROM account_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+            latest_account = conn.execute(
+                """
+                SELECT *
+                FROM account_snapshots
+                ORDER BY CASE WHEN source = 'broker_router' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
         return {
             "unresolved_predictions": int(unresolved["cnt"]) if unresolved else 0,
             "open_positions": int(open_positions["cnt"]) if open_positions else 0,
@@ -816,13 +954,35 @@ class TradingRepository:
     def recent_system_events(self, level: str | None = None, limit: int = 50) -> pd.DataFrame:
         query = "SELECT * FROM system_events"
         params: List[Any] = []
+        clauses: List[str] = []
         if level:
-            query += " WHERE level = ?"
+            clauses.append("level = ?")
+            params.append(level)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def recent_component_events(self, component: str, level: str | None = None, limit: int = 50) -> pd.DataFrame:
+        query = "SELECT * FROM system_events WHERE component = ?"
+        params: List[Any] = [component]
+        if level:
+            query += " AND level = ?"
             params.append(level)
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(int(limit))
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
+
+    def load_model_registry(self, limit: int = 200) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                "SELECT * FROM model_registry ORDER BY COALESCE(promoted_at, created_at) DESC, created_at DESC LIMIT ?",
+                conn,
+                params=[int(limit)],
+            )
 
     def prediction_report(self, limit: int = 500) -> pd.DataFrame:
         with self.connect() as conn:
@@ -866,6 +1026,10 @@ class TradingRepository:
 
     def trade_performance_report(self) -> Dict[str, float]:
         equity = self.load_account_snapshots(limit=1000)
+        if not equity.empty and "source" in equity.columns:
+            broker_router = equity[equity["source"].astype(str) == "broker_router"]
+            if not broker_router.empty:
+                equity = broker_router
         if equity.empty:
             return {"samples": 0.0, "total_return_pct": np.nan, "max_drawdown_pct": np.nan, "today_pnl": 0.0}
         equity = equity.sort_values("created_at")

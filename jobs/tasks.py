@@ -7,10 +7,12 @@ from typing import Dict, Iterable
 import pandas as pd
 
 from config.settings import RuntimeSettings, load_settings
+from services.broker_base import BrokerRouter
 from services.evaluator import Evaluator
+from services.kis_paper_broker import KISPaperBroker
 from services.market_data_service import MarketDataService
 from services.outcome_resolver import OutcomeResolver
-from services.paper_broker import PaperBroker
+from services.paper_broker import SimBroker
 from services.portfolio_manager import PortfolioManager
 from services.retrainer import Retrainer
 from services.risk_engine import RiskEngine
@@ -26,7 +28,7 @@ class TaskContext:
     market_data_service: MarketDataService
     signal_engine: SignalEngine
     risk_engine: RiskEngine
-    paper_broker: PaperBroker
+    paper_broker: BrokerRouter
     portfolio_manager: PortfolioManager
     universe_scanner: UniverseScanner
     outcome_resolver: OutcomeResolver
@@ -38,9 +40,17 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
     settings = load_settings(settings_path)
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
+    repository.initialize_runtime_flags()
     market_data_service = MarketDataService(settings)
     signal_engine = SignalEngine(settings, repository)
-    paper_broker = PaperBroker(settings, repository)
+    paper_broker = BrokerRouter(
+        settings,
+        repository,
+        {
+            "sim": SimBroker(settings, repository),
+            "kis_paper": KISPaperBroker(settings, repository),
+        },
+    )
     risk_engine = RiskEngine(settings, repository)
     portfolio_manager = PortfolioManager(settings, repository, paper_broker)
     universe_scanner = UniverseScanner(settings, repository, market_data_service, signal_engine)

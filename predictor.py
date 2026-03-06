@@ -313,15 +313,24 @@ def _target_to_next_close(target: np.ndarray, current_close: np.ndarray, target_
 
 
 def _infer_future_index(index: pd.DatetimeIndex, periods: int) -> pd.DatetimeIndex:
-    if len(index) < 2:
+    if periods < 1:
+        return pd.DatetimeIndex([], dtype="datetime64[ns]")
+    if len(index) == 0:
+        raise ValueError("index must contain at least one timestamp")
+
+    def _calendar_fallback() -> pd.DatetimeIndex:
         weekend_ratio = float((index.weekday >= 5).mean()) if len(index) else 0.0
         freq = "D" if weekend_ratio > 0.15 else "B"
         return pd.date_range(start=index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
 
+    if len(index) < 2:
+        return _calendar_fallback()
+
     inferred = pd.infer_freq(index)
     if inferred:
         try:
-            return pd.date_range(start=index[-1] + pd.tseries.frequencies.to_offset(inferred), periods=periods, freq=inferred)
+            offset = pd.tseries.frequencies.to_offset(inferred)
+            return pd.date_range(start=index[-1] + offset, periods=periods, freq=inferred)
         except Exception:
             pass
 
@@ -331,9 +340,7 @@ def _infer_future_index(index: pd.DatetimeIndex, periods: int) -> pd.DatetimeInd
         if pd.notna(step) and step <= pd.Timedelta(hours=12):
             return pd.date_range(start=index[-1] + step, periods=periods, freq=step)
 
-    weekend_ratio = float((index.weekday >= 5).mean()) if len(index) else 0.0
-    freq = "D" if weekend_ratio > 0.15 else "B"
-    return pd.date_range(start=index[-1] + pd.Timedelta(days=1), periods=periods, freq=freq)
+    return _calendar_fallback()
 
 
 def _build_base_models() -> Dict[str, object]:
@@ -569,89 +576,94 @@ def _apply_atr_stops_and_targets(
     stop_loss_atr_mult: float,
     take_profit_atr_mult: float,
 ) -> pd.DataFrame:
-    exit_price = base_exit_price.astype(float).copy()
-    stop_level = pd.Series(np.nan, index=entry_price.index, dtype=float)
-    take_level = pd.Series(np.nan, index=entry_price.index, dtype=float)
-    stop_hit = pd.Series(False, index=entry_price.index, dtype=bool)
-    take_hit = pd.Series(False, index=entry_price.index, dtype=bool)
-    exit_reason = pd.Series("close", index=entry_price.index, dtype="object")
+    # This path is exercised repeatedly during validation/backtests, so keep the
+    # stop/target decision logic vectorized rather than per-row Python loops.
+    index = entry_price.index
+    exit_price = base_exit_price.astype(float).to_numpy(copy=True)
+    stop_level = np.full(len(index), np.nan, dtype=float)
+    take_level = np.full(len(index), np.nan, dtype=float)
+    stop_hit = np.zeros(len(index), dtype=bool)
+    take_hit = np.zeros(len(index), dtype=bool)
+    exit_reason = np.full(len(index), "close", dtype=object)
 
     if stop_loss_atr_mult <= 0 and take_profit_atr_mult <= 0:
         return pd.DataFrame(
             {
-                "exit_price": exit_price,
-                "stop_level": stop_level,
-                "take_level": take_level,
-                "stop_hit": stop_hit,
-                "take_hit": take_hit,
-                "exit_reason": exit_reason,
+                "exit_price": pd.Series(exit_price, index=index),
+                "stop_level": pd.Series(stop_level, index=index),
+                "take_level": pd.Series(take_level, index=index),
+                "stop_hit": pd.Series(stop_hit, index=index),
+                "take_hit": pd.Series(take_hit, index=index),
+                "exit_reason": pd.Series(exit_reason, index=index, dtype="object"),
             }
         )
 
-    for idx in entry_price.index:
-        size = float(signal.loc[idx])
-        if abs(size) <= 1e-12:
-            continue
+    entry_values = entry_price.astype(float).to_numpy()
+    base_exit_values = base_exit_price.astype(float).to_numpy()
+    day_open_values = session_open.astype(float).to_numpy()
+    day_high_values = session_high.astype(float).to_numpy()
+    day_low_values = session_low.astype(float).to_numpy()
+    atr_values = atr_value.astype(float).to_numpy()
+    signal_values = signal.astype(float).to_numpy()
 
-        entry = float(entry_price.loc[idx])
-        base_exit = float(base_exit_price.loc[idx]) if pd.notna(base_exit_price.loc[idx]) else np.nan
-        day_open = float(session_open.loc[idx]) if pd.notna(session_open.loc[idx]) else np.nan
-        day_high = float(session_high.loc[idx]) if pd.notna(session_high.loc[idx]) else np.nan
-        day_low = float(session_low.loc[idx]) if pd.notna(session_low.loc[idx]) else np.nan
-        atr = float(atr_value.loc[idx]) if pd.notna(atr_value.loc[idx]) else np.nan
-        if not np.isfinite(entry) or not np.isfinite(base_exit) or not np.isfinite(day_high) or not np.isfinite(day_low):
-            continue
-        if not np.isfinite(atr) or atr <= 0:
-            continue
+    active_mask = np.abs(signal_values) > 1e-12
+    finite_mask = (
+        np.isfinite(entry_values)
+        & np.isfinite(base_exit_values)
+        & np.isfinite(day_high_values)
+        & np.isfinite(day_low_values)
+        & np.isfinite(atr_values)
+        & (atr_values > 0)
+    )
+    valid_mask = active_mask & finite_mask
+    is_long = signal_values > 0
 
-        is_long = size > 0
+    if stop_loss_atr_mult > 0:
+        stop_candidates = np.where(
+            is_long,
+            entry_values - atr_values * stop_loss_atr_mult,
+            entry_values + atr_values * stop_loss_atr_mult,
+        )
+        stop_level[valid_mask] = stop_candidates[valid_mask]
+        long_stop_hit = is_long & valid_mask & (day_low_values <= stop_candidates)
+        short_stop_hit = (~is_long) & valid_mask & (day_high_values >= stop_candidates)
+        stop_hit = long_stop_hit | short_stop_hit
 
-        current_stop = np.nan
-        current_take = np.nan
-        current_stop_hit = False
-        current_take_hit = False
-        chosen_exit = base_exit
-        chosen_reason = "close"
+    if take_profit_atr_mult > 0:
+        take_candidates = np.where(
+            is_long,
+            entry_values + atr_values * take_profit_atr_mult,
+            entry_values - atr_values * take_profit_atr_mult,
+        )
+        take_level[valid_mask] = take_candidates[valid_mask]
+        long_take_hit = is_long & valid_mask & (day_high_values >= take_candidates)
+        short_take_hit = (~is_long) & valid_mask & (day_low_values <= take_candidates)
+        take_hit = long_take_hit | short_take_hit
 
-        if stop_loss_atr_mult > 0:
-            current_stop = entry - atr * stop_loss_atr_mult if is_long else entry + atr * stop_loss_atr_mult
-            current_stop_hit = day_low <= current_stop if is_long else day_high >= current_stop
+    stop_exit = np.where(
+        is_long,
+        np.where(np.isfinite(day_open_values), np.minimum(day_open_values, stop_level), stop_level),
+        np.where(np.isfinite(day_open_values), np.maximum(day_open_values, stop_level), stop_level),
+    )
 
-        if take_profit_atr_mult > 0:
-            current_take = entry + atr * take_profit_atr_mult if is_long else entry - atr * take_profit_atr_mult
-            current_take_hit = day_high >= current_take if is_long else day_low <= current_take
+    both_hit = stop_hit & take_hit
+    stop_only = stop_hit & ~take_hit
+    take_only = take_hit & ~stop_hit
 
-        if current_stop_hit and current_take_hit:
-            if is_long:
-                chosen_exit = min(day_open, current_stop) if np.isfinite(day_open) else current_stop
-            else:
-                chosen_exit = max(day_open, current_stop) if np.isfinite(day_open) else current_stop
-            chosen_reason = "stop_priority"
-        elif current_stop_hit:
-            if is_long:
-                chosen_exit = min(day_open, current_stop) if np.isfinite(day_open) else current_stop
-            else:
-                chosen_exit = max(day_open, current_stop) if np.isfinite(day_open) else current_stop
-            chosen_reason = "stop_loss"
-        elif current_take_hit:
-            chosen_exit = current_take
-            chosen_reason = "take_profit"
-
-        exit_price.loc[idx] = float(chosen_exit)
-        stop_level.loc[idx] = current_stop
-        take_level.loc[idx] = current_take
-        stop_hit.loc[idx] = bool(current_stop_hit)
-        take_hit.loc[idx] = bool(current_take_hit)
-        exit_reason.loc[idx] = chosen_reason
+    exit_price[both_hit | stop_only] = stop_exit[both_hit | stop_only]
+    exit_price[take_only] = take_level[take_only]
+    exit_reason[both_hit] = "stop_priority"
+    exit_reason[stop_only] = "stop_loss"
+    exit_reason[take_only] = "take_profit"
 
     return pd.DataFrame(
         {
-            "exit_price": exit_price,
-            "stop_level": stop_level,
-            "take_level": take_level,
-            "stop_hit": stop_hit,
-            "take_hit": take_hit,
-            "exit_reason": exit_reason,
+            "exit_price": pd.Series(exit_price, index=index),
+            "stop_level": pd.Series(stop_level, index=index),
+            "take_level": pd.Series(take_level, index=index),
+            "stop_hit": pd.Series(stop_hit, index=index),
+            "take_hit": pd.Series(take_hit, index=index),
+            "exit_reason": pd.Series(exit_reason, index=index, dtype="object"),
         }
     )
 

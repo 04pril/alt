@@ -6,14 +6,14 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from services.broker_base import BrokerProtocol
 from services.market_data_service import MarketDataService
-from services.paper_broker import PaperBroker
 from storage.models import PositionRecord
 from storage.repository import TradingRepository, utc_now_iso
 
 
 class PortfolioManager:
-    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker: PaperBroker):
+    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker: BrokerProtocol):
         self.settings = settings
         self.repository = repository
         self.broker = broker
@@ -26,6 +26,7 @@ class PortfolioManager:
                     symbol=str(position["symbol"]),
                     asset_type=str(position["asset_type"]),
                     timeframe=str(position["timeframe"]),
+                    purpose="execution",
                 )
             except Exception:
                 continue
@@ -55,7 +56,7 @@ class PortfolioManager:
                         "lowest_price": low,
                         "trailing_stop": trailing if np.isfinite(trailing) else float(position["trailing_stop"]),
                         "unrealized_pnl": unrealized,
-                        "exposure_value": abs(mark * qty),
+                        "exposure_value": mark * qty if side == "LONG" else -(mark * qty),
                         "notes": "mtm_update",
                     }
                 )
@@ -73,6 +74,7 @@ class PortfolioManager:
                     symbol=str(position["symbol"]),
                     asset_type=str(position["asset_type"]),
                     timeframe=str(position["timeframe"]),
+                    purpose="execution",
                 )
             except Exception:
                 continue

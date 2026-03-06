@@ -6,7 +6,8 @@
     "loop_sleep_seconds": 30,
     "retry_backoff_seconds": 30,
     "max_retry_count": 3,
-    "lock_owner": "paper-worker"
+    "lock_owner": "paper-worker",
+    "job_lease_timeout_seconds": 180
   },
   "strategy": {
     "strategy_version": "paper_strategy_v1",
@@ -33,6 +34,166 @@
     "time_stop_bars": 3,
     "allow_short": false,
     "target_daily_vol_pct": 1.0,
-    "max_position_size": 1.0
+    "max_position_size": 1.0,
+    "scan_score_weights": {
+      "expected_return": 0.4,
+      "confidence": 0.25,
+      "cost": -0.1,
+      "volatility": -0.1,
+      "recent_performance": 0.15
+    }
+  },
+  "risk": {
+    "starting_cash": 30000000.0,
+    "max_open_positions": 8,
+    "max_daily_new_entries": 4,
+    "symbol_max_weight": 0.18,
+    "asset_type_max_weight": {
+      "코인": 0.35,
+      "미국주식": 0.45,
+      "한국주식": 0.45
+    },
+    "per_trade_risk_budget_pct": 0.012,
+    "total_risk_budget_pct": 0.1,
+    "daily_loss_limit_pct": 0.03,
+    "max_drawdown_limit_pct": 0.15,
+    "max_same_direction_correlation": 0.82,
+    "correlation_window_bars": 60,
+    "cooldown_bars_after_exit": 2
+  },
+  "broker": {
+    "fee_bps": 5.0,
+    "base_slippage_bps": 3.0,
+    "volatility_slippage_mult": 0.25,
+    "max_volume_participation": 0.05,
+    "allow_partial_fills": true,
+    "default_order_type": "market",
+    "kis_config_path": "kis_devlp.yaml",
+    "asset_broker_mode": {
+      "코인": "sim",
+      "미국주식": "sim",
+      "한국주식": "kis_paper"
+    },
+    "broker_short_support": {
+      "sim": true,
+      "kis_paper": false
+    }
+  },
+  "retraining": {
+    "cadence": "weekly",
+    "benchmark_symbols": [
+      "BTC-USD",
+      "AAPL",
+      "005930.KS"
+    ],
+    "promotion_min_directional_accuracy_pct": 52.0,
+    "promotion_max_mae_pct": 5.0,
+    "promotion_min_trade_return_pct": 0.0,
+    "promotion_max_drawdown_pct": 15.0
+  },
+  "asset_schedules": {
+    "코인": {
+      "asset_type": "코인",
+      "timeframe": "1h",
+      "scan_interval_minutes": 60,
+      "entry_interval_minutes": 60,
+      "exit_interval_minutes": 15,
+      "outcome_interval_minutes": 60,
+      "session_mode": "always",
+      "timezone": "UTC",
+      "market_open": "00:00",
+      "market_close": "23:59",
+      "holiday_country": "",
+      "lookback_bars": 720,
+      "forecast_horizon_bars": 1,
+      "pre_close_buffer_minutes": 15,
+      "min_history_bars": 400
+    },
+    "미국주식": {
+      "asset_type": "미국주식",
+      "timeframe": "1d",
+      "scan_interval_minutes": 60,
+      "entry_interval_minutes": 15,
+      "exit_interval_minutes": 15,
+      "outcome_interval_minutes": 60,
+      "session_mode": "market_hours",
+      "timezone": "America/New_York",
+      "market_open": "09:30",
+      "market_close": "16:00",
+      "holiday_country": "US",
+      "lookback_bars": 520,
+      "forecast_horizon_bars": 1,
+      "pre_close_buffer_minutes": 20,
+      "min_history_bars": 320
+    },
+    "한국주식": {
+      "asset_type": "한국주식",
+      "timeframe": "1d",
+      "scan_interval_minutes": 60,
+      "entry_interval_minutes": 15,
+      "exit_interval_minutes": 15,
+      "outcome_interval_minutes": 60,
+      "session_mode": "market_hours",
+      "timezone": "Asia/Seoul",
+      "market_open": "09:00",
+      "market_close": "15:30",
+      "holiday_country": "KR",
+      "lookback_bars": 520,
+      "forecast_horizon_bars": 1,
+      "pre_close_buffer_minutes": 20,
+      "min_history_bars": 320
+    }
+  },
+  "universes": {
+    "코인": {
+      "watchlist": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD",
+        "XRP-USD"
+      ],
+      "top_universe": [
+        "BTC-USD",
+        "ETH-USD",
+        "SOL-USD",
+        "BNB-USD",
+        "DOGE-USD"
+      ]
+    },
+    "미국주식": {
+      "watchlist": [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "AMZN"
+      ],
+      "top_universe": [
+        "AAPL",
+        "MSFT",
+        "NVDA",
+        "AMZN",
+        "GOOGL",
+        "META",
+        "AMD",
+        "AVGO"
+      ]
+    },
+    "한국주식": {
+      "watchlist": [
+        "005930.KS",
+        "000660.KS",
+        "035420.KS",
+        "005380.KS"
+      ],
+      "top_universe": [
+        "005930.KS",
+        "000660.KS",
+        "035420.KS",
+        "005380.KS",
+        "068270.KS",
+        "247540.KS",
+        "373220.KS"
+      ]
+    }
   }
 }

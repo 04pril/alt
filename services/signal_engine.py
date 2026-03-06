@@ -157,7 +157,7 @@ class SignalEngine:
             embargo_days=strategy.embargo_bars,
             target_mode=strategy.target_mode,
             validation_days=strategy.validation_bars,
-            allow_short=strategy.allow_short,
+            allow_short=self.settings.short_allowed_for(asset_type),
             trade_mode=strategy.trade_mode,
             target_daily_vol_pct=strategy.target_daily_vol_pct,
             max_position_size=strategy.max_position_size,
