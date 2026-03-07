@@ -53,9 +53,7 @@ class PaperBroker:
         order_id = make_id("ord")
         side = "buy" if signal.signal == "LONG" else "sell"
         timeframe_delta = timedelta(hours=1) if signal.timeframe == "1h" else timedelta(days=1)
-        max_holding_until = (
-            pd.Timestamp.utcnow().tz_localize("UTC") + timeframe_delta * int(self.settings.strategy.max_holding_bars)
-        ).isoformat()
+        max_holding_until = (pd.Timestamp.now(tz="UTC") + timeframe_delta * int(self.settings.strategy.max_holding_bars)).isoformat()
         record = OrderRecord(
             order_id=order_id,
             created_at=now_iso,

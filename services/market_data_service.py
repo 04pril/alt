@@ -55,36 +55,66 @@ class MarketDataService:
             return False
         return when.date() in self._country_holidays(schedule.holiday_country, when.year)
 
+    def _market_now(self, asset_type: str, when: datetime | None = None) -> datetime:
+        """Return current time in the market's source timezone for hours comparison."""
+        schedule = self.schedule(asset_type)
+        current = when or self.now(asset_type)
+        if schedule.market_source_timezone:
+            return current.astimezone(ZoneInfo(schedule.market_source_timezone))
+        return current
+
+    def _session_date(self, market_now: datetime, schedule: AssetScheduleConfig) -> datetime:
+        """For cross-midnight sessions, the after-midnight portion belongs to the previous day's session.
+        e.g. Saturday 02:00 KST is part of Friday's 10:00~06:00 session."""
+        t_open = time.fromisoformat(schedule.market_open)
+        t_close = time.fromisoformat(schedule.market_close)
+        if t_open > t_close and market_now.time() <= t_close:
+            return market_now - timedelta(days=1)
+        return market_now
+
     def is_market_open(self, asset_type: str, when: datetime | None = None) -> bool:
         schedule = self.schedule(asset_type)
         if schedule.session_mode == "always":
             return True
-        current = when or self.now(asset_type)
-        if current.weekday() >= 5 or self.is_holiday(asset_type, current):
+        market_now = self._market_now(asset_type, when)
+        t_open = time.fromisoformat(schedule.market_open)
+        t_close = time.fromisoformat(schedule.market_close)
+        t_now = market_now.time()
+        # For cross-midnight sessions, check weekday/holiday of the session start date
+        check_date = self._session_date(market_now, schedule)
+        if check_date.weekday() >= 5 or self.is_holiday(asset_type, check_date):
             return False
-        start = datetime.combine(current.date(), time.fromisoformat(schedule.market_open), current.tzinfo)
-        end = datetime.combine(current.date(), time.fromisoformat(schedule.market_close), current.tzinfo)
-        return start <= current <= end
+        if t_open <= t_close:
+            return t_open <= t_now <= t_close
+        # cross-midnight session (e.g. 10:00 ~ 06:00)
+        return t_now >= t_open or t_now <= t_close
 
     def is_pre_close_window(self, asset_type: str, when: datetime | None = None) -> bool:
         schedule = self.schedule(asset_type)
-        current = when or self.now(asset_type)
-        if not self.is_market_open(asset_type, current):
+        market_now = self._market_now(asset_type, when)
+        if not self.is_market_open(asset_type, when):
             return False
-        close_dt = datetime.combine(current.date(), time.fromisoformat(schedule.market_close), current.tzinfo)
+        t_close = time.fromisoformat(schedule.market_close)
+        close_dt = datetime.combine(market_now.date(), t_close, market_now.tzinfo)
+        # cross-midnight: if current time is past midnight (before close), close is today
+        # if current time is before midnight (after open), close is tomorrow
+        t_open = time.fromisoformat(schedule.market_open)
+        if t_open > t_close and market_now.time() >= t_open:
+            close_dt += timedelta(days=1)
         window_start = close_dt - timedelta(minutes=int(schedule.pre_close_buffer_minutes))
-        return window_start <= current <= close_dt
+        return window_start <= market_now <= close_dt
 
     def market_phase(self, asset_type: str, when: datetime | None = None) -> str:
         schedule = self.schedule(asset_type)
-        current = when or self.now(asset_type)
         if schedule.session_mode == "always":
             return "always_open"
-        if current.weekday() >= 5 or self.is_holiday(asset_type, current):
+        market_now = self._market_now(asset_type, when)
+        check_date = self._session_date(market_now, schedule)
+        if check_date.weekday() >= 5 or self.is_holiday(asset_type, check_date):
             return "holiday"
-        if not self.is_market_open(asset_type, current):
+        if not self.is_market_open(asset_type, when):
             return "closed"
-        if self.is_pre_close_window(asset_type, current):
+        if self.is_pre_close_window(asset_type, when):
             return "pre_close"
         return "open"
 

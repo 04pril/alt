@@ -221,11 +221,7 @@ def _summary_value(summary_df: pd.DataFrame, key: str, default: float | str = ""
 
 
 def _market_timezone(asset_type: str) -> str:
-    if asset_type == "한국주식":
-        return "Asia/Seoul"
-    if asset_type == "미국주식":
-        return "America/New_York"
-    return "UTC"
+    return "Asia/Seoul"
 
 
 def _cutoff_timestamp(asset_type: str, cutoff_date: pd.Timestamp) -> str:
@@ -556,7 +552,7 @@ def load_prediction_log(symbol: str | None = None, status: str | None = None, li
         return frame
     for col in ["generated_at", "data_cutoff_at", "target_date", "resolved_at", "evaluated_at"]:
         if col in frame.columns:
-            frame[col] = pd.to_datetime(frame[col], errors="coerce")
+            frame[col] = pd.to_datetime(frame[col], errors="coerce", utc=True)
     numeric_cols = [
         "forecast_horizon",
         "current_price",
@@ -780,7 +776,7 @@ def load_order_log(limit: int = 200) -> pd.DataFrame:
     if "order_no" not in frame.columns and "broker_order_no" in frame.columns:
         frame["order_no"] = frame["broker_order_no"]
     if "requested_at" in frame.columns:
-        frame["requested_at"] = pd.to_datetime(frame["requested_at"], errors="coerce")
+        frame["requested_at"] = pd.to_datetime(frame["requested_at"], errors="coerce", utc=True)
     return frame
 
 
@@ -797,7 +793,7 @@ def load_model_registry() -> pd.DataFrame:
         )
     if frame.empty:
         return frame
-    frame["created_at"] = pd.to_datetime(frame["created_at"], errors="coerce")
+    frame["created_at"] = pd.to_datetime(frame["created_at"], errors="coerce", utc=True)
     frame["is_champion"] = pd.to_numeric(frame["is_champion"], errors="coerce").fillna(0).astype(int)
     return frame
 
@@ -859,7 +855,7 @@ def load_equity_curve(limit: int | None = None) -> pd.DataFrame:
         frame = pd.read_sql_query(query, conn)
     if frame.empty:
         return frame
-    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True)
     for col in ("cash", "stock_eval", "total_eval", "pnl", "return_pct"):
         frame[col] = pd.to_numeric(frame[col], errors="coerce")
     return frame.dropna(subset=["timestamp"]).reset_index(drop=True)

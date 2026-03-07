@@ -31,6 +31,7 @@ class AssetScheduleConfig:
     forecast_horizon_bars: int
     pre_close_buffer_minutes: int = 15
     min_history_bars: int = 320
+    market_source_timezone: str = ""
 
 
 @dataclass
@@ -142,7 +143,7 @@ class RuntimeSettings:
                 exit_interval_minutes=15,
                 outcome_interval_minutes=60,
                 session_mode="always",
-                timezone="UTC",
+                timezone="Asia/Seoul",
                 market_open="00:00",
                 market_close="23:59",
                 holiday_country="",
@@ -150,7 +151,7 @@ class RuntimeSettings:
                 forecast_horizon_bars=1,
                 min_history_bars=400,
             ),
-            # Assumption: US equities generate signals in the pre-close window and fill with a paper MOC price proxy.
+            # KIS 미국주식 모의매매: 주간거래 10:00 ~ 정규장 마감 06:00 KST (cross-midnight)
             "미국주식": AssetScheduleConfig(
                 asset_type="미국주식",
                 timeframe="1d",
@@ -159,9 +160,9 @@ class RuntimeSettings:
                 exit_interval_minutes=15,
                 outcome_interval_minutes=60,
                 session_mode="market_hours",
-                timezone="America/New_York",
-                market_open="09:30",
-                market_close="16:00",
+                timezone="Asia/Seoul",
+                market_open="10:00",
+                market_close="06:00",
                 holiday_country="US",
                 lookback_bars=520,
                 forecast_horizon_bars=1,

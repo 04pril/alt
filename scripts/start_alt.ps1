@@ -126,3 +126,33 @@ Write-Host "Alt app/worker restart completed."
 Write-Host "App PID: $($appProc.Id)"
 Write-Host "Worker PID: $($workerProc.Id)"
 Write-Host "Logs: $logDir"
+Write-Host ""
+Write-Host "========== Live Logs (Ctrl+C to stop) =========="
+Write-Host ""
+
+$logFiles = @(
+    (Join-Path $logDir "worker.stdout.log"),
+    (Join-Path $logDir "worker.stderr.log"),
+    (Join-Path $logDir "app.stdout.log"),
+    (Join-Path $logDir "app.stderr.log")
+)
+
+# 로그 파일이 아직 없으면 생성
+foreach ($f in $logFiles) {
+    if (!(Test-Path $f)) { New-Item $f -ItemType File -Force | Out-Null }
+}
+
+# 각 파일을 별도 Job으로 tail
+$tailJobs = $logFiles | ForEach-Object {
+    $path = $_
+    Start-Job -ScriptBlock { Get-Content -Path $using:path -Tail 0 -Wait }
+}
+
+try {
+    while ($true) {
+        $tailJobs | Receive-Job
+        Start-Sleep -Milliseconds 300
+    }
+} finally {
+    $tailJobs | Stop-Job -PassThru | Remove-Job -Force
+}

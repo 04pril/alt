@@ -111,7 +111,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
     for asset_type in asset_list:
         schedule = context.settings.asset_schedules[asset_type]
         market_is_open = context.market_data_service.is_market_open(asset_type)
-        if schedule.timeframe == "1d" and not context.market_data_service.is_pre_close_window(asset_type):
+        if schedule.timeframe == "1d" and not market_is_open:
             entered[asset_type] = 0
             continue
         latest = context.repository.latest_candidates(asset_type=asset_type, timeframe=schedule.timeframe, limit=100)

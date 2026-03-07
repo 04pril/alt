@@ -188,6 +188,7 @@ def to_trade_view(metric_df: pd.DataFrame) -> pd.DataFrame:
     view = metric_df.copy()
     view["지표"] = view["metric"].map(TRADE_METRIC_LABELS).fillna(view["metric"])
     view = view[["지표", "value"]].rename(columns={"value": "값"})
+    view["값"] = pd.to_numeric(view["값"], errors="coerce")
     return view
 
 
@@ -206,6 +207,7 @@ def to_validation_view(summary_df: pd.DataFrame) -> pd.DataFrame:
     view = summary_df.copy()
     view["항목"] = view["item"].map(VALIDATION_ITEM_LABELS).fillna(view["item"])
     view = view[["항목", "value"]].rename(columns={"value": "값"})
+    view["값"] = view["값"].astype(str)
     return view
 
 
@@ -219,6 +221,26 @@ def quiet_external_call(fn):
                 return fn()
         finally:
             logging.disable(previous_disable)
+
+
+def read_html_tables(html_text: str) -> List[pd.DataFrame]:
+    last_error: Exception | None = None
+    for flavor in (None, ["bs4"], ["html5lib"]):
+        try:
+            if flavor is None:
+                tables = quiet_external_call(lambda: pd.read_html(io.StringIO(html_text)))
+            else:
+                tables = quiet_external_call(
+                    lambda flavor=flavor: pd.read_html(io.StringIO(html_text), flavor=flavor)
+                )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if tables:
+            return tables
+    if last_error is not None:
+        raise last_error
+    return []
 
 
 def normalize_kr_name_key(text: str) -> str:
@@ -238,7 +260,7 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
         )
         response.raise_for_status()
         response.encoding = "euc-kr"
-        tables = quiet_external_call(lambda: pd.read_html(io.StringIO(response.text)))
+        tables = read_html_tables(response.text)
     except Exception:
         return {}
     if not tables:
@@ -411,7 +433,7 @@ def build_single_top100_entries(scope: str) -> List[Dict[str, str | int | None]]
     return output
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def resolve_single_top100_entries(scope: str, display_limit: int) -> Tuple[List[Dict[str, str | int | None]], List[str]]:
     entries = build_single_top100_entries(scope=scope)[: max(display_limit, 0)]
     resolved_map: Dict[Tuple[str, str], str] = {}

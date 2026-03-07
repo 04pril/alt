@@ -93,7 +93,7 @@ class SignalEngine:
                     symbol=result.symbol,
                     asset_type=asset_type,
                     timeframe=timeframe,
-                    market_timezone="UTC" if asset_type == "코인" else ("America/New_York" if asset_type == "미국주식" else "Asia/Seoul"),
+                    market_timezone="Asia/Seoul",
                     data_cutoff_at=pd.Timestamp(getattr(result, "data_cutoff_at")).isoformat(),
                     target_at=pd.Timestamp(target_at).isoformat(),
                     forecast_horizon_bars=horizon,

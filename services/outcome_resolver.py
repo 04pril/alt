@@ -18,7 +18,7 @@ class OutcomeResolver:
         if unresolved.empty:
             return 0
         resolved_count = 0
-        now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+        now_utc = pd.Timestamp.now(tz="UTC")
         for _, row in unresolved.iterrows():
             target_at = pd.Timestamp(row["target_at"])
             if target_at.tzinfo is None:
@@ -35,12 +35,14 @@ class OutcomeResolver:
             except Exception:
                 continue
             index = pd.to_datetime(bars.index)
+            if index.tz is not None:
+                index = index.tz_convert("UTC").tz_localize(None)
             if str(row["timeframe"]) == "1d":
                 target_key = target_at.tz_convert("UTC").tz_localize(None).normalize()
-                close_map = pd.Series(bars["Close"].astype(float).values, index=index.tz_localize(None).normalize())
+                close_map = pd.Series(bars["Close"].astype(float).values, index=index.normalize())
             else:
                 target_key = target_at.tz_convert("UTC").tz_localize(None).floor(str(row["timeframe"]))
-                close_map = pd.Series(bars["Close"].astype(float).values, index=index.tz_localize(None))
+                close_map = pd.Series(bars["Close"].astype(float).values, index=index)
             actual_price = close_map.get(target_key)
             if pd.isna(actual_price):
                 continue

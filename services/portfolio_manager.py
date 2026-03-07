@@ -104,7 +104,7 @@ class PortfolioManager:
                     max_holding_until = max_holding_until.tz_localize("UTC")
                 else:
                     max_holding_until = max_holding_until.tz_convert("UTC")
-                if pd.Timestamp.utcnow().tz_localize("UTC") >= max_holding_until:
+                if pd.Timestamp.now(tz="UTC") >= max_holding_until:
                     reason = "time_stop"
 
             if not reason and not latest_candidates.empty:
