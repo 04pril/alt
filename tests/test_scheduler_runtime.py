@@ -77,6 +77,50 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(int(row["retry_count"]), 1)
 
+    def test_broker_sync_job_uses_retry_backoff(self) -> None:
+        attempts = {"job": 0}
+
+        def flaky_sync():
+            attempts["job"] += 1
+            if attempts["job"] == 1:
+                raise RuntimeError("broker sync failed")
+            return {"fills": 0}
+
+        first = _run_guarded(self.context, "broker_order_sync", "2026-03-08T12:00", flaky_sync)
+        self.assertIsNone(first)
+        blocked = _run_guarded(self.context, "broker_order_sync", "2026-03-08T12:00", flaky_sync)
+        self.assertIsNone(blocked)
+        self.assertEqual(attempts["job"], 1)
+
+        time.sleep(1.1)
+        second = _run_guarded(self.context, "broker_order_sync", "2026-03-08T12:00", flaky_sync)
+        self.assertEqual(second, {"fills": 0})
+        row = self.repo.get_job_run_by_key("broker_order_sync", "2026-03-08T12:00")
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(int(row["retry_count"]), 1)
+
+    def test_long_running_job_can_refresh_lease_and_worker_heartbeat(self) -> None:
+        observed: dict[str, str] = {}
+
+        def long_job():
+            self.context.job_touch("phase_1", {"step": 1})
+            first_row = self.repo.get_job_run_by_key("scan:crypto", "2026-03-08T13:00")
+            observed["lease_1"] = str(first_row["lease_expires_at"])
+            observed["heartbeat_1"] = self.repo.get_control_flag("worker_heartbeat_at", "")
+            time.sleep(0.05)
+            self.context.job_touch("phase_2", {"step": 2})
+            second_row = self.repo.get_job_run_by_key("scan:crypto", "2026-03-08T13:00")
+            observed["lease_2"] = str(second_row["lease_expires_at"])
+            observed["heartbeat_2"] = self.repo.get_control_flag("worker_heartbeat_at", "")
+            return {"ok": True}
+
+        result = _run_guarded(self.context, "scan:crypto", "2026-03-08T13:00", long_job)
+        self.assertEqual(result, {"ok": True})
+        self.assertNotEqual(observed["heartbeat_1"], "")
+        self.assertNotEqual(observed["heartbeat_2"], "")
+        self.assertNotEqual(observed["lease_1"], observed["lease_2"])
+        self.assertNotEqual(observed["heartbeat_1"], observed["heartbeat_2"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -349,7 +349,8 @@ class PaperBroker:
         self.snapshot_account(cash_override=cash_value)
         return True
 
-    def process_open_orders(self, market_data_service: MarketDataService) -> int:
+    def process_open_orders(self, market_data_service: MarketDataService, touch=None) -> int:
+        touch = touch or (lambda *args, **kwargs: None)
         orders = self.repository.open_orders(statuses=("new", "partially_filled"))
         if not orders.empty and "raw_json" in orders.columns:
             broker_name = orders["raw_json"].fillna("{}").astype(str).map(
@@ -361,6 +362,7 @@ class PaperBroker:
         account = self._latest_account()
         cash_value = float(account.get("cash", self.settings.risk.starting_cash))
         for _, order in orders.iterrows():
+            touch("sim_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"])})
             asset_type = str(order["asset_type"])
             if not market_data_service.is_market_open(asset_type):
                 continue

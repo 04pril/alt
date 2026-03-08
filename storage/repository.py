@@ -787,6 +787,19 @@ class TradingRepository:
                 params=list(statuses),
             )
 
+    def recent_orders(self, limit: int = 200) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT rowid, *
+                FROM orders
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                conn,
+                params=[int(limit)],
+            )
+
     def active_entry_orders(
         self,
         *,

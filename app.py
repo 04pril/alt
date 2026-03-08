@@ -21,18 +21,9 @@ import streamlit.config as st_config
 import yfinance as yf
 
 from config.settings import load_settings
-from kis_paper import (
-    KISPaperClient,
-    KISPaperError,
-    append_equity_snapshot,
-    append_order_log,
-    compute_equity_metrics,
-    load_equity_curve,
-    load_order_log,
-)
+from kis_paper import KISPaperError
 from monitoring.dashboard_hooks import load_dashboard_data
-from prediction_store import (
-    attach_order_to_prediction,
+from prediction_memory import (
     filter_prediction_history,
     load_prediction_log,
     load_model_registry,
@@ -42,6 +33,15 @@ from prediction_store import (
     summarize_prediction_accuracy,
 )
 from predictor import extract_korean_stock_code, is_korean_stock_symbol, normalize_symbol, run_forecast
+from services.manual_kis_service import (
+    compute_manual_equity_metrics,
+    load_kis_account_snapshot,
+    load_kis_config,
+    load_kis_quote,
+    load_manual_equity_curve,
+    load_manual_order_history,
+    submit_manual_kis_order,
+)
 from storage.repository import TradingRepository
 from top100_universe import (
     KR_NAME_ALIASES,
@@ -489,7 +489,7 @@ def _build_kr_snapshot(symbol: str, item: Dict[str, object]) -> Dict[str, float 
 
 def fetch_single_kr_quote_snapshot(symbol: str) -> Dict[str, float | str]:
     try:
-        kis_quote = KISPaperClient().get_quote(symbol_or_code=symbol)
+        kis_quote = load_kis_quote(symbol)
         current_price = first_valid_float(kis_quote.get("current_price"))
         previous_close = first_valid_float(kis_quote.get("previous_close"))
         change_pct = first_valid_float(kis_quote.get("change_pct"))
@@ -1001,6 +1001,34 @@ Start-Process -FilePath $python -ArgumentList '-m','jobs.scheduler' -WorkingDire
     return False, "worker 재시작 버튼은 현재 Windows 환경에서만 지원합니다."
 
 
+def run_manual_runtime_job(job_name: str) -> Tuple[bool, str]:
+    from jobs.scheduler import _run_guarded
+    from jobs.tasks import (
+        broker_account_sync_job,
+        broker_order_sync_job,
+        broker_position_sync_job,
+        build_task_context,
+    )
+
+    runners = {
+        "broker_account_sync": broker_account_sync_job,
+        "broker_order_sync": broker_order_sync_job,
+        "broker_position_sync": broker_position_sync_job,
+    }
+    runner = runners.get(job_name)
+    if runner is None:
+        return False, f"지원하지 않는 job입니다: {job_name}"
+    try:
+        context = build_task_context()
+        run_key = f"manual:{pd.Timestamp.now(tz='UTC').isoformat()}"
+        result = _run_guarded(context, job_name, run_key, lambda: runner(context))
+    except Exception as exc:
+        return False, str(exc)
+    if result is None:
+        return False, f"{job_name} 실행을 시작하지 못했습니다."
+    return True, f"{job_name} 실행 완료"
+
+
 
 
 def render_global_footer() -> None:
@@ -1404,18 +1432,38 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
 
     st.subheader("운영 모니터링")
     st.caption("background worker가 저장한 예측/포지션/잡 상태를 읽기 전용으로 표시합니다.")
-    control_cols = st.columns([1.0, 1.0, 3.0])
+    control_cols = st.columns([1.0, 1.0, 1.1, 1.1, 1.1, 2.6])
     if control_cols[0].button("신규 진입 중단", key="ops_pause"):
         repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
         st.rerun()
     if control_cols[1].button("신규 진입 재개", key="ops_resume"):
         repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
         st.rerun()
+    if control_cols[2].button("계좌 Sync", key="ops_broker_account_sync"):
+        ok, message = run_manual_runtime_job("broker_account_sync")
+        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+        st.rerun()
+    if control_cols[3].button("주문 Sync", key="ops_broker_order_sync"):
+        ok, message = run_manual_runtime_job("broker_order_sync")
+        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+        st.rerun()
+    if control_cols[4].button("포지션 Sync", key="ops_broker_position_sync"):
+        ok, message = run_manual_runtime_job("broker_position_sync")
+        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+        st.rerun()
 
     data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
     trade_performance = data["trade_performance"]
     auto_trading_status = data.get("auto_trading_status", {})
+    broker_sync_status = data.get("broker_sync_status", {})
+    broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
+    feedback = st.session_state.pop("broker_sync_feedback", None)
+    if isinstance(feedback, dict) and feedback.get("message"):
+        if feedback.get("ok"):
+            st.success(str(feedback["message"]))
+        else:
+            st.error(str(feedback["message"]))
     metrics = st.columns(6)
     metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
     metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
@@ -1427,6 +1475,21 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
         f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
     )
+    if broker_sync_status:
+        sync_rows = pd.DataFrame(
+            [
+                {
+                    "job": key,
+                    "status": row.get("status", "never"),
+                    "finished_at": row.get("finished_at", pd.NaT),
+                    "retry_count": row.get("retry_count", 0),
+                    "error_message": row.get("error_message", ""),
+                }
+                for key, row in broker_sync_status.items()
+            ]
+        )
+        if not sync_rows.empty:
+            st.dataframe(format_frame_timestamps_for_display(sync_rows), width="stretch", hide_index=True)
 
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
@@ -1451,8 +1514,8 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
         st.plotly_chart(fig, width="stretch")
 
-    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_assets, tab_errors = st.tabs(
-        ["Job Health", "Open Positions", "Predictions", "Candidates", "Assets", "Recent Errors"]
+    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_assets, tab_errors, tab_broker = st.tabs(
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Assets", "Recent Errors", "Broker Sync"]
     )
     with tab_jobs:
         if job_health.empty:
@@ -1489,6 +1552,11 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
             st.caption("최근 ERROR 이벤트가 없습니다.")
         else:
             st.dataframe(format_frame_timestamps_for_display(recent_errors), width="stretch", hide_index=True)
+    with tab_broker:
+        if broker_sync_errors.empty:
+            st.caption("최근 broker sync 오류가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(broker_sync_errors), width="stretch", hide_index=True)
 
 
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
@@ -1990,16 +2058,13 @@ def build_paper_symbol_catalog() -> Tuple[List[Dict[str, str]], List[str]]:
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_paper_account_snapshot(refresh_token: int) -> Tuple[Dict[str, Any], pd.DataFrame]:
     _ = refresh_token
-    client = KISPaperClient()
-    snapshot = client.get_account_snapshot()
-    return dict(snapshot.summary), snapshot.holdings.copy()
+    return load_kis_account_snapshot()
 
 
 @st.cache_data(ttl=15, show_spinner=False)
 def fetch_paper_quote_snapshot(symbol: str, refresh_token: int) -> Dict[str, Any]:
     _ = refresh_token
-    client = KISPaperClient()
-    return client.get_quote(symbol)
+    return load_kis_quote(symbol)
 
 
 def build_paper_trade_plan(
@@ -2017,7 +2082,7 @@ def build_paper_trade_plan(
     if not holdings.empty and "symbol_code" in holdings.columns:
         matched = holdings.loc[holdings["symbol_code"].astype(str) == str(symbol_code)]
         if not matched.empty:
-            holding_qty = int(first_valid_float(matched.iloc[0].get("보유수량"), default=0.0))
+            holding_qty = int(first_valid_float(matched.iloc[0].get("quantity"), matched.iloc[0].get("보유수량"), default=0.0))
 
     empty_plan = {
         "side": "hold",
@@ -2093,7 +2158,7 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
     st.caption("한국투자증권 모의계좌(KIS REST)로 국내주식 모의 주문을 넣고, 계좌 성과를 추적합니다.")
 
     try:
-        kis_config = KISPaperClient().config
+        kis_config = load_kis_config()
     except KISPaperError as exc:
         st.error(f"KIS 모의매매 설정 오류: {exc}")
         return
@@ -2162,7 +2227,6 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
         account_summary, account_holdings = fetch_paper_account_snapshot(
             refresh_token=int(st.session_state.get("paper_account_refresh_token", 0))
         )
-        append_equity_snapshot(account_summary, account_holdings)
         quote_snapshot = fetch_paper_quote_snapshot(
             symbol=paper_symbol,
             refresh_token=int(st.session_state.get("paper_quote_refresh_token", 0)),
@@ -2300,40 +2364,29 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
         ):
             try:
                 prediction_id = prediction_id_for_run(linked_prediction_run_id, forecast_horizon=1) if linked_prediction_run_id else None
-                client = KISPaperClient()
-                order_result = client.place_cash_order(
-                    symbol_or_code=paper_symbol,
+                order_result = submit_manual_kis_order(
+                    symbol=paper_symbol,
                     side=side,
                     quantity=order_qty,
                     order_type=order_type,
-                    price=limit_price,
-                )
-                append_order_log(
-                    {
-                        "prediction_id": prediction_id,
-                        "requested_at": order_result["requested_at"],
-                        "symbol": paper_symbol,
-                        "symbol_code": order_result["symbol_code"],
+                    requested_price=limit_price,
+                    prediction_id=prediction_id,
+                    metadata={
                         "name": paper_name,
-                        "side": side,
-                        "order_type": order_type,
-                        "quantity": order_qty,
-                        "requested_price": None if order_type == "market" else limit_price,
                         "quote_price": current_price,
                         "predicted_move_pct": plan["predicted_move_pct"],
                         "entry_estimate": plan["entry_estimate"],
                         "stop_level": plan["stop_level"],
                         "take_level": plan["take_level"],
-                        "order_no": order_result["order_no"],
-                        "message": order_result["message"],
-                    }
+                    },
                 )
-                if prediction_id and order_result.get("order_no"):
-                    attach_order_to_prediction(prediction_id=prediction_id, order_id=str(order_result["order_no"]))
             except Exception as exc:
                 st.error(f"모의 주문 실패: {exc}")
             else:
-                st.success(f"주문 접수 완료: {order_result['message'] or '모의투자 주문이 전송되었습니다.'}")
+                st.success(
+                    f"주문 접수 완료: {order_result.get('status') or 'submitted'}"
+                    + (f" / broker={order_result.get('broker_order_id')}" if order_result.get("broker_order_id") else "")
+                )
                 st.session_state["paper_account_refresh_token"] += 1
                 st.session_state["paper_quote_refresh_token"] += 1
                 st.rerun()
@@ -2344,9 +2397,9 @@ def render_paper_trading_page(analysis_inputs: Dict[str, Any], is_mobile_ui: boo
     else:
         st.dataframe(account_holdings, width="stretch", hide_index=True)
 
-    equity_curve = load_equity_curve()
-    equity_metrics = compute_equity_metrics(equity_curve)
-    order_log = load_order_log(limit=200)
+    equity_curve = load_manual_equity_curve()
+    equity_metrics = compute_manual_equity_metrics()
+    order_log = load_manual_order_history(limit=200)
 
     perf_cols = st.columns(4)
     perf_cols[0].metric("에쿼티 샘플", f"{int(equity_metrics['samples'])}")

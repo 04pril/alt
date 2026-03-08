@@ -113,6 +113,9 @@ class SchedulerSettings:
     job_lease_seconds: int = 180
     exit_management_interval_minutes: int = 15
     outcome_resolution_interval_minutes: int = 60
+    broker_account_sync_interval_minutes: int = 15
+    broker_order_sync_interval_minutes: int = 5
+    broker_position_sync_interval_minutes: int = 5
     lock_owner: str = "paper-worker"
 
 

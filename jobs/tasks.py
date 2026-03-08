@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Dict, Iterable
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterable
 
 import pandas as pd
 
@@ -34,6 +34,10 @@ class TaskContext:
     outcome_resolver: OutcomeResolver
     evaluator: Evaluator
     retrainer: Retrainer
+    job_touch: Callable[[str | None, Dict[str, Any] | None], None] = field(default=lambda *_args, **_kwargs: None, repr=False)
+
+    def touch_runtime(self, stage: str | None = None, details: Dict[str, Any] | None = None) -> None:
+        self.job_touch(stage, details or {})
 
 
 def build_task_context(settings_path: str | None = None) -> TaskContext:
@@ -103,7 +107,14 @@ def scan_job(context: TaskContext, asset_types: Iterable[str] | None = None) -> 
     asset_list = list(asset_types or context.settings.asset_schedules.keys())
     results: Dict[str, int] = {}
     for asset_type in asset_list:
-        rows = context.universe_scanner.scan_asset(asset_type)
+        context.touch_runtime("scan_asset", {"asset_type": asset_type})
+        rows = context.universe_scanner.scan_asset(
+            asset_type,
+            touch=lambda stage=None, details=None, asset_type=asset_type: context.touch_runtime(
+                stage or "scan_symbol",
+                {"asset_type": asset_type, **(details or {})},
+            ),
+        )
         results[asset_type] = len(rows)
         context.repository.log_event("INFO", "scan_job", "scan_complete", f"{asset_type} scanned", {"count": len(rows)})
     return results
@@ -113,6 +124,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
     asset_list = list(asset_types or context.settings.asset_schedules.keys())
     entered: Dict[str, int] = {}
     for asset_type in asset_list:
+        context.touch_runtime("entry_asset", {"asset_type": asset_type})
         schedule = context.settings.asset_schedules[asset_type]
         market_is_open = context.market_data_service.is_market_open(asset_type)
         if schedule.timeframe == "1d" and not context.market_data_service.is_pre_close_window(asset_type):
@@ -128,6 +140,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
         open_positions = context.repository.open_positions()
         corr_symbols = list(open_positions["symbol"].astype(str).tolist()) if not open_positions.empty else []
         for _, candidate in latest.iterrows():
+            context.touch_runtime("entry_candidate", {"asset_type": asset_type, "symbol": str(candidate["symbol"])})
             signal = _rebuild_signal(context, candidate)
             if signal is None:
                 continue
@@ -150,11 +163,36 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
 
 
 def exit_management_job(context: TaskContext) -> Dict[str, int]:
-    context.portfolio_manager.mark_to_market(context.market_data_service)
     exit_orders = context.portfolio_manager.evaluate_exit_orders(context.market_data_service)
-    fills = context.paper_broker.process_open_orders(context.market_data_service)
-    context.repository.log_event("INFO", "exit_job", "exit_cycle", "exit management cycle completed", {"exit_orders": exit_orders, "fills": fills})
-    return {"exit_orders": exit_orders, "fills": fills}
+    context.repository.log_event("INFO", "exit_job", "exit_cycle", "exit management cycle completed", {"exit_orders": exit_orders})
+    return {"exit_orders": exit_orders}
+
+
+def broker_position_sync_job(context: TaskContext) -> Dict[str, int]:
+    context.portfolio_manager.mark_to_market(
+        context.market_data_service,
+        touch=lambda stage=None, details=None: context.touch_runtime(stage or "broker_position_sync", details),
+    )
+    open_positions = context.repository.open_positions()
+    metrics = {"open_positions": int(len(open_positions))}
+    context.repository.log_event("INFO", "broker_sync", "broker_position_sync", "broker position sync completed", metrics)
+    return metrics
+
+
+def broker_order_sync_job(context: TaskContext) -> Dict[str, int]:
+    result = context.paper_broker.sync_orders(
+        context.market_data_service,
+        touch=lambda stage=None, details=None: context.touch_runtime(stage or "broker_order_sync", details),
+    )
+    context.repository.log_event("INFO", "broker_sync", "broker_order_sync", "broker order sync completed", result)
+    return result
+
+
+def broker_account_sync_job(context: TaskContext) -> Dict[str, Any]:
+    context.touch_runtime("broker_account_sync", {})
+    result = context.paper_broker.sync_account()
+    context.repository.log_event("INFO", "broker_sync", "broker_account_sync", "broker account sync completed", result)
+    return result
 
 
 def outcome_resolution_job(context: TaskContext) -> Dict[str, int]:

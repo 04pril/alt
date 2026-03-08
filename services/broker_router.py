@@ -36,8 +36,54 @@ class BrokerRouter:
             return self.kis_broker.submit_exit_order(position=position, reason=reason)
         return self.sim_broker.submit_exit_order(position=position, reason=reason)
 
-    def process_open_orders(self, market_data_service: Any) -> int:
-        filled = self.sim_broker.process_open_orders(market_data_service)
+    def submit_manual_kis_order(
+        self,
+        *,
+        symbol: str,
+        asset_type: str,
+        timeframe: str,
+        side: str,
+        quantity: int,
+        order_type: str,
+        requested_price: float,
+        prediction_id: str | None = None,
+        scan_id: str | None = None,
+        strategy_version: str = "manual_kis",
+        reason: str = "manual_entry",
+        raw_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        if self.kis_broker is None or not self._use_kis(symbol, asset_type):
+            raise RuntimeError("KIS mock broker is not enabled for this symbol")
+        return self.kis_broker.submit_manual_order(
+            symbol=symbol,
+            asset_type=asset_type,
+            timeframe=timeframe,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            requested_price=requested_price,
+            prediction_id=prediction_id,
+            scan_id=scan_id,
+            strategy_version=strategy_version,
+            reason=reason,
+            raw_metadata=raw_metadata,
+        )
+
+    def sync_account(self) -> dict[str, Any]:
+        self.sim_broker.snapshot_account()
+        payload: dict[str, Any] = {"sim_snapshot_written": 1}
         if self.kis_broker is not None and self.kis_broker.is_enabled():
-            filled += self.kis_broker.process_open_orders(market_data_service)
-        return filled
+            payload["kis"] = self.kis_broker.sync_account()
+        else:
+            payload["kis"] = {"broker": "kis_mock", "enabled": False}
+        return payload
+
+    def sync_orders(self, market_data_service: Any, touch=None) -> dict[str, int]:
+        touch = touch or (lambda *args, **kwargs: None)
+        filled = self.sim_broker.process_open_orders(market_data_service, touch=touch)
+        if self.kis_broker is not None and self.kis_broker.is_enabled():
+            filled += self.kis_broker.process_open_orders(market_data_service, touch=touch)
+        return {"fills": int(filled)}
+
+    def process_open_orders(self, market_data_service: Any, touch=None) -> int:
+        return int(self.sync_orders(market_data_service, touch=touch)["fills"])

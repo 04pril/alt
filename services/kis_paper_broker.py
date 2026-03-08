@@ -224,7 +224,91 @@ class KISPaperBroker:
         )
         return order_id
 
-    def process_open_orders(self, market_data_service) -> int:
+    def submit_manual_order(
+        self,
+        *,
+        symbol: str,
+        asset_type: str,
+        timeframe: str,
+        side: str,
+        quantity: int,
+        order_type: str,
+        requested_price: float,
+        prediction_id: str | None = None,
+        scan_id: str | None = None,
+        strategy_version: str = "manual_kis",
+        reason: str = "manual_entry",
+        raw_metadata: Dict[str, Any] | None = None,
+    ) -> str:
+        client = self._client()
+        symbol_code = extract_kis_code(symbol)
+        baseline = self._holding_baseline(client, symbol_code)
+        payload = {
+            "broker": "kis_mock",
+            "symbol_code": symbol_code,
+            "baseline_qty": baseline["quantity"],
+            "baseline_avg_price": baseline["avg_price"],
+            "last_seen_broker_qty": baseline["quantity"],
+            "last_seen_broker_avg_price": baseline["avg_price"],
+            "broker_state": "submitted",
+            **(raw_metadata or {}),
+        }
+        order_id = self._insert_submitted_order(
+            symbol=symbol,
+            asset_type=asset_type,
+            timeframe=timeframe,
+            prediction_id=prediction_id,
+            scan_id=scan_id,
+            side=side,
+            quantity=int(quantity),
+            requested_price=float(requested_price),
+            strategy_version=strategy_version,
+            reason=reason,
+            payload=payload,
+        )
+        try:
+            result = client.place_cash_order(
+                symbol_or_code=symbol,
+                side=side,
+                quantity=int(quantity),
+                order_type=order_type,
+                price=requested_price if order_type == "limit" else None,
+            )
+        except Exception as exc:
+            self.repository.update_order(
+                order_id,
+                status="rejected",
+                error_message=str(exc),
+                raw_json={"broker": "kis_mock", "broker_state": "rejected"},
+            )
+            return order_id
+        self.repository.update_order(
+            order_id,
+            status="acknowledged" if result.get("order_no") else "submitted",
+            broker_order_id=str(result.get("order_no") or ""),
+            raw_json={
+                "broker": "kis_mock",
+                "broker_state": "acknowledged" if result.get("order_no") else "submitted",
+                "broker_message": str(result.get("message") or ""),
+                "submitted_at": str(result.get("requested_at") or utc_now_iso()),
+            },
+        )
+        return order_id
+
+    def sync_account(self) -> Dict[str, Any]:
+        if not self.is_enabled():
+            return {"broker": "kis_mock", "enabled": False, "holding_count": 0}
+        snapshot = self._client().get_account_snapshot()
+        return {
+            "broker": "kis_mock",
+            "enabled": True,
+            "cash": float(snapshot.summary.get("cash", 0.0) or 0.0),
+            "total_eval": float(snapshot.summary.get("total_eval", 0.0) or 0.0),
+            "holding_count": int(snapshot.summary.get("holding_count", 0) or 0),
+        }
+
+    def process_open_orders(self, market_data_service, touch=None) -> int:
+        touch = touch or (lambda *args, **kwargs: None)
         if not self.is_enabled():
             return 0
         active = self.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled"))
@@ -243,6 +327,7 @@ class KISPaperBroker:
             holdings = pd.DataFrame(columns=["symbol_code", "quantity", "avg_price"])
         fills_applied = 0
         for _, order in active.iterrows():
+            touch("kis_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"])})
             payload = self._parse_payload(order.get("raw_json"))
             symbol_code = str(payload.get("symbol_code") or extract_kis_code(str(order["symbol"])))
             matched = holdings.loc[holdings["symbol_code"].astype(str) == symbol_code]

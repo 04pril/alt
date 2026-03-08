@@ -44,6 +44,43 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("recent_errors", data)
             self.assertIn("auto_trading_status", data)
             self.assertIn("asset_overview", data)
+            self.assertIn("broker_sync_status", data)
+            self.assertIn("broker_sync_errors", data)
+
+    def test_dashboard_reader_exposes_broker_sync_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            with repo.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO job_runs(
+                        job_run_id, job_name, run_key, scheduled_at, started_at, finished_at,
+                        status, retry_count, lock_owner, error_message, metrics_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "job_sync_1",
+                        "broker_order_sync",
+                        "2026-03-09T10:00",
+                        "2026-03-09T10:00:00Z",
+                        "2026-03-09T10:00:01Z",
+                        "2026-03-09T10:00:02Z",
+                        "completed",
+                        0,
+                        "worker",
+                        "",
+                        "{}",
+                    ),
+                )
+            repo.log_event("ERROR", "scheduler", "job_failed", "broker_order_sync failed", {"error": "sync boom"})
+
+            data = load_dashboard_data(settings)
+            self.assertIn("broker_order_sync", data["broker_sync_status"])
+            self.assertEqual(data["broker_sync_status"]["broker_order_sync"]["status"], "completed")
+            self.assertFalse(data["broker_sync_errors"].empty)
 
     def test_asset_overview_contains_all_asset_types(self) -> None:
         settings = RuntimeSettings()

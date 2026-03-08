@@ -17,9 +17,12 @@ class PortfolioManager:
         self.repository = repository
         self.broker = broker
 
-    def mark_to_market(self, market_data_service: MarketDataService) -> None:
+    def mark_to_market(self, market_data_service: MarketDataService, touch=None) -> None:
+        touch = touch or (lambda *args, **kwargs: None)
         positions = self.repository.open_positions()
         for _, position in positions.iterrows():
+            base_position = {key: value for key, value in position.to_dict().items() if key != "rowid"}
+            touch("position_mark", {"symbol": str(position["symbol"]), "timeframe": str(position["timeframe"])})
             try:
                 quote = market_data_service.latest_quote(
                     symbol=str(position["symbol"]),
@@ -47,7 +50,7 @@ class PortfolioManager:
             self.repository.upsert_position(
                 PositionRecord(
                     **{
-                        **position.to_dict(),
+                        **base_position,
                         "updated_at": utc_now_iso(),
                         "mark_price": mark,
                         "highest_price": high,
