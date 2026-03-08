@@ -281,6 +281,91 @@ class RiskEngineTest(unittest.TestCase):
             self.assertEqual(state["equity"], 27_500_000.0)
             self.assertEqual(state["drawdown_pct"], -0.5)
 
+    def test_kr_assets_fall_back_to_sim_snapshot_when_kis_snapshot_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_sim_only",
+                    created_at="2026-03-08T09:00:00Z",
+                    cash=19_000_000.0,
+                    equity=19_200_000.0,
+                    gross_exposure=200_000.0,
+                    net_exposure=200_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=20_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-0.8,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                )
+            )
+            engine = RiskEngine(settings, repo)
+
+            state = engine._latest_account_state(asset_type="한국주식", symbol="005930.KS")
+
+            self.assertEqual(state["cash"], 19_000_000.0)
+            self.assertEqual(state["equity"], 19_200_000.0)
+            self.assertEqual(state["drawdown_pct"], -0.8)
+
+    def test_crypto_assets_ignore_kis_account_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_sim_crypto",
+                    created_at="2026-03-08T09:00:00Z",
+                    cash=8_000_000.0,
+                    equity=8_300_000.0,
+                    gross_exposure=300_000.0,
+                    net_exposure=300_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=30_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-1.5,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                )
+            )
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis_crypto_noise",
+                    created_at="2026-03-08T09:01:00Z",
+                    cash=40_000_000.0,
+                    equity=41_000_000.0,
+                    gross_exposure=1_000_000.0,
+                    net_exposure=1_000_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=100_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-0.2,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    raw_json="{}",
+                )
+            )
+            engine = RiskEngine(settings, repo)
+
+            state = engine._latest_account_state(asset_type="코인", symbol="BTC-USD")
+
+            self.assertEqual(state["cash"], 8_000_000.0)
+            self.assertEqual(state["equity"], 8_300_000.0)
+            self.assertEqual(state["drawdown_pct"], -1.5)
+
 
 if __name__ == "__main__":
     unittest.main()

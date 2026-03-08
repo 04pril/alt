@@ -164,6 +164,84 @@ class PaperBrokerTest(unittest.TestCase):
         self.assertEqual(float(latest["equity"]), 120.0)
         self.assertAlmostEqual(float(latest["drawdown_pct"]), -40.0)
 
+    def test_sim_snapshot_drawdown_ignores_kis_peak(self) -> None:
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_peak",
+                created_at="2026-03-08T08:10:00Z",
+                cash=1000.0,
+                equity=1000.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="kis_account_sync",
+            )
+        )
+
+        self.broker.snapshot_account(cash_override=150.0)
+        latest = self.repo.latest_account_snapshot(exclude_sources=("kis_account_sync",))
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(str(latest["source"]), "paper_broker")
+        self.assertAlmostEqual(float(latest["drawdown_pct"]), -25.0)
+
+    def test_kis_snapshot_drawdown_ignores_sim_peak(self) -> None:
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_sim_peak",
+                created_at="2026-03-08T08:00:00Z",
+                cash=500.0,
+                equity=500.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+            )
+        )
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_peak",
+                created_at="2026-03-08T08:05:00Z",
+                cash=300.0,
+                equity=300.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="kis_account_sync",
+            )
+        )
+
+        snapshot = self.broker.record_external_account_snapshot(
+            cash=240.0,
+            equity=240.0,
+            gross_exposure=0.0,
+            net_exposure=0.0,
+            unrealized_pnl=0.0,
+            open_positions=0,
+            source="kis_account_sync",
+        )
+
+        self.assertEqual(str(snapshot["source"]), "kis_account_sync")
+        self.assertAlmostEqual(float(snapshot["drawdown_pct"]), -20.0)
+
     def test_allow_partial_fills_false_keeps_order_open(self) -> None:
         self.settings.broker.allow_partial_fills = False
         order_id = self.broker.submit_entry_order(self._signal(), quantity=10)

@@ -41,6 +41,7 @@ Job Runs + System Events + Account Snapshots -> Monitoring
 - sim broker snapshots are written with sim-oriented sources such as `paper_broker`
 - KIS account sync writes `source=kis_account_sync` rows into the same table
 - `RiskEngine` reads `kis_account_sync` for KR execution paths and sim-only snapshots for US equities / crypto
+- KR drawdown peaks are computed from `kis_account_sync` rows only, while sim drawdown peaks exclude `kis_account_sync`
 - this keeps KIS buying power, persisted account state, and risk gating aligned
 
 ## Execution Assurance Pipeline

@@ -29,7 +29,9 @@ class RiskEngine:
         self.repository = repository
 
     def _latest_account_state(self, asset_type: str = "", symbol: str = "") -> Dict[str, float]:
-        # KR execution paths must read the latest persisted KIS account snapshot; other assets stay on sim state.
+        # KR execution paths prefer the persisted KIS sync snapshot and only fall back to sim state
+        # when no KIS account snapshot has been written yet. US equities / crypto never read KIS rows.
+        latest: Dict[str, float] | None
         if is_kis_routable_kr_equity(symbol=symbol, asset_type=asset_type):
             latest = self.repository.latest_account_snapshot(source="kis_account_sync")
             if latest is None:

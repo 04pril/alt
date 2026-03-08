@@ -975,9 +975,27 @@ class TradingRepository:
             row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0.0) AS pnl FROM positions").fetchone()
         return float(row["pnl"]) if row else 0.0
 
-    def max_account_equity(self) -> float:
+    def max_account_equity(
+        self,
+        *,
+        source: str | None = None,
+        exclude_sources: Iterable[str] | None = None,
+    ) -> float:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(str(source))
+        excluded = tuple(str(value) for value in (exclude_sources or ()) if str(value))
+        if excluded:
+            placeholders = ", ".join("?" for _ in excluded)
+            clauses.append(f"source NOT IN ({placeholders})")
+            params.extend(excluded)
+        query = "SELECT COALESCE(MAX(equity), 0.0) AS peak FROM account_snapshots"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         with self.connect() as conn:
-            row = conn.execute("SELECT COALESCE(MAX(equity), 0.0) AS peak FROM account_snapshots").fetchone()
+            row = conn.execute(query, params).fetchone()
         return float(row["peak"]) if row else 0.0
 
     def recent_closed_realized_pnl(self, created_date: str) -> float:

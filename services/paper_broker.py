@@ -68,7 +68,11 @@ class PaperBroker:
         touch=None,
     ) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
-        peak = max(float(self.repository.max_account_equity()), float(equity))
+        if str(source) == "kis_account_sync":
+            peak_source = float(self.repository.max_account_equity(source="kis_account_sync"))
+        else:
+            peak_source = float(self.repository.max_account_equity(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES))
+        peak = max(peak_source, float(equity))
         drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
         record = AccountSnapshotRecord(
             snapshot_id=make_id("snap"),

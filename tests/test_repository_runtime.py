@@ -164,6 +164,63 @@ class RepositoryRuntimeTest(unittest.TestCase):
         self.assertEqual(latest["snapshot_id"], "snap_new")
         self.assertEqual(float(latest["equity"]), 150.0)
 
+    def test_max_account_equity_honors_source_scope(self) -> None:
+        rows = [
+            AccountSnapshotRecord(
+                snapshot_id="snap_sim_1",
+                created_at="2026-03-08T09:00:00Z",
+                cash=100.0,
+                equity=100.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+            ),
+            AccountSnapshotRecord(
+                snapshot_id="snap_sim_2",
+                created_at="2026-03-08T09:01:00Z",
+                cash=120.0,
+                equity=120.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+            ),
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_1",
+                created_at="2026-03-08T09:02:00Z",
+                cash=500.0,
+                equity=500.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="kis_account_sync",
+            ),
+        ]
+        for row in rows:
+            self.repo.insert_account_snapshot(row)
+
+        self.assertEqual(self.repo.max_account_equity(source="kis_account_sync"), 500.0)
+        self.assertEqual(self.repo.max_account_equity(exclude_sources=("kis_account_sync",)), 120.0)
+
     def test_latest_position_and_cooldown_use_rowid_tiebreaker(self) -> None:
         updated_at = "2026-03-08T11:00:00Z"
         base = {
