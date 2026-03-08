@@ -14,8 +14,10 @@ class _StubBroker:
         self.account_calls = 0
         self.order_calls = 0
 
-    def sync_account(self):
+    def sync_account(self, touch=None):
         self.account_calls += 1
+        if callable(touch):
+            touch("stub_account_sync", {"call": self.account_calls})
         return {"kis": {"enabled": True}, "sim": {"enabled": True}}
 
     def sync_orders(self, market_data_service, touch=None):

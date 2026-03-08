@@ -18,12 +18,14 @@ from storage.repository import TradingRepository, make_id, utc_now_iso
 
 
 class PaperBroker:
+    SIM_ONLY_EXCLUDED_SOURCES = ("kis_account_sync",)
+
     def __init__(self, settings: RuntimeSettings, repository: TradingRepository):
         self.settings = settings
         self.repository = repository
 
     def ensure_account_initialized(self) -> None:
-        if self.repository.latest_account_snapshot() is not None:
+        if self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) is not None:
             return
         self.repository.insert_account_snapshot(
             AccountSnapshotRecord(
@@ -47,7 +49,104 @@ class PaperBroker:
 
     def _latest_account(self) -> Dict[str, Any]:
         self.ensure_account_initialized()
-        return self.repository.latest_account_snapshot() or {}
+        return self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) or {}
+
+    def _store_account_snapshot(
+        self,
+        *,
+        cash: float,
+        equity: float,
+        gross_exposure: float,
+        net_exposure: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        daily_pnl: float,
+        open_positions: int,
+        open_orders: int,
+        source: str,
+        raw_json: str = "{}",
+        touch=None,
+    ) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        peak = max(float(self.repository.max_account_equity()), float(equity))
+        drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
+        record = AccountSnapshotRecord(
+            snapshot_id=make_id("snap"),
+            created_at=utc_now_iso(),
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized_pnl),
+            unrealized_pnl=float(unrealized_pnl),
+            daily_pnl=float(daily_pnl),
+            drawdown_pct=float(drawdown_pct),
+            open_positions=int(open_positions),
+            open_orders=int(open_orders),
+            paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
+            source=source,
+            raw_json=raw_json,
+        )
+        self.repository.insert_account_snapshot(record)
+        touch(
+            "account_snapshot_stored",
+            {
+                "source": source,
+                "equity": float(equity),
+                "cash": float(cash),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+            },
+        )
+        return {
+            "snapshot_id": record.snapshot_id,
+            "created_at": record.created_at,
+            "cash": record.cash,
+            "equity": record.equity,
+            "gross_exposure": record.gross_exposure,
+            "net_exposure": record.net_exposure,
+            "realized_pnl": record.realized_pnl,
+            "unrealized_pnl": record.unrealized_pnl,
+            "daily_pnl": record.daily_pnl,
+            "drawdown_pct": record.drawdown_pct,
+            "open_positions": record.open_positions,
+            "open_orders": record.open_orders,
+            "source": record.source,
+        }
+
+    def record_external_account_snapshot(
+        self,
+        *,
+        cash: float,
+        equity: float,
+        gross_exposure: float,
+        net_exposure: float,
+        unrealized_pnl: float,
+        open_positions: int,
+        source: str,
+        raw_json: str = "{}",
+        touch=None,
+    ) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("external_account_snapshot_start", {"source": source})
+        realized = self.repository.total_realized_pnl()
+        today = str(pd.Timestamp.utcnow().date())
+        daily_pnl = self.repository.recent_closed_realized_pnl(today)
+        open_order_count = int(len(self.repository.open_orders()))
+        return self._store_account_snapshot(
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized),
+            unrealized_pnl=float(unrealized_pnl),
+            daily_pnl=float(daily_pnl),
+            open_positions=int(open_positions),
+            open_orders=open_order_count,
+            source=source,
+            raw_json=raw_json,
+            touch=touch,
+        )
 
     def _position_side_from_order(self, order_side: str) -> str:
         return "LONG" if order_side == "buy" else "SHORT"
@@ -450,7 +549,9 @@ class PaperBroker:
     def sync_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> Dict[str, int]:
         return {"fills": int(self.process_open_orders(market_data_service, touch=touch))}
 
-    def snapshot_account(self, cash_override: float | None = None) -> None:
+    def snapshot_account(self, cash_override: float | None = None, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("sim_account_snapshot_start", {"source": "paper_broker"})
         account = self._latest_account()
         open_positions = self.repository.open_positions()
         open_orders = self.repository.open_orders()
@@ -469,32 +570,39 @@ class PaperBroker:
         gross_exposure = float(exposures.abs().sum()) if not exposures.empty else 0.0
         net_exposure = float(exposures.sum()) if not exposures.empty else 0.0
         equity = cash + net_exposure
-        peak = max(float(self.repository.max_account_equity()), float(equity))
-        drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
         today = str(pd.Timestamp.utcnow().date())
         daily_pnl = self.repository.recent_closed_realized_pnl(today)
-        self.repository.insert_account_snapshot(
-            AccountSnapshotRecord(
-                snapshot_id=make_id("snap"),
-                created_at=utc_now_iso(),
-                cash=float(cash),
-                equity=float(equity),
-                gross_exposure=float(gross_exposure),
-                net_exposure=float(net_exposure),
-                realized_pnl=float(realized),
-                unrealized_pnl=float(unrealized),
-                daily_pnl=float(daily_pnl),
-                drawdown_pct=float(drawdown_pct),
-                open_positions=int(len(open_positions)),
-                open_orders=int(len(open_orders)),
-                paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
-                source="paper_broker",
-                raw_json="{}",
-            )
+        touch(
+            "sim_account_snapshot_metrics",
+            {
+                "equity": float(equity),
+                "cash": float(cash),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+                "open_positions": int(len(open_positions)),
+                "open_orders": int(len(open_orders)),
+            },
+        )
+        return self._store_account_snapshot(
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized),
+            unrealized_pnl=float(unrealized),
+            daily_pnl=float(daily_pnl),
+            open_positions=int(len(open_positions)),
+            open_orders=int(len(open_orders)),
+            source="paper_broker",
+            raw_json="{}",
+            touch=touch,
         )
 
-    def sync_account(self) -> Dict[str, Any]:
+    def sync_account(self, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("sim_account_sync_start", {"broker": "sim"})
         latest = self._latest_account()
+        touch("sim_account_sync_complete", {"source": str(latest.get("source") or "paper_broker")})
         return {
             "broker": "sim",
             "enabled": True,

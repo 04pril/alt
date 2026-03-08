@@ -10,6 +10,7 @@ from config.settings import RuntimeSettings
 from kis_paper import KISPaperSnapshot
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
+from services.risk_engine import RiskEngine
 from services.signal_engine import SignalDecision
 from storage.models import OrderRecord
 from storage.repository import TradingRepository
@@ -38,7 +39,20 @@ class _FakeKISClient:
         self.daily_rows = pd.DataFrame()
 
     def get_account_snapshot(self) -> KISPaperSnapshot:
-        return KISPaperSnapshot(summary={"cash": 30_000_000.0, "holding_count": int(len(self.holdings))}, holdings=self.holdings.copy(), raw_summary={})
+        market_value = float(pd.to_numeric(self.holdings.get("market_value"), errors="coerce").fillna(0.0).sum()) if not self.holdings.empty else 0.0
+        unrealized = float(pd.to_numeric(self.holdings.get("unrealized_pnl"), errors="coerce").fillna(0.0).sum()) if not self.holdings.empty else 0.0
+        cash = 30_000_000.0
+        return KISPaperSnapshot(
+            summary={
+                "cash": cash,
+                "stock_eval": market_value,
+                "total_eval": cash + market_value,
+                "pnl": unrealized,
+                "holding_count": int(len(self.holdings)),
+            },
+            holdings=self.holdings.copy(),
+            raw_summary={},
+        )
 
     def get_quote(self, symbol: str):
         return {"symbol_code": "005930", "current_price": 70000.0, "raw": {}}
@@ -224,6 +238,34 @@ class KISPaperBrokerTest(unittest.TestCase):
         sync = self.broker.sync_orders(self.market)
         self.assertEqual(sync["fills"], 1)
         self.assertEqual(self.repo.get_order(result["order_id"])["status"], "filled")
+
+    def test_sync_account_writes_canonical_snapshot_used_by_risk_engine(self) -> None:
+        self.sim_broker.snapshot_account(cash_override=1_000_000.0)
+        self.client.holdings = pd.DataFrame(
+            [
+                {
+                    "symbol_code": "005930",
+                    "quantity": 10,
+                    "avg_price": 70000.0,
+                    "current_price": 72000.0,
+                    "unrealized_pnl": 20_000.0,
+                    "market_value": 720_000.0,
+                }
+            ]
+        )
+        sync = self.broker.sync_account()
+        latest = self.repo.latest_account_snapshot()
+        engine = RiskEngine(self.settings, self.repo)
+        state = engine._latest_account_state(asset_type="한국주식", symbol="005930.KS")
+
+        self.assertTrue(sync["enabled"])
+        self.assertEqual(str(latest["source"]), "kis_account_sync")
+        self.assertEqual(float(latest["cash"]), 30_000_000.0)
+        self.assertEqual(float(latest["equity"]), 30_720_000.0)
+        self.assertEqual(float(latest["gross_exposure"]), 720_000.0)
+        self.assertEqual(float(latest["net_exposure"]), 720_000.0)
+        self.assertEqual(state["cash"], 30_000_000.0)
+        self.assertEqual(state["equity"], 30_720_000.0)
 
 
 if __name__ == "__main__":

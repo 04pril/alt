@@ -84,6 +84,18 @@ def run_once(settings_path: str | None = None) -> None:
     context = build_task_context(settings_path)
     settings = context.settings
     context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), "scheduler loop heartbeat")
+    _run_guarded(
+        context,
+        job_name="broker_market_status",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_market_status_interval_minutes),
+        fn=lambda: broker_market_status_job(context),
+    )
+    _run_guarded(
+        context,
+        job_name="broker_account_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_account_sync_interval_minutes),
+        fn=lambda: broker_account_sync_job(context),
+    )
     for asset_type, schedule in settings.asset_schedules.items():
         now = datetime.now(ZoneInfo(schedule.timezone))
         _run_guarded(
@@ -98,12 +110,6 @@ def run_once(settings_path: str | None = None) -> None:
             run_key=_bucket_key(now, schedule.entry_interval_minutes),
             fn=lambda asset_type=asset_type: entry_decision_job(context, [asset_type]),
         )
-    _run_guarded(
-        context,
-        job_name="broker_market_status",
-        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_market_status_interval_minutes),
-        fn=lambda: broker_market_status_job(context),
-    )
     _run_guarded(
         context,
         job_name="broker_position_sync",
@@ -121,12 +127,6 @@ def run_once(settings_path: str | None = None) -> None:
         job_name="broker_order_sync",
         run_key=_bucket_key(_utc_now(), settings.scheduler.broker_order_sync_interval_minutes),
         fn=lambda: broker_order_sync_job(context),
-    )
-    _run_guarded(
-        context,
-        job_name="broker_account_sync",
-        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_account_sync_interval_minutes),
-        fn=lambda: broker_account_sync_job(context),
     )
     _run_guarded(
         context,

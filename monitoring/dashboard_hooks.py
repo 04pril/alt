@@ -8,6 +8,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from services.broker_router import resolve_broker_mode
+from services.kis_paper_broker import KISPaperBroker
+from services.paper_broker import PaperBroker
 from storage.repository import TradingRepository
 
 KST = ZoneInfo("Asia/Seoul")
@@ -62,7 +65,14 @@ def _localize_timestamp_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return localized
 
 
-def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
+def _kis_enabled_for_monitor(settings: RuntimeSettings, repository: TradingRepository) -> bool:
+    try:
+        return bool(KISPaperBroker(settings, repository, PaperBroker(settings, repository)).is_enabled())
+    except Exception:
+        return False
+
+
+def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for asset_type, schedule in settings.asset_schedules.items():
         universe = settings.universes.get(asset_type)
@@ -77,6 +87,7 @@ def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
                 "스캔주기(분)": schedule.scan_interval_minutes,
                 "진입주기(분)": schedule.entry_interval_minutes,
                 "청산주기(분)": schedule.exit_interval_minutes,
+                "실행브로커": resolve_broker_mode(asset_type=asset_type, kis_enabled=kis_enabled),
                 "Watchlist 개수": len(watchlist),
                 "Top Universe 개수": len(top_universe),
                 "대표 종목": ", ".join((watchlist or top_universe)[:4]),
@@ -157,6 +168,7 @@ def _broker_sync_status(job_health: pd.DataFrame) -> pd.DataFrame:
 def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
+    kis_enabled = _kis_enabled_for_monitor(settings, repository)
     summary = repository.dashboard_counts()
     equity_curve = _localize_timestamp_columns(repository.load_account_snapshots(limit=500))
     job_health = _localize_timestamp_columns(repository.recent_job_health(limit=200))
@@ -199,7 +211,7 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "open_positions": _localize_timestamp_columns(repository.open_positions()),
         "open_orders": open_orders,
         "candidate_scans": _localize_timestamp_columns(repository.latest_candidates(limit=100)),
-        "asset_overview": build_asset_overview(settings),
+        "asset_overview": build_asset_overview(settings, kis_enabled=kis_enabled),
         "equity_curve": equity_curve.sort_values("created_at") if not equity_curve.empty else pd.DataFrame(),
         "job_health": job_health,
         "recent_errors": _localize_timestamp_columns(repository.recent_system_events(level="ERROR", limit=50)),

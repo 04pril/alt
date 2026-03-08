@@ -50,17 +50,22 @@ class DashboardHooksTest(unittest.TestCase):
 
     def test_asset_overview_contains_all_asset_types(self) -> None:
         settings = RuntimeSettings()
-        overview = build_asset_overview(settings)
+        overview = build_asset_overview(settings, kis_enabled=True)
         self.assertFalse(overview.empty)
         self.assertEqual(set(overview["자산유형"]), {"코인", "미국주식", "한국주식"})
-        self.assertIn("대표 심볼", overview.columns)
+        self.assertIn("대표 종목", overview.columns)
 
-    def test_asset_overview_contains_all_asset_types(self) -> None:
+    def test_asset_overview_includes_broker_mode_column(self) -> None:
         settings = RuntimeSettings()
-        overview = build_asset_overview(settings)
+        overview = build_asset_overview(settings, kis_enabled=True)
         self.assertFalse(overview.empty)
         self.assertEqual(set(overview["자산유형"]), set(settings.asset_schedules.keys()))
         self.assertIn("대표 종목", overview.columns)
+        self.assertIn("실행브로커", overview.columns)
+        broker_modes = dict(zip(overview["자산유형"], overview["실행브로커"]))
+        self.assertEqual(broker_modes["한국주식"], "kis_mock")
+        self.assertEqual(broker_modes["미국주식"], "sim")
+        self.assertEqual(broker_modes["코인"], "sim")
 
     def test_auto_trading_status_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

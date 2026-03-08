@@ -1550,6 +1550,7 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
     broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
     kis_runtime = data.get("kis_runtime", {})
+    asset_overview = data.get("asset_overview", pd.DataFrame())
 
     metrics = st.columns(6)
     metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
@@ -1562,6 +1563,12 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
         f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
     )
+    if not asset_overview.empty and {"자산유형", "실행브로커"}.issubset(asset_overview.columns):
+        broker_mode_text = " · ".join(
+            f"{str(row['자산유형'])}={str(row['실행브로커'])}"
+            for _, row in asset_overview.iterrows()
+        )
+        st.caption(f"자산별 실행 브로커 · {broker_mode_text}")
 
     execution_cols = st.columns(5)
     execution_cols[0].metric("Today Candidates", f"{int(execution_summary.get('today_candidate_count', 0))}")
@@ -1595,7 +1602,6 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     open_positions = data["open_positions"]
     open_orders = data["open_orders"]
     candidate_scans = data["candidate_scans"]
-    asset_overview = data.get("asset_overview", pd.DataFrame())
     prediction_report = data["prediction_report"]
     equity_curve = data["equity_curve"]
     today_execution_events = data.get("today_execution_events", pd.DataFrame())

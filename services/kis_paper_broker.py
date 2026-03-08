@@ -65,6 +65,35 @@ class KISPaperBroker:
             "avg_price": float(pd.to_numeric(row.get("avg_price", row.get("매입평균가")), errors="coerce")),
         }
 
+    def _canonical_account_values(self, snapshot) -> Dict[str, float]:
+        holdings = snapshot.holdings.copy()
+        market_value = 0.0
+        unrealized_pnl = float(snapshot.summary.get("pnl", 0.0) or 0.0)
+        if not holdings.empty:
+            if "market_value" in holdings.columns:
+                market_value = float(pd.to_numeric(holdings["market_value"], errors="coerce").fillna(0.0).sum())
+            if not np.isfinite(market_value) or market_value <= 0:
+                market_value = float(pd.to_numeric(holdings.get("평가금액"), errors="coerce").fillna(0.0).sum())
+            if "unrealized_pnl" in holdings.columns:
+                unrealized_pnl = float(pd.to_numeric(holdings["unrealized_pnl"], errors="coerce").fillna(0.0).sum())
+            elif "평가손익" in holdings.columns:
+                unrealized_pnl = float(pd.to_numeric(holdings["평가손익"], errors="coerce").fillna(0.0).sum())
+
+        cash = float(snapshot.summary.get("cash", 0.0) or 0.0)
+        stock_eval = float(snapshot.summary.get("stock_eval", market_value) or market_value)
+        total_eval = float(snapshot.summary.get("total_eval", cash + stock_eval) or (cash + stock_eval))
+        gross_exposure = max(stock_eval, market_value, 0.0)
+        net_exposure = gross_exposure
+        equity = total_eval if np.isfinite(total_eval) and total_eval > 0 else cash + net_exposure
+        return {
+            "cash": float(cash),
+            "equity": float(equity),
+            "gross_exposure": float(gross_exposure),
+            "net_exposure": float(net_exposure),
+            "unrealized_pnl": float(unrealized_pnl),
+            "open_positions": int(len(holdings)),
+        }
+
     def _pick_execution_price(self, quote: Dict[str, Any], orderbook: Dict[str, Any], side: str) -> float:
         if side == "buy":
             for key in ("best_ask", "expected_price"):
@@ -356,16 +385,47 @@ class KISPaperBroker:
     def submit_exit_order(self, position: pd.Series, reason: str) -> str:
         return str(self.submit_exit_order_result(position, reason).get("order_id") or "")
 
-    def sync_account(self) -> Dict[str, Any]:
+    def sync_account(self, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
         if not self.is_enabled():
+            touch("kis_account_sync_skipped", {"enabled": False})
             return {"broker": "kis_mock", "enabled": False}
+        touch("kis_account_sync_request", {"enabled": True})
         client = self._client()
         snapshot = client.get_account_snapshot()
+        touch(
+            "kis_account_sync_snapshot",
+            {
+                "holding_count": int(snapshot.summary.get("holding_count", 0) or 0),
+                "cash": float(snapshot.summary.get("cash", 0.0) or 0.0),
+            },
+        )
         approval_key_available = False
         try:
             approval_key_available = bool(client.get_websocket_approval_key())
         except Exception:
             approval_key_available = False
+        touch("kis_account_sync_ws", {"approval_key_available": approval_key_available, "hts_id_configured": bool(client.config.hts_id)})
+        canonical = self._canonical_account_values(snapshot)
+        canonical_snapshot = self.sim_broker.record_external_account_snapshot(
+            cash=canonical["cash"],
+            equity=canonical["equity"],
+            gross_exposure=canonical["gross_exposure"],
+            net_exposure=canonical["net_exposure"],
+            unrealized_pnl=canonical["unrealized_pnl"],
+            open_positions=canonical["open_positions"],
+            source="kis_account_sync",
+            raw_json=json.dumps(
+                {
+                    "broker": "kis_mock",
+                    "summary": snapshot.summary,
+                    "holding_count": canonical["open_positions"],
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+            touch=lambda stage=None, details=None: touch(stage or "kis_account_snapshot", details),
+        )
         self.repository.set_control_flag("kis_last_account_sync_at", utc_now_iso(), "broker_account_sync")
         self._log_state(
             "broker_account_sync",
@@ -374,8 +434,10 @@ class KISPaperBroker:
                 "holding_count": int(snapshot.summary.get("holding_count", 0)),
                 "approval_key_available": approval_key_available,
                 "hts_id_configured": bool(client.config.hts_id),
+                "canonical_snapshot_source": str(canonical_snapshot.get("source") or "kis_account_sync"),
             },
         )
+        touch("kis_account_sync_complete", {"canonical_source": str(canonical_snapshot.get("source") or "kis_account_sync")})
         return {
             "broker": "kis_mock",
             "enabled": True,
@@ -383,6 +445,7 @@ class KISPaperBroker:
             "holding_count": int(snapshot.summary.get("holding_count", 0)),
             "approval_key_available": approval_key_available,
             "hts_id_configured": bool(client.config.hts_id),
+            "canonical_snapshot": canonical_snapshot,
         }
 
     def _today_order_frame(self, client: KISPaperClient, order: pd.Series) -> pd.DataFrame:

@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from services.broker_router import is_kis_routable_kr_equity
 from services.signal_engine import SignalDecision
 from storage.repository import TradingRepository, parse_utc_timestamp
 
@@ -27,8 +28,15 @@ class RiskEngine:
         self.settings = settings
         self.repository = repository
 
-    def _latest_account_state(self) -> Dict[str, float]:
-        latest = self.repository.latest_account_snapshot() or {}
+    def _latest_account_state(self, asset_type: str = "", symbol: str = "") -> Dict[str, float]:
+        # KR execution paths must read the latest persisted KIS account snapshot; other assets stay on sim state.
+        if is_kis_routable_kr_equity(symbol=symbol, asset_type=asset_type):
+            latest = self.repository.latest_account_snapshot(source="kis_account_sync")
+            if latest is None:
+                latest = self.repository.latest_account_snapshot(exclude_sources=("kis_account_sync",))
+        else:
+            latest = self.repository.latest_account_snapshot(exclude_sources=("kis_account_sync",))
+        latest = latest or {}
         equity = float(latest.get("equity", self.settings.risk.starting_cash))
         cash = float(latest.get("cash", self.settings.risk.starting_cash))
         drawdown_pct = float(latest.get("drawdown_pct", 0.0) or 0.0)
@@ -62,7 +70,7 @@ class RiskEngine:
     ) -> RiskDecision:
         strategy = self.settings.strategy
         risk = self.settings.risk
-        state = self._latest_account_state()
+        state = self._latest_account_state(asset_type=signal.asset_type, symbol=signal.symbol)
         today = str(pd.Timestamp.utcnow().date())
         if self.repository.get_control_flag("trading_paused", "0") == "1":
             return RiskDecision(False, "paused", 0, 0.0, 0.0)

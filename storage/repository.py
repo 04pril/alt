@@ -924,9 +924,28 @@ class TradingRepository:
                 asdict(record),
             )
 
-    def latest_account_snapshot(self) -> Dict[str, Any] | None:
+    def latest_account_snapshot(
+        self,
+        *,
+        source: str | None = None,
+        exclude_sources: Iterable[str] | None = None,
+    ) -> Dict[str, Any] | None:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(str(source))
+        excluded = tuple(str(value) for value in (exclude_sources or ()) if str(value))
+        if excluded:
+            placeholders = ", ".join("?" for _ in excluded)
+            clauses.append(f"source NOT IN ({placeholders})")
+            params.extend(excluded)
+        query = "SELECT rowid, * FROM account_snapshots"
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
         with self.connect() as conn:
-            row = conn.execute("SELECT rowid, * FROM account_snapshots ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+            row = conn.execute(query, params).fetchone()
         return dict(row) if row else None
 
     def load_account_snapshots(self, limit: int = 500) -> pd.DataFrame:

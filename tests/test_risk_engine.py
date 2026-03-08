@@ -8,16 +8,16 @@ import pandas as pd
 from config.settings import RuntimeSettings
 from services.risk_engine import RiskEngine
 from services.signal_engine import SignalDecision
-from storage.models import OrderRecord, PositionRecord
+from storage.models import AccountSnapshotRecord, OrderRecord, PositionRecord
 from storage.repository import TradingRepository
 
 
 class RiskEngineTest(unittest.TestCase):
-    def _build_signal(self) -> SignalDecision:
+    def _build_signal(self, *, symbol: str = "BTC-USD", asset_type: str = "코인", timeframe: str = "1h") -> SignalDecision:
         return SignalDecision(
-            symbol="BTC-USD",
-            asset_type="코인",
-            timeframe="1h",
+            symbol=symbol,
+            asset_type=asset_type,
+            timeframe=timeframe,
             prediction_id="pred1",
             scan_id="scan1",
             score=1.0,
@@ -180,6 +180,106 @@ class RiskEngineTest(unittest.TestCase):
             )
             allowed = engine.evaluate_entry(self._build_signal(), correlation_matrix=pd.DataFrame(), market_is_open=True)
             self.assertTrue(allowed.allowed)
+
+    def test_non_kr_assets_ignore_kis_account_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_sim",
+                    created_at="2026-03-08T09:00:00Z",
+                    cash=20_000_000.0,
+                    equity=20_500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=100_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-1.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                )
+            )
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis",
+                    created_at="2026-03-08T09:01:00Z",
+                    cash=30_000_000.0,
+                    equity=31_000_000.0,
+                    gross_exposure=1_000_000.0,
+                    net_exposure=1_000_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=200_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-2.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    raw_json="{}",
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            state = engine._latest_account_state(asset_type="미국주식", symbol="AAPL")
+            self.assertEqual(state["cash"], 20_000_000.0)
+            self.assertEqual(state["equity"], 20_500_000.0)
+            self.assertEqual(state["drawdown_pct"], -1.0)
+
+    def test_kr_assets_prefer_kis_account_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_sim",
+                    created_at="2026-03-08T09:00:00Z",
+                    cash=12_000_000.0,
+                    equity=12_500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=50_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-1.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                )
+            )
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis",
+                    created_at="2026-03-08T09:01:00Z",
+                    cash=27_000_000.0,
+                    equity=27_500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=60_000.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-0.5,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    raw_json="{}",
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            state = engine._latest_account_state(asset_type="한국주식", symbol="005930.KS")
+            self.assertEqual(state["cash"], 27_000_000.0)
+            self.assertEqual(state["equity"], 27_500_000.0)
+            self.assertEqual(state["drawdown_pct"], -0.5)
 
 
 if __name__ == "__main__":

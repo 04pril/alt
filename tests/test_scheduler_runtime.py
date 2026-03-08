@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from config.settings import RuntimeSettings
 from jobs.scheduler import _run_guarded
+from jobs.tasks import broker_account_sync_job
 from storage.repository import TradingRepository
 
 
@@ -22,6 +23,7 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.repo = TradingRepository(self.settings.storage.db_path)
         self.repo.initialize()
         self.context = SimpleNamespace(repository=self.repo, settings=self.settings)
+        self.context.touch_runtime = lambda stage=None, details=None: self.context.job_touch(stage, details)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -89,6 +91,45 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertIsNone(first)
         self.assertIsNone(second)
         self.assertEqual(attempts["job"], 1)
+
+    def test_broker_account_sync_job_uses_retry_backoff(self) -> None:
+        attempts = {"job": 0}
+
+        class _FailingBroker:
+            def sync_account(self, touch=None):
+                attempts["job"] += 1
+                raise RuntimeError("account sync failed")
+
+        self.context.paper_broker = _FailingBroker()
+        first = _run_guarded(self.context, "broker_account_sync", "2026-03-08T15:25", lambda: broker_account_sync_job(self.context))
+        second = _run_guarded(self.context, "broker_account_sync", "2026-03-08T15:25", lambda: broker_account_sync_job(self.context))
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(attempts["job"], 1)
+
+    def test_broker_account_sync_job_refreshes_heartbeat_during_slow_sync(self) -> None:
+        observed = {"first": "", "second": ""}
+
+        class _SlowBroker:
+            def sync_account(self, touch=None):
+                if callable(touch):
+                    touch("account_sync_stage_one", {"step": 1})
+                observed["first"] = self_outer.repo.get_control_flag("worker_heartbeat_at", "")
+                time.sleep(0.05)
+                if callable(touch):
+                    touch("account_sync_stage_two", {"step": 2})
+                observed["second"] = self_outer.repo.get_control_flag("worker_heartbeat_at", "")
+                return {"sim": {"enabled": True}, "kis": {"enabled": False}}
+
+        self_outer = self
+        self.context.paper_broker = _SlowBroker()
+        result = _run_guarded(self.context, "broker_account_sync", "2026-03-08T15:40", lambda: broker_account_sync_job(self.context))
+        row = self.repo.get_job_run_by_key("broker_account_sync", "2026-03-08T15:40")
+        self.assertEqual(result["sim"]["enabled"], True)
+        self.assertEqual(row["status"], "completed")
+        self.assertNotEqual(observed["first"], "")
+        self.assertNotEqual(observed["second"], "")
+        self.assertTrue(self.repo.get_control_flag("worker_heartbeat_job", "").startswith("broker_account_sync"))
 
     def test_long_running_job_refreshes_lease_and_worker_heartbeat(self) -> None:
         observed = {"heartbeat_before": "", "heartbeat_after": ""}

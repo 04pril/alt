@@ -12,6 +12,12 @@ The current routing model stays the same:
 - US equities and crypto: SQLite-backed `PaperBroker`
 - predictor semantics and `run_forecast_on_price_data(...)` reuse are unchanged
 
+KR-only routing rule:
+
+- KIS routing is limited to KR symbols (`.KS` / `.KQ`) and bare 6-digit KR stock codes
+- asset-level monitoring may still label `한국주식` as `kis_mock`
+- US equities and crypto stay on the sim broker path even if a broad `...주식` label is passed through by mistake
+
 ## Runtime Architecture
 
 ```text
@@ -29,6 +35,13 @@ Orders -> Fills -> Positions -> Account Snapshots
 Predictions -> Outcome Resolver -> Outcomes -> Evaluations
 Job Runs + System Events + Account Snapshots -> Monitoring
 ```
+
+`account_snapshots` in `storage/repository.py` remain the canonical account-state ledger.
+
+- sim broker snapshots are written with sim-oriented sources such as `paper_broker`
+- KIS account sync writes `source=kis_account_sync` rows into the same table
+- `RiskEngine` reads `kis_account_sync` for KR execution paths and sim-only snapshots for US equities / crypto
+- this keeps KIS buying power, persisted account state, and risk gating aligned
 
 ## Execution Assurance Pipeline
 
@@ -80,6 +93,8 @@ These jobs are:
 - visible in `system_events`
 - eligible for retry/backoff
 - manually runnable from the monitor UI
+
+`broker_account_sync` also propagates runtime `touch()` callbacks through the router and broker layers, so a slow account sync refreshes lease and worker heartbeat mid-run instead of only at job start.
 
 ## KR Execution Path
 

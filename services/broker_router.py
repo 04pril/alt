@@ -7,6 +7,21 @@ import pandas as pd
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 
+KR_EQUITY_ASSET_TYPE = "한국주식"
+KR_SYMBOL_SUFFIXES = (".KS", ".KQ")
+
+
+def is_kis_routable_kr_equity(symbol: str = "", asset_type: str = "") -> bool:
+    normalized_symbol = str(symbol).upper().strip()
+    normalized_asset_type = str(asset_type).strip()
+    if normalized_symbol:
+        return normalized_symbol.endswith(KR_SYMBOL_SUFFIXES) or (normalized_symbol.isdigit() and len(normalized_symbol) == 6)
+    return normalized_asset_type == KR_EQUITY_ASSET_TYPE
+
+
+def resolve_broker_mode(symbol: str = "", asset_type: str = "", *, kis_enabled: bool) -> str:
+    return "kis_mock" if kis_enabled and is_kis_routable_kr_equity(symbol=symbol, asset_type=asset_type) else "sim"
+
 
 class BrokerRouter:
     def __init__(self, sim_broker: PaperBroker, kis_broker: KISPaperBroker | None = None):
@@ -22,9 +37,11 @@ class BrokerRouter:
     def _use_kis(self, symbol: str, asset_type: str) -> bool:
         if self.kis_broker is None or not self.kis_broker.is_enabled():
             return False
-        normalized_symbol = str(symbol).upper().strip()
-        normalized_asset_type = str(asset_type).strip()
-        return normalized_symbol.endswith((".KS", ".KQ")) or normalized_asset_type.endswith("주식")
+        return resolve_broker_mode(symbol=symbol, asset_type=asset_type, kis_enabled=True) == "kis_mock"
+
+    def broker_mode_for_asset(self, asset_type: str, symbol: str = "") -> str:
+        kis_enabled = self.kis_broker is not None and self.kis_broker.is_enabled()
+        return resolve_broker_mode(symbol=symbol, asset_type=asset_type, kis_enabled=kis_enabled)
 
     def submit_entry_order(self, signal, quantity: int, scan_id: str | None = None) -> str:
         if self._use_kis(signal.symbol, signal.asset_type):
@@ -69,11 +86,27 @@ class BrokerRouter:
             return self.kis_broker.preflight_entry(signal, quantity, market_data_service)
         return {"allowed": True, "reason": "ok", "broker": "sim"}
 
-    def sync_account(self) -> dict[str, Any]:
-        sim_summary = self.sim_broker.sync_account()
+    def sync_account(self, touch=None) -> dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("broker_account_sync_start", {"broker": "router"})
+        sim_summary = self.sim_broker.sync_account(
+            touch=lambda stage=None, details=None: touch(stage or "sim_account_sync", details),
+        )
         result = {"sim": sim_summary}
         if self.kis_broker is not None and self.kis_broker.is_enabled():
-            result["kis"] = self.kis_broker.sync_account()
+            touch("broker_account_sync_kis", {"broker": "kis_mock"})
+            result["kis"] = self.kis_broker.sync_account(
+                touch=lambda stage=None, details=None: touch(stage or "kis_account_sync", details),
+            )
+        else:
+            result["kis"] = {"broker": "kis_mock", "enabled": False}
+        touch(
+            "broker_account_sync_complete",
+            {
+                "sim_source": str(result["sim"].get("summary", {}).get("source") or result["sim"].get("source") or ""),
+                "kis_enabled": bool(result["kis"].get("enabled", False)),
+            },
+        )
         return result
 
     def sync_orders(self, market_data_service: Any, touch=None) -> dict[str, int]:
