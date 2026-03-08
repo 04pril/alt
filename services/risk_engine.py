@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from math import floor
 from typing import Dict
@@ -9,7 +10,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from services.signal_engine import SignalDecision
-from storage.repository import TradingRepository
+from storage.repository import TradingRepository, parse_utc_timestamp
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,26 @@ class RiskEngine:
         cash = float(latest.get("cash", self.settings.risk.starting_cash))
         drawdown_pct = float(latest.get("drawdown_pct", 0.0) or 0.0)
         return {"equity": equity, "cash": cash, "drawdown_pct": drawdown_pct}
+
+    def _pending_entry_frame(self) -> pd.DataFrame:
+        frame = self.repository.active_entry_orders(active_only=True)
+        if frame.empty:
+            return frame
+
+        def parse_payload(payload: object) -> Dict[str, float]:
+            try:
+                return json.loads(str(payload or "{}"))
+            except Exception:
+                return {}
+
+        payloads = frame["raw_json"].map(parse_payload)
+        frame = frame.copy()
+        frame["pending_price"] = pd.to_numeric(frame["requested_price"], errors="coerce")
+        frame["pending_qty"] = pd.to_numeric(frame["remaining_qty"], errors="coerce").fillna(0.0)
+        frame["pending_notional"] = (frame["pending_price"].fillna(0.0) * frame["pending_qty"]).abs()
+        frame["pending_expected_risk"] = payloads.map(lambda item: float(item.get("expected_risk", np.nan)))
+        frame["pending_expected_risk"] = pd.to_numeric(frame["pending_expected_risk"], errors="coerce").fillna(0.0)
+        return frame
 
     def evaluate_entry(
         self,
@@ -58,9 +79,13 @@ class RiskEngine:
         if strategy.round_trip_cost_bps > strategy.max_cost_bps:
             return RiskDecision(False, "cost_too_high", 0, 0.0, 0.0)
 
+        cooldown_until = self.repository.latest_cooldown_until(signal.symbol, signal.timeframe)
+        cooldown_dt = parse_utc_timestamp(cooldown_until)
+        if cooldown_dt is not None and pd.Timestamp.now(tz="UTC").to_pydatetime() < cooldown_dt:
+            return RiskDecision(False, "cooldown_active", 0, 0.0, 0.0)
+
         open_positions = self.repository.open_positions()
-        if len(open_positions) >= risk.max_open_positions:
-            return RiskDecision(False, "max_open_positions", 0, 0.0, 0.0)
+        pending_entries = self._pending_entry_frame()
         if self.repository.count_daily_entries(today) >= risk.max_daily_new_entries:
             return RiskDecision(False, "max_daily_entries", 0, 0.0, 0.0)
         if state["drawdown_pct"] <= -(risk.max_drawdown_limit_pct * 100.0):
@@ -72,8 +97,22 @@ class RiskEngine:
             (open_positions["symbol"].astype(str) == signal.symbol)
             & (open_positions["timeframe"].astype(str) == signal.timeframe)
         ]
-        if not same_symbol.empty:
+        same_symbol_pending = pending_entries[
+            (pending_entries["symbol"].astype(str) == signal.symbol)
+            & (pending_entries["timeframe"].astype(str) == signal.timeframe)
+        ]
+        if not same_symbol.empty or not same_symbol_pending.empty:
             return RiskDecision(False, "already_holding_symbol", 0, 0.0, 0.0)
+
+        reserved_slots = pd.concat(
+            [
+                open_positions.loc[:, ["symbol", "timeframe"]] if not open_positions.empty else pd.DataFrame(columns=["symbol", "timeframe"]),
+                pending_entries.loc[:, ["symbol", "timeframe"]] if not pending_entries.empty else pd.DataFrame(columns=["symbol", "timeframe"]),
+            ],
+            ignore_index=True,
+        ).drop_duplicates()
+        if len(reserved_slots) >= risk.max_open_positions:
+            return RiskDecision(False, "max_open_positions", 0, 0.0, 0.0)
 
         if not correlation_matrix.empty and signal.symbol in correlation_matrix.index:
             current_side = signal.signal
@@ -87,23 +126,60 @@ class RiskEngine:
                 if np.isfinite(corr) and corr >= risk.max_same_direction_correlation:
                     return RiskDecision(False, f"correlation_limit:{other}", 0, 0.0, 0.0)
 
-        current_exposure = (
-            pd.to_numeric(open_positions.get("exposure_value"), errors="coerce").abs().sum() if not open_positions.empty else 0.0
-        )
-        asset_exposure = (
-            pd.to_numeric(
-                open_positions.loc[open_positions["asset_type"] == signal.asset_type, "exposure_value"],
-                errors="coerce",
-            ).abs().sum()
+        open_exposures = pd.to_numeric(open_positions.get("exposure_value"), errors="coerce").fillna(0.0) if not open_positions.empty else pd.Series(dtype=float)
+        current_gross_exposure = float(open_exposures.abs().sum()) if not open_exposures.empty else 0.0
+        asset_open_exposure = (
+            float(
+                pd.to_numeric(open_positions.loc[open_positions["asset_type"] == signal.asset_type, "exposure_value"], errors="coerce")
+                .fillna(0.0)
+                .abs()
+                .sum()
+            )
             if not open_positions.empty
             else 0.0
         )
+        pending_gross_exposure = float(pd.to_numeric(pending_entries.get("pending_notional"), errors="coerce").fillna(0.0).sum()) if not pending_entries.empty else 0.0
+        pending_asset_exposure = (
+            float(pd.to_numeric(pending_entries.loc[pending_entries["asset_type"] == signal.asset_type, "pending_notional"], errors="coerce").fillna(0.0).sum())
+            if not pending_entries.empty
+            else 0.0
+        )
+        reserved_cash = (
+            float(
+                pd.to_numeric(
+                    pending_entries.loc[pending_entries["side"].astype(str) == "buy", "pending_notional"],
+                    errors="coerce",
+                )
+                .fillna(0.0)
+                .sum()
+            )
+            if not pending_entries.empty
+            else 0.0
+        )
+        position_risk = (
+            float(
+                (
+                    pd.to_numeric(open_positions.get("exposure_value"), errors="coerce").fillna(0.0).abs()
+                    * pd.to_numeric(open_positions.get("expected_risk"), errors="coerce").fillna(0.0)
+                ).sum()
+            )
+            if not open_positions.empty
+            else 0.0
+        )
+        pending_risk = (
+            float((pending_entries["pending_notional"] * pending_entries["pending_expected_risk"]).sum())
+            if not pending_entries.empty
+            else 0.0
+        )
+
         equity = max(state["equity"], 1.0)
+        available_cash = max(0.0, state["cash"] - reserved_cash)
         symbol_cap = equity * risk.symbol_max_weight
-        asset_cap = equity * risk.asset_type_max_weight.get(signal.asset_type, 0.3) - asset_exposure
-        remaining_total_risk = max(0.0, equity * risk.total_risk_budget_pct - current_exposure * signal.expected_risk)
+        asset_cap = equity * risk.asset_type_max_weight.get(signal.asset_type, 0.3) - asset_open_exposure - pending_asset_exposure
+        remaining_total_risk = max(0.0, equity * risk.total_risk_budget_pct - position_risk - pending_risk)
         risk_cap = equity * risk.per_trade_risk_budget_pct / max(signal.expected_risk, 1e-6)
-        notional = max(0.0, min(symbol_cap, asset_cap, remaining_total_risk, risk_cap, state["cash"]))
+        total_exposure_cap = max(0.0, equity * risk.total_risk_budget_pct / max(signal.expected_risk, 1e-6) - current_gross_exposure - pending_gross_exposure)
+        notional = max(0.0, min(symbol_cap, asset_cap, remaining_total_risk / max(signal.expected_risk, 1e-6), risk_cap, total_exposure_cap, available_cash))
         if notional <= 0:
             return RiskDecision(False, "no_risk_budget", 0, 0.0, 0.0)
         quantity = int(floor(notional / max(signal.current_price, 1e-9)))

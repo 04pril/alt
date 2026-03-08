@@ -110,6 +110,9 @@ class SchedulerSettings:
     loop_sleep_seconds: int = 30
     retry_backoff_seconds: int = 30
     max_retry_count: int = 3
+    job_lease_seconds: int = 180
+    exit_management_interval_minutes: int = 15
+    outcome_resolution_interval_minutes: int = 60
     lock_owner: str = "paper-worker"
 
 

@@ -434,7 +434,25 @@ class KISPaperClient:
 
         holdings = pd.DataFrame(all_rows)
         if holdings.empty:
-            holdings = pd.DataFrame(columns=["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"])
+            holdings = pd.DataFrame(
+                columns=[
+                    "symbol_code",
+                    "종목명",
+                    "보유수량",
+                    "매입평균가",
+                    "현재가",
+                    "평가손익",
+                    "수익률(%)",
+                    "평가금액",
+                    "name",
+                    "quantity",
+                    "avg_price",
+                    "current_price",
+                    "unrealized_pnl",
+                    "return_pct",
+                    "market_value",
+                ]
+            )
         else:
             holdings["symbol_code"] = holdings.get("pdno", "")
             holdings["종목명"] = holdings.get("prdt_name", "")
@@ -444,8 +462,33 @@ class KISPaperClient:
             holdings["평가손익"] = pd.to_numeric(holdings.get("evlu_pfls_amt", 0), errors="coerce")
             holdings["수익률(%)"] = pd.to_numeric(holdings.get("evlu_pfls_rt", 0), errors="coerce")
             holdings["평가금액"] = pd.to_numeric(holdings.get("evlu_amt", 0), errors="coerce")
+            holdings["name"] = holdings["종목명"]
+            holdings["quantity"] = holdings["보유수량"]
+            holdings["avg_price"] = holdings["매입평균가"]
+            holdings["current_price"] = holdings["현재가"]
+            holdings["unrealized_pnl"] = holdings["평가손익"]
+            holdings["return_pct"] = holdings["수익률(%)"]
+            holdings["market_value"] = holdings["평가금액"]
             holdings = holdings.loc[holdings["보유수량"] > 0].reset_index(drop=True)
-            holdings = holdings[["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"]]
+            holdings = holdings[
+                [
+                    "symbol_code",
+                    "종목명",
+                    "보유수량",
+                    "매입평균가",
+                    "현재가",
+                    "평가손익",
+                    "수익률(%)",
+                    "평가금액",
+                    "name",
+                    "quantity",
+                    "avg_price",
+                    "current_price",
+                    "unrealized_pnl",
+                    "return_pct",
+                    "market_value",
+                ]
+            ]
 
         cash = _pick_numeric(summary_raw, ["dnca_tot_amt"])
         stock_eval = _pick_numeric(summary_raw, ["scts_evlu_amt", "evlu_amt_smtl_amt"])

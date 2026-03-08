@@ -5,7 +5,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List
 
@@ -17,12 +17,17 @@ from storage.models import (
     CandidateScanRecord,
     EvaluationRecord,
     FillRecord,
+    JobRunLease,
     OrderRecord,
     OutcomeRecord,
     PositionRecord,
     PredictionRecord,
     SystemEventRecord,
 )
+
+ACTIVE_ORDER_STATUSES = ("new", "submitted", "acknowledged", "pending_fill", "partially_filled")
+ACTIVE_ENTRY_ORDER_STATUSES = ("new", "submitted", "acknowledged", "pending_fill", "partially_filled", "filled")
+TERMINAL_ORDER_STATUSES = ("filled", "rejected", "cancelled")
 
 
 SCHEMA_SQL = """
@@ -248,6 +253,8 @@ CREATE TABLE IF NOT EXISTS job_runs (
     status TEXT NOT NULL,
     retry_count INTEGER NOT NULL DEFAULT 0,
     lock_owner TEXT,
+    next_retry_at TEXT,
+    lease_expires_at TEXT,
     error_message TEXT,
     metrics_json TEXT,
     UNIQUE(job_name, run_key)
@@ -273,11 +280,23 @@ CREATE TABLE IF NOT EXISTS control_flags (
 
 
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:20]}"
+
+
+def parse_utc_timestamp(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 class TradingRepository:
@@ -297,8 +316,32 @@ class TradingRepository:
             conn.close()
 
     def initialize(self) -> None:
-        with self.connect():
-            pass
+        with self.connect() as conn:
+            self._migrate_schema(conn)
+
+    def _column_names(self, conn: sqlite3.Connection, table_name: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+        return {str(row["name"]) for row in rows}
+
+    def _migrate_schema(self, conn: sqlite3.Connection) -> None:
+        job_run_columns = self._column_names(conn, "job_runs")
+        if "next_retry_at" not in job_run_columns:
+            conn.execute("ALTER TABLE job_runs ADD COLUMN next_retry_at TEXT")
+        if "lease_expires_at" not in job_run_columns:
+            conn.execute("ALTER TABLE job_runs ADD COLUMN lease_expires_at TEXT")
+
+    def initialize_runtime_flags(self, defaults: Dict[str, tuple[str, str]]) -> None:
+        rows = [(name, value, utc_now_iso(), notes) for name, (value, notes) in defaults.items()]
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO control_flags(flag_name, flag_value, updated_at, notes)
+                VALUES(?, ?, ?, ?)
+                """,
+                rows,
+            )
 
     def set_control_flag(self, flag_name: str, flag_value: str, notes: str = "") -> None:
         with self.connect() as conn:
@@ -342,38 +385,142 @@ class TradingRepository:
             )
         )
 
-    def begin_job_run(self, job_name: str, run_key: str, scheduled_at: str, lock_owner: str) -> str | None:
+    def get_job_run(self, job_run_id: str) -> Dict[str, Any] | None:
         with self.connect() as conn:
-            existing = conn.execute(
-                "SELECT job_run_id, status FROM job_runs WHERE job_name = ? AND run_key = ?",
+            row = conn.execute("SELECT * FROM job_runs WHERE job_run_id = ?", (job_run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def get_job_run_by_key(self, job_name: str, run_key: str) -> Dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT rowid, * FROM job_runs WHERE job_name = ? AND run_key = ?",
                 (job_name, run_key),
             ).fetchone()
-            if existing and str(existing["status"]) in {"running", "completed"}:
-                return None
-            job_run_id = str(existing["job_run_id"]) if existing else make_id("job")
-            conn.execute(
-                """
-                INSERT INTO job_runs(job_run_id, job_name, run_key, scheduled_at, started_at, status, retry_count, lock_owner, error_message, metrics_json)
-                VALUES(?, ?, ?, ?, ?, 'running', 0, ?, '', '{}')
-                ON CONFLICT(job_name, run_key) DO UPDATE SET
-                    started_at=excluded.started_at,
-                    status='running',
-                    lock_owner=excluded.lock_owner,
-                    error_message=''
-                """,
-                (job_run_id, job_name, run_key, scheduled_at, utc_now_iso(), lock_owner),
-            )
-        return job_run_id
+        return dict(row) if row else None
 
-    def finish_job_run(self, job_run_id: str, status: str, error_message: str = "", metrics: Dict[str, Any] | None = None) -> None:
+    def begin_job_run(
+        self,
+        job_name: str,
+        run_key: str,
+        scheduled_at: str,
+        lock_owner: str,
+        *,
+        retry_backoff_seconds: int = 30,
+        max_retry_count: int = 3,
+        lease_seconds: int = 180,
+    ) -> JobRunLease:
+        now_iso = utc_now_iso()
+        now_dt = parse_utc_timestamp(now_iso) or datetime.now(timezone.utc)
+        lease_expires_at = (now_dt + timedelta(seconds=max(int(lease_seconds), 30))).isoformat().replace("+00:00", "Z")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT rowid, * FROM job_runs WHERE job_name = ? AND run_key = ?",
+                (job_name, run_key),
+            ).fetchone()
+            if existing:
+                existing_status = str(existing["status"] or "")
+                existing_retry_count = int(existing["retry_count"] or 0)
+                next_retry_at = parse_utc_timestamp(existing["next_retry_at"])
+                lease_dt = parse_utc_timestamp(existing["lease_expires_at"])
+                canonical_id = str(existing["job_run_id"])
+                if existing_status == "completed":
+                    return JobRunLease(canonical_id, False, existing_status, existing_retry_count)
+                if existing_status == "running" and lease_dt is not None and lease_dt > now_dt:
+                    return JobRunLease(canonical_id, False, existing_status, existing_retry_count)
+                if existing_status == "failed":
+                    if existing_retry_count >= max(int(max_retry_count), 0) and next_retry_at is None:
+                        return JobRunLease(canonical_id, False, existing_status, existing_retry_count)
+                    if next_retry_at is not None and next_retry_at > now_dt:
+                        return JobRunLease(canonical_id, False, existing_status, existing_retry_count)
+                next_retry_count = existing_retry_count + (1 if existing_status == "failed" else 0)
+                conn.execute(
+                    """
+                    UPDATE job_runs
+                    SET started_at = ?,
+                        finished_at = NULL,
+                        scheduled_at = ?,
+                        status = 'running',
+                        retry_count = ?,
+                        lock_owner = ?,
+                        next_retry_at = NULL,
+                        lease_expires_at = ?,
+                        error_message = ''
+                    WHERE job_run_id = ?
+                    """,
+                    (now_iso, scheduled_at, next_retry_count, lock_owner, lease_expires_at, canonical_id),
+                )
+            else:
+                canonical_id = make_id("job")
+                conn.execute(
+                    """
+                    INSERT INTO job_runs(
+                        job_run_id, job_name, run_key, scheduled_at, started_at, finished_at,
+                        status, retry_count, lock_owner, next_retry_at, lease_expires_at, error_message, metrics_json
+                    ) VALUES(?, ?, ?, ?, ?, NULL, 'running', 0, ?, NULL, ?, '', '{}')
+                    """,
+                    (canonical_id, job_name, run_key, scheduled_at, now_iso, lock_owner, lease_expires_at),
+                )
+                next_retry_count = 0
+            row = conn.execute(
+                "SELECT * FROM job_runs WHERE job_name = ? AND run_key = ?",
+                (job_name, run_key),
+            ).fetchone()
+        canonical = dict(row) if row else {"job_run_id": canonical_id, "status": "running", "retry_count": next_retry_count}
+        return JobRunLease(
+            job_run_id=str(canonical["job_run_id"]),
+            acquired=True,
+            status=str(canonical["status"]),
+            retry_count=int(canonical.get("retry_count") or 0),
+        )
+
+    def refresh_job_lease(self, job_run_id: str, lease_seconds: int) -> None:
+        lease_dt = datetime.now(timezone.utc) + timedelta(seconds=max(int(lease_seconds), 30))
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE job_runs
-                SET finished_at = ?, status = ?, error_message = ?, metrics_json = ?
+                SET lease_expires_at = ?
+                WHERE job_run_id = ? AND status = 'running'
+                """,
+                (lease_dt.isoformat().replace("+00:00", "Z"), job_run_id),
+            )
+
+    def finish_job_run(
+        self,
+        job_run_id: str,
+        status: str,
+        error_message: str = "",
+        metrics: Dict[str, Any] | None = None,
+        *,
+        retry_backoff_seconds: int = 30,
+        max_retry_count: int = 3,
+    ) -> None:
+        finished_at = utc_now_iso()
+        finished_dt = parse_utc_timestamp(finished_at) or datetime.now(timezone.utc)
+        with self.connect() as conn:
+            row = conn.execute("SELECT retry_count FROM job_runs WHERE job_run_id = ?", (job_run_id,)).fetchone()
+            if not row:
+                return
+            retry_count = int(row["retry_count"] or 0)
+            next_retry_at = None
+            if status == "failed" and retry_count < max(int(max_retry_count), 0):
+                delay_seconds = max(int(retry_backoff_seconds), 1) * (retry_count + 1)
+                next_retry_at = (finished_dt + timedelta(seconds=delay_seconds)).isoformat().replace("+00:00", "Z")
+            conn.execute(
+                """
+                UPDATE job_runs
+                SET finished_at = ?, status = ?, error_message = ?, metrics_json = ?, next_retry_at = ?, lease_expires_at = NULL
                 WHERE job_run_id = ?
                 """,
-                (utc_now_iso(), status, error_message, json.dumps(metrics or {}, ensure_ascii=False), job_run_id),
+                (
+                    finished_at,
+                    status,
+                    error_message,
+                    json.dumps(metrics or {}, ensure_ascii=False),
+                    next_retry_at,
+                    job_run_id,
+                ),
             )
 
     def record_model_version(
@@ -567,7 +714,7 @@ class TradingRepository:
         query = "SELECT * FROM candidate_scans"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY created_at DESC, rank ASC LIMIT ?"
+        query += " ORDER BY created_at DESC, rowid DESC, rank ASC LIMIT ?"
         params.append(int(limit))
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
@@ -596,11 +743,12 @@ class TradingRepository:
         status: str,
         filled_qty: int | None = None,
         remaining_qty: int | None = None,
+        broker_order_id: str | None = None,
         error_message: str = "",
         raw_json: Dict[str, Any] | None = None,
     ) -> None:
         with self.connect() as conn:
-            row = conn.execute("SELECT filled_qty, remaining_qty, raw_json FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+            row = conn.execute("SELECT filled_qty, remaining_qty, broker_order_id, raw_json FROM orders WHERE order_id = ?", (order_id,)).fetchone()
             if not row:
                 return
             payload = json.loads(str(row["raw_json"] or "{}"))
@@ -609,7 +757,7 @@ class TradingRepository:
             conn.execute(
                 """
                 UPDATE orders
-                SET updated_at = ?, status = ?, filled_qty = ?, remaining_qty = ?, error_message = ?, raw_json = ?
+                SET updated_at = ?, status = ?, filled_qty = ?, remaining_qty = ?, broker_order_id = ?, error_message = ?, raw_json = ?
                 WHERE order_id = ?
                 """,
                 (
@@ -617,18 +765,54 @@ class TradingRepository:
                     status,
                     int(filled_qty if filled_qty is not None else row["filled_qty"]),
                     int(remaining_qty if remaining_qty is not None else row["remaining_qty"]),
+                    str(broker_order_id if broker_order_id is not None else row["broker_order_id"] or ""),
                     error_message,
                     json.dumps(payload, ensure_ascii=False),
                     order_id,
                 ),
             )
 
-    def open_orders(self) -> pd.DataFrame:
+    def get_order(self, order_id: str) -> Dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+        return dict(row) if row else None
+
+    def open_orders(self, statuses: Iterable[str] | None = None) -> pd.DataFrame:
+        statuses = tuple(statuses or ACTIVE_ORDER_STATUSES)
+        placeholders = ", ".join("?" for _ in statuses)
         with self.connect() as conn:
             return pd.read_sql_query(
-                "SELECT * FROM orders WHERE status IN ('new', 'partially_filled') ORDER BY created_at ASC",
+                f"SELECT rowid, * FROM orders WHERE status IN ({placeholders}) ORDER BY created_at ASC, rowid ASC",
                 conn,
+                params=list(statuses),
             )
+
+    def active_entry_orders(
+        self,
+        *,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        asset_type: str | None = None,
+        active_only: bool = True,
+    ) -> pd.DataFrame:
+        clauses = ["reason = 'entry'"]
+        if active_only:
+            clauses.append(f"status IN ({', '.join(repr(status) for status in ACTIVE_ORDER_STATUSES)})")
+        else:
+            clauses.append("status NOT IN ('rejected', 'cancelled')")
+        params: List[Any] = []
+        if symbol:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if timeframe:
+            clauses.append("timeframe = ?")
+            params.append(timeframe)
+        if asset_type:
+            clauses.append("asset_type = ?")
+            params.append(asset_type)
+        query = "SELECT rowid, * FROM orders WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, rowid ASC"
+        with self.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
 
     def insert_fill(self, record: FillRecord) -> None:
         with self.connect() as conn:
@@ -678,7 +862,7 @@ class TradingRepository:
     def open_positions(self) -> pd.DataFrame:
         with self.connect() as conn:
             return pd.read_sql_query(
-                "SELECT * FROM positions WHERE status = 'open' ORDER BY created_at ASC",
+                "SELECT rowid, * FROM positions WHERE status = 'open' ORDER BY created_at ASC, rowid ASC",
                 conn,
             )
 
@@ -689,7 +873,7 @@ class TradingRepository:
                 SELECT *
                 FROM positions
                 WHERE symbol = ? AND timeframe = ?
-                ORDER BY updated_at DESC
+                ORDER BY updated_at DESC, rowid DESC
                 LIMIT 1
                 """,
                 conn,
@@ -703,7 +887,7 @@ class TradingRepository:
                 SELECT cooldown_until
                 FROM positions
                 WHERE symbol = ? AND timeframe = ?
-                ORDER BY updated_at DESC
+                ORDER BY updated_at DESC, rowid DESC
                 LIMIT 1
                 """,
                 (symbol, timeframe),
@@ -729,13 +913,13 @@ class TradingRepository:
 
     def latest_account_snapshot(self) -> Dict[str, Any] | None:
         with self.connect() as conn:
-            row = conn.execute("SELECT * FROM account_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+            row = conn.execute("SELECT rowid, * FROM account_snapshots ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
         return dict(row) if row else None
 
     def load_account_snapshots(self, limit: int = 500) -> pd.DataFrame:
         with self.connect() as conn:
             return pd.read_sql_query(
-                "SELECT * FROM account_snapshots ORDER BY created_at DESC LIMIT ?",
+                "SELECT rowid, * FROM account_snapshots ORDER BY created_at DESC, rowid DESC LIMIT ?",
                 conn,
                 params=[int(limit)],
             )
@@ -747,12 +931,22 @@ class TradingRepository:
                 SELECT COUNT(*) AS cnt
                 FROM orders
                 WHERE substr(created_at, 1, 10) = ?
-                  AND side IN ('buy', 'sell')
-                  AND status IN ('new', 'partially_filled', 'filled')
+                  AND reason = 'entry'
+                  AND status NOT IN ('rejected', 'cancelled')
                 """,
                 (created_date,),
             ).fetchone()
         return int(row["cnt"]) if row else 0
+
+    def total_realized_pnl(self) -> float:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0.0) AS pnl FROM positions").fetchone()
+        return float(row["pnl"]) if row else 0.0
+
+    def max_account_equity(self) -> float:
+        with self.connect() as conn:
+            row = conn.execute("SELECT COALESCE(MAX(equity), 0.0) AS peak FROM account_snapshots").fetchone()
+        return float(row["peak"]) if row else 0.0
 
     def recent_closed_realized_pnl(self, created_date: str) -> float:
         with self.connect() as conn:
@@ -772,8 +966,14 @@ class TradingRepository:
         with self.connect() as conn:
             unresolved = conn.execute("SELECT COUNT(*) AS cnt FROM predictions WHERE status = 'unresolved'").fetchone()
             open_positions = conn.execute("SELECT COUNT(*) AS cnt FROM positions WHERE status = 'open'").fetchone()
-            open_orders = conn.execute("SELECT COUNT(*) AS cnt FROM orders WHERE status IN ('new', 'partially_filled')").fetchone()
-            latest_account = conn.execute("SELECT * FROM account_snapshots ORDER BY created_at DESC LIMIT 1").fetchone()
+            placeholders = ", ".join("?" for _ in ACTIVE_ORDER_STATUSES)
+            open_orders = conn.execute(
+                f"SELECT COUNT(*) AS cnt FROM orders WHERE status IN ({placeholders})",
+                list(ACTIVE_ORDER_STATUSES),
+            ).fetchone()
+            latest_account = conn.execute(
+                "SELECT rowid, * FROM account_snapshots ORDER BY created_at DESC, rowid DESC LIMIT 1"
+            ).fetchone()
         return {
             "unresolved_predictions": int(unresolved["cnt"]) if unresolved else 0,
             "open_positions": int(open_positions["cnt"]) if open_positions else 0,
@@ -787,7 +987,7 @@ class TradingRepository:
                 """
                 SELECT *
                 FROM job_runs
-                ORDER BY COALESCE(finished_at, started_at, scheduled_at) DESC
+                ORDER BY COALESCE(finished_at, started_at, scheduled_at) DESC, rowid DESC
                 LIMIT ?
                 """,
                 conn,
@@ -799,6 +999,7 @@ class TradingRepository:
             row = conn.execute(
                 """
                 SELECT
+                    rowid,
                     job_run_id,
                     job_name,
                     status,
@@ -807,7 +1008,7 @@ class TradingRepository:
                     finished_at,
                     COALESCE(finished_at, started_at, scheduled_at) AS heartbeat_at
                 FROM job_runs
-                ORDER BY COALESCE(finished_at, started_at, scheduled_at) DESC
+                ORDER BY COALESCE(finished_at, started_at, scheduled_at) DESC, rowid DESC
                 LIMIT 1
                 """
             ).fetchone()
@@ -819,7 +1020,7 @@ class TradingRepository:
         if level:
             query += " WHERE level = ?"
             params.append(level)
-        query += " ORDER BY created_at DESC LIMIT ?"
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
         params.append(int(limit))
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
@@ -844,7 +1045,7 @@ class TradingRepository:
                 FROM predictions p
                 LEFT JOIN outcomes o ON o.prediction_id = p.prediction_id
                 LEFT JOIN evaluations e ON e.prediction_id = p.prediction_id
-                ORDER BY p.created_at DESC
+                ORDER BY p.created_at DESC, p.rowid DESC
                 LIMIT ?
                 """,
                 conn,
@@ -858,14 +1059,14 @@ class TradingRepository:
                 SELECT *
                 FROM predictions
                 WHERE scan_id = ?
-                ORDER BY created_at DESC, forecast_horizon_bars ASC
+                ORDER BY created_at DESC, rowid DESC, forecast_horizon_bars ASC
                 """,
                 conn,
                 params=[scan_id],
             )
 
     def trade_performance_report(self) -> Dict[str, float]:
-        equity = self.load_account_snapshots(limit=1000)
+        equity = self.load_account_snapshots(limit=2000)
         if equity.empty:
             return {"samples": 0.0, "total_return_pct": np.nan, "max_drawdown_pct": np.nan, "today_pnl": 0.0}
         equity = equity.sort_values("created_at")

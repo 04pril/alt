@@ -90,7 +90,11 @@ class UniverseScanner:
                     volatility=float(metrics.get("volatility", np.nan)),
                 )
                 latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe)
-                is_holding = int(not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
+                pending_entry = self.repository.active_entry_orders(symbol=symbol, timeframe=schedule.timeframe, asset_type=asset_type)
+                is_holding = int(
+                    (not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
+                    or not pending_entry.empty
+                )
                 cooldown_until = self.repository.latest_cooldown_until(symbol=symbol, timeframe=schedule.timeframe)
                 candidates.append(
                     CandidateScanRecord(

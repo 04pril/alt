@@ -30,21 +30,38 @@ def _bucket_key(dt: datetime, minutes: int) -> str:
 
 
 def _run_guarded(context, job_name: str, run_key: str, fn):
-    job_run_id = context.repository.begin_job_run(
+    lease = context.repository.begin_job_run(
         job_name=job_name,
         run_key=run_key,
         scheduled_at=_utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         lock_owner=context.settings.scheduler.lock_owner,
+        retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+        max_retry_count=context.settings.scheduler.max_retry_count,
+        lease_seconds=context.settings.scheduler.job_lease_seconds,
     )
-    if job_run_id is None:
+    if not lease.acquired:
         return None
     try:
+        context.repository.refresh_job_lease(lease.job_run_id, context.settings.scheduler.job_lease_seconds)
         result = fn()
     except Exception as exc:  # pragma: no cover - exercised in runtime
-        context.repository.finish_job_run(job_run_id, status="failed", error_message=str(exc), metrics={})
+        context.repository.finish_job_run(
+            lease.job_run_id,
+            status="failed",
+            error_message=str(exc),
+            metrics={},
+            retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+            max_retry_count=context.settings.scheduler.max_retry_count,
+        )
         context.repository.log_event("ERROR", "scheduler", "job_failed", f"{job_name} failed", {"error": str(exc)})
         return None
-    context.repository.finish_job_run(job_run_id, status="completed", metrics=result if isinstance(result, dict) else {})
+    context.repository.finish_job_run(
+        lease.job_run_id,
+        status="completed",
+        metrics=result if isinstance(result, dict) else {},
+        retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+        max_retry_count=context.settings.scheduler.max_retry_count,
+    )
     return result
 
 
@@ -69,13 +86,13 @@ def run_once(settings_path: str | None = None) -> None:
     _run_guarded(
         context,
         job_name="exit_management",
-        run_key=_bucket_key(_utc_now(), 15),
+        run_key=_bucket_key(_utc_now(), settings.scheduler.exit_management_interval_minutes),
         fn=lambda: exit_management_job(context),
     )
     _run_guarded(
         context,
         job_name="outcome_resolution",
-        run_key=_bucket_key(_utc_now(), 60),
+        run_key=_bucket_key(_utc_now(), settings.scheduler.outcome_resolution_interval_minutes),
         fn=lambda: outcome_resolution_job(context),
     )
     _run_guarded(

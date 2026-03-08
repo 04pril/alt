@@ -7,13 +7,12 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from services.market_data_service import MarketDataService
-from services.paper_broker import PaperBroker
 from storage.models import PositionRecord
 from storage.repository import TradingRepository, utc_now_iso
 
 
 class PortfolioManager:
-    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker: PaperBroker):
+    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker):
         self.settings = settings
         self.repository = repository
         self.broker = broker
@@ -55,7 +54,7 @@ class PortfolioManager:
                         "lowest_price": low,
                         "trailing_stop": trailing if np.isfinite(trailing) else float(position["trailing_stop"]),
                         "unrealized_pnl": unrealized,
-                        "exposure_value": abs(mark * qty),
+                        "exposure_value": mark * qty if side == "LONG" else -(mark * qty),
                         "notes": "mtm_update",
                     }
                 )
@@ -65,9 +64,18 @@ class PortfolioManager:
     def evaluate_exit_orders(self, market_data_service: MarketDataService) -> int:
         exit_orders = 0
         positions = self.repository.open_positions()
+        active_exit_orders = self.repository.open_orders(statuses=("new", "submitted", "acknowledged", "pending_fill", "partially_filled"))
         latest_candidates = self.repository.latest_candidates(limit=500)
         latest_candidates = latest_candidates.sort_values("created_at").drop_duplicates(subset=["symbol", "timeframe"], keep="last")
         for _, position in positions.iterrows():
+            if not active_exit_orders.empty:
+                duplicated = active_exit_orders[
+                    (active_exit_orders["reason"].astype(str) != "entry")
+                    & (active_exit_orders["symbol"].astype(str) == str(position["symbol"]))
+                    & (active_exit_orders["timeframe"].astype(str) == str(position["timeframe"]))
+                ]
+                if not duplicated.empty:
+                    continue
             try:
                 quote = market_data_service.latest_quote(
                     symbol=str(position["symbol"]),
@@ -104,7 +112,7 @@ class PortfolioManager:
                     max_holding_until = max_holding_until.tz_localize("UTC")
                 else:
                     max_holding_until = max_holding_until.tz_convert("UTC")
-                if pd.Timestamp.utcnow().tz_localize("UTC") >= max_holding_until:
+                if pd.Timestamp.now(tz="UTC") >= max_holding_until:
                     reason = "time_stop"
 
             if not reason and not latest_candidates.empty:

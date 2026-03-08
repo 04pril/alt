@@ -4,7 +4,7 @@ from typing import Dict, List
 
 from config.settings import RuntimeSettings
 from predictor import MODEL_NAME, MODEL_VERSION, FEATURE_VERSION, run_forecast
-from storage.repository import TradingRepository, make_id, utc_now_iso
+from storage.repository import TradingRepository, make_id, parse_utc_timestamp, utc_now_iso
 
 
 class Retrainer:
@@ -13,7 +13,9 @@ class Retrainer:
         self.repository = repository
 
     def retraining_due(self) -> bool:
-        cadence = self.settings.retraining.cadence
+        cadence = str(self.settings.retraining.cadence or "weekly").lower().strip()
+        if cadence == "disabled":
+            return False
         recent = self.repository.recent_job_health(limit=100)
         recent = recent[recent["job_name"] == "retrain_check"] if not recent.empty else recent
         if recent.empty:
@@ -22,12 +24,18 @@ class Retrainer:
         last_started = str(last.get("started_at") or "")
         if not last_started:
             return True
-        delta = utc_now_iso()[:10]
+        last_started_at = utc_now_iso()
+        last_dt = parse_utc_timestamp(last_started)
+        now_dt = parse_utc_timestamp(last_started_at)
+        if last_dt is None or now_dt is None:
+            return True
         if cadence == "weekly":
-            return last_started[:10] != delta
+            return last_dt.isocalendar()[:2] != now_dt.isocalendar()[:2]
+        if cadence == "daily":
+            return last_dt.date() != now_dt.date()
         if cadence == "monthly":
-            return last_started[:7] != delta[:7]
-        return False
+            return (last_dt.year, last_dt.month) != (now_dt.year, now_dt.month)
+        return True
 
     def run(self) -> Dict[str, float | str]:
         metrics: List[Dict[str, float]] = []
