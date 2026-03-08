@@ -5,7 +5,13 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from config.settings import RuntimeSettings
-from monitoring.dashboard_hooks import build_asset_overview, compute_auto_trading_status, load_dashboard_data
+from monitoring.dashboard_hooks import (
+    build_asset_overview,
+    build_broker_sync_read_model,
+    compute_auto_trading_status,
+    load_dashboard_data,
+    set_trading_pause_state,
+)
 from storage.repository import TradingRepository
 
 
@@ -46,6 +52,7 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("asset_overview", data)
             self.assertIn("broker_sync_status", data)
             self.assertIn("broker_sync_errors", data)
+            self.assertEqual(set(data["broker_sync_status"].keys()), {"broker_account_sync", "broker_order_sync", "broker_position_sync"})
 
     def test_dashboard_reader_exposes_broker_sync_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -81,6 +88,75 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("broker_order_sync", data["broker_sync_status"])
             self.assertEqual(data["broker_sync_status"]["broker_order_sync"]["status"], "completed")
             self.assertFalse(data["broker_sync_errors"].empty)
+
+    def test_build_broker_sync_read_model_covers_expected_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = TradingRepository(f"{tmp}/runtime.sqlite3")
+            repo.initialize()
+            with repo.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO job_runs(
+                        job_run_id, job_name, run_key, scheduled_at, started_at, finished_at,
+                        status, retry_count, lock_owner, error_message, metrics_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "job_account_sync",
+                        "broker_account_sync",
+                        "2026-03-09T10:00",
+                        "2026-03-09T10:00:00.000000Z",
+                        "2026-03-09T10:00:01.000000Z",
+                        "2026-03-09T10:00:05.000000Z",
+                        "completed",
+                        0,
+                        "worker",
+                        "",
+                        "{}",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO job_runs(
+                        job_run_id, job_name, run_key, scheduled_at, started_at, finished_at,
+                        status, retry_count, lock_owner, error_message, metrics_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "job_position_sync",
+                        "broker_position_sync",
+                        "2026-03-09T09:00",
+                        "2026-03-09T09:00:00.000000Z",
+                        "2026-03-09T09:00:01.000000Z",
+                        "2026-03-09T09:00:02.000000Z",
+                        "failed",
+                        1,
+                        "worker",
+                        "sync failed",
+                        "{}",
+                    ),
+                )
+            repo.log_event("ERROR", "broker_sync", "broker_position_sync_failed", "broker_position_sync failed", {"error": "boom"})
+
+            status, errors = build_broker_sync_read_model(repo.recent_job_health(limit=20), repo.recent_system_events(limit=20))
+
+            self.assertEqual(status["broker_account_sync"]["status"], "completed")
+            self.assertEqual(status["broker_position_sync"]["status"], "failed")
+            self.assertEqual(status["broker_order_sync"]["status"], "never")
+            self.assertFalse(errors.empty)
+
+    def test_set_trading_pause_state_updates_repository_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+
+            set_trading_pause_state(settings, paused=True, notes="pause test")
+            self.assertEqual(repo.get_control_flag("trading_paused", "0"), "1")
+
+            set_trading_pause_state(settings, paused=False, notes="resume test")
+            self.assertEqual(repo.get_control_flag("trading_paused", "1"), "0")
 
     def test_asset_overview_contains_all_asset_types(self) -> None:
         settings = RuntimeSettings()

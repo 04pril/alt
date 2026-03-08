@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from typing import Any, Dict, Tuple
 
 import numpy as np
@@ -15,30 +16,58 @@ from services.paper_broker import PaperBroker
 from storage.repository import TradingRepository
 
 
-def _build_router(settings: RuntimeSettings) -> tuple[TradingRepository, BrokerRouter]:
+@dataclass(frozen=True)
+class ManualKISRuntime:
+    settings: RuntimeSettings
+    repository: TradingRepository
+    router: BrokerRouter
+
+
+def _open_repository(settings: RuntimeSettings) -> TradingRepository:
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
+    return repository
+
+
+def _build_router(settings: RuntimeSettings, repository: TradingRepository) -> BrokerRouter:
     sim_broker = PaperBroker(settings, repository)
     kis_broker = KISPaperBroker(settings, repository, sim_broker)
     router = BrokerRouter(sim_broker=sim_broker, kis_broker=kis_broker)
     router.ensure_account_initialized()
-    return repository, router
+    return router
+
+
+def _build_manual_runtime(settings_path: str | None = None) -> ManualKISRuntime:
+    settings = load_settings(settings_path)
+    repository = _open_repository(settings)
+    return ManualKISRuntime(
+        settings=settings,
+        repository=repository,
+        router=_build_router(settings, repository),
+    )
+
+
+def _load_client(settings_path: str | None = None) -> KISPaperClient:
+    _ = load_settings(settings_path)
+    return KISPaperClient()
+
+
+def _attach_prediction_order_link(prediction_id: str | None, order_id: str) -> None:
+    if prediction_id:
+        attach_order_to_prediction(prediction_id=prediction_id, order_id=order_id)
 
 
 def load_kis_config(settings_path: str | None = None):
-    _ = load_settings(settings_path)
-    return KISPaperClient().config
+    return _load_client(settings_path).config
 
 
 def load_kis_account_snapshot(settings_path: str | None = None) -> Tuple[Dict[str, Any], pd.DataFrame]:
-    _ = load_settings(settings_path)
-    snapshot = KISPaperClient().get_account_snapshot()
+    snapshot = _load_client(settings_path).get_account_snapshot()
     return dict(snapshot.summary), snapshot.holdings.copy()
 
 
 def load_kis_quote(symbol: str, settings_path: str | None = None) -> Dict[str, Any]:
-    _ = load_settings(settings_path)
-    return KISPaperClient().get_quote(symbol)
+    return _load_client(settings_path).get_quote(symbol)
 
 
 def submit_manual_kis_order(
@@ -52,9 +81,8 @@ def submit_manual_kis_order(
     settings_path: str | None = None,
     metadata: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    settings = load_settings(settings_path)
-    repository, router = _build_router(settings)
-    order_id = router.submit_manual_kis_order(
+    runtime = _build_manual_runtime(settings_path)
+    order_id = runtime.router.submit_manual_kis_order(
         symbol=symbol,
         asset_type="한국주식",
         timeframe="1d",
@@ -67,9 +95,8 @@ def submit_manual_kis_order(
         reason="manual_entry" if side == "buy" else "manual_exit",
         raw_metadata=metadata or {},
     )
-    order = repository.get_order(order_id) or {}
-    if prediction_id:
-        attach_order_to_prediction(prediction_id=prediction_id, order_id=str(order_id))
+    order = runtime.repository.get_order(order_id) or {}
+    _attach_prediction_order_link(prediction_id, str(order_id))
     return {
         "order_id": order_id,
         "broker_order_id": str(order.get("broker_order_id") or ""),
@@ -79,9 +106,7 @@ def submit_manual_kis_order(
 
 
 def load_manual_order_history(limit: int = 200, settings_path: str | None = None) -> pd.DataFrame:
-    settings = load_settings(settings_path)
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
+    repository = _open_repository(load_settings(settings_path))
     frame = repository.recent_orders(limit=limit)
     if frame.empty:
         return frame
@@ -102,9 +127,7 @@ def load_manual_order_history(limit: int = 200, settings_path: str | None = None
 
 
 def load_manual_equity_curve(limit: int = 500, settings_path: str | None = None) -> pd.DataFrame:
-    settings = load_settings(settings_path)
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
+    repository = _open_repository(load_settings(settings_path))
     frame = repository.load_account_snapshots(limit=limit)
     if frame.empty:
         return frame
@@ -112,9 +135,7 @@ def load_manual_equity_curve(limit: int = 500, settings_path: str | None = None)
 
 
 def compute_manual_equity_metrics(settings_path: str | None = None) -> Dict[str, float]:
-    settings = load_settings(settings_path)
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
+    repository = _open_repository(load_settings(settings_path))
     trade_metrics = repository.trade_performance_report()
     curve = repository.load_account_snapshots(limit=2000)
     latest_equity = float(curve.sort_values("created_at").iloc[-1]["equity"]) if not curve.empty else float("nan")

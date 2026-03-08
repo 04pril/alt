@@ -415,7 +415,9 @@ class PaperBroker:
         self.snapshot_account(cash_override=cash_value)
         return filled_count
 
-    def snapshot_account(self, cash_override: float | None = None) -> None:
+    def snapshot_account(self, cash_override: float | None = None, touch=None) -> None:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("sim_account_snapshot_start", {"source": "paper_broker"})
         account = self._latest_account()
         open_positions = self.repository.open_positions()
         open_orders = self.repository.open_orders()
@@ -438,6 +440,16 @@ class PaperBroker:
         drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
         today = str(pd.Timestamp.utcnow().date())
         daily_pnl = self.repository.recent_closed_realized_pnl(today)
+        touch(
+            "sim_account_snapshot_metrics",
+            {
+                "equity": float(equity),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+                "open_positions": int(len(open_positions)),
+                "open_orders": int(len(open_orders)),
+            },
+        )
         self.repository.insert_account_snapshot(
             AccountSnapshotRecord(
                 snapshot_id=make_id("snap"),
@@ -457,3 +469,4 @@ class PaperBroker:
                 raw_json="{}",
             )
         )
+        touch("sim_account_snapshot_inserted", {"source": "paper_broker"})

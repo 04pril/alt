@@ -69,13 +69,24 @@ class BrokerRouter:
             raw_metadata=raw_metadata,
         )
 
-    def sync_account(self) -> dict[str, Any]:
-        self.sim_broker.snapshot_account()
+    def sync_account(self, touch=None) -> dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("broker_account_sync_start", {"broker": "router"})
+        self.sim_broker.snapshot_account(
+            touch=lambda stage=None, details=None: touch(stage or "sim_account_snapshot", details),
+        )
         payload: dict[str, Any] = {"sim_snapshot_written": 1}
         if self.kis_broker is not None and self.kis_broker.is_enabled():
-            payload["kis"] = self.kis_broker.sync_account()
+            touch("broker_account_sync_kis", {"broker": "kis_mock"})
+            payload["kis"] = self.kis_broker.sync_account(
+                touch=lambda stage=None, details=None: touch(stage or "kis_account_sync", details),
+            )
         else:
             payload["kis"] = {"broker": "kis_mock", "enabled": False}
+        touch(
+            "broker_account_sync_complete",
+            {"sim_snapshot_written": payload["sim_snapshot_written"], "kis_enabled": bool(payload["kis"].get("enabled", False))},
+        )
         return payload
 
     def sync_orders(self, market_data_service: Any, touch=None) -> dict[str, int]:

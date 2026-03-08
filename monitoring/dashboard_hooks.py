@@ -49,6 +49,41 @@ def _localize_timestamp_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return localized
 
 
+def _runtime_repository(settings: RuntimeSettings) -> TradingRepository:
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+    return repository
+
+
+def set_trading_pause_state(settings: RuntimeSettings, paused: bool, notes: str = "set from streamlit monitor") -> None:
+    repository = _runtime_repository(settings)
+    repository.set_control_flag("trading_paused", "1" if paused else "0", notes)
+
+
+def build_broker_sync_read_model(
+    job_health: pd.DataFrame,
+    recent_events: pd.DataFrame,
+) -> tuple[Dict[str, Dict[str, Any]], pd.DataFrame]:
+    broker_sync_status: Dict[str, Dict[str, Any]] = {}
+    for job_name in BROKER_SYNC_JOBS:
+        if not job_health.empty and "job_name" in job_health.columns:
+            matched = job_health.loc[job_health["job_name"].astype(str) == job_name]
+            if matched.empty:
+                broker_sync_status[job_name] = {"job_name": job_name, "status": "never", "finished_at": pd.NaT, "error_message": ""}
+                continue
+            row = matched.sort_values(["scheduled_at", "finished_at"], ascending=[False, False]).iloc[0].to_dict()
+            broker_sync_status[job_name] = row
+            continue
+        broker_sync_status[job_name] = {"job_name": job_name, "status": "never", "finished_at": pd.NaT, "error_message": ""}
+    broker_sync_errors = recent_events
+    if not broker_sync_errors.empty:
+        broker_sync_errors = broker_sync_errors[
+            broker_sync_errors["message"].astype(str).str.contains("broker_", case=False, na=False)
+            | broker_sync_errors["event_type"].astype(str).str.contains("broker_", case=False, na=False)
+        ].copy()
+    return broker_sync_status, broker_sync_errors
+
+
 def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for asset_type, schedule in settings.asset_schedules.items():
@@ -137,27 +172,12 @@ def compute_auto_trading_status(
 
 
 def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
+    repository = _runtime_repository(settings)
     summary = repository.dashboard_counts()
     equity_curve = _localize_timestamp_columns(repository.load_account_snapshots(limit=500))
     job_health = _localize_timestamp_columns(repository.recent_job_health(limit=200))
     recent_events = _localize_timestamp_columns(repository.recent_system_events(limit=100))
-    broker_sync_status: Dict[str, Dict[str, Any]] = {}
-    if not job_health.empty and "job_name" in job_health.columns:
-        for job_name in BROKER_SYNC_JOBS:
-            matched = job_health.loc[job_health["job_name"].astype(str) == job_name]
-            if matched.empty:
-                broker_sync_status[job_name] = {"job_name": job_name, "status": "never", "finished_at": pd.NaT, "error_message": ""}
-                continue
-            row = matched.sort_values("scheduled_at", ascending=False).iloc[0].to_dict()
-            broker_sync_status[job_name] = row
-    broker_sync_errors = recent_events
-    if not broker_sync_errors.empty:
-        broker_sync_errors = broker_sync_errors[
-            broker_sync_errors["message"].astype(str).str.contains("broker_", case=False, na=False)
-            | broker_sync_errors["event_type"].astype(str).str.contains("broker_", case=False, na=False)
-        ].copy()
+    broker_sync_status, broker_sync_errors = build_broker_sync_read_model(job_health, recent_events)
     return {
         "summary": summary,
         "prediction_report": _localize_timestamp_columns(repository.prediction_report(limit=200)),

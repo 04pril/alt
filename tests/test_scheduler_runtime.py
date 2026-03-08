@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from config.settings import RuntimeSettings
 from jobs.scheduler import _run_guarded
+from jobs.tasks import broker_account_sync_job
 from storage.repository import TradingRepository
 
 
@@ -21,7 +22,8 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.settings.scheduler.lock_owner = "test-worker"
         self.repo = TradingRepository(self.settings.storage.db_path)
         self.repo.initialize()
-        self.context = SimpleNamespace(repository=self.repo, settings=self.settings)
+        self.context = SimpleNamespace(repository=self.repo, settings=self.settings, job_touch=lambda *_args, **_kwargs: None)
+        self.context.touch_runtime = lambda stage=None, details=None: self.context.job_touch(stage, details or {})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -116,6 +118,38 @@ class SchedulerRuntimeTest(unittest.TestCase):
 
         result = _run_guarded(self.context, "scan:crypto", "2026-03-08T13:00", long_job)
         self.assertEqual(result, {"ok": True})
+        self.assertNotEqual(observed["heartbeat_1"], "")
+        self.assertNotEqual(observed["heartbeat_2"], "")
+        self.assertNotEqual(observed["lease_1"], observed["lease_2"])
+        self.assertNotEqual(observed["heartbeat_1"], observed["heartbeat_2"])
+
+    def test_broker_account_sync_job_refreshes_heartbeat_during_sync(self) -> None:
+        observed: dict[str, str] = {}
+        self_ref = self
+
+        class _SlowBroker:
+            def sync_account(self, touch=None):
+                touch = touch or (lambda *args, **kwargs: None)
+                touch("account_phase_1", {"step": 1})
+                first_row = self_ref.repo.get_job_run_by_key("broker_account_sync", "2026-03-08T14:00")
+                observed["lease_1"] = str(first_row["lease_expires_at"])
+                observed["heartbeat_1"] = self_ref.repo.get_control_flag("worker_heartbeat_at", "")
+                time.sleep(0.05)
+                touch("account_phase_2", {"step": 2})
+                second_row = self_ref.repo.get_job_run_by_key("broker_account_sync", "2026-03-08T14:00")
+                observed["lease_2"] = str(second_row["lease_expires_at"])
+                observed["heartbeat_2"] = self_ref.repo.get_control_flag("worker_heartbeat_at", "")
+                return {"sim_snapshot_written": 1}
+
+        self.context.paper_broker = _SlowBroker()
+
+        result = _run_guarded(
+            self.context,
+            "broker_account_sync",
+            "2026-03-08T14:00",
+            lambda: broker_account_sync_job(self.context),
+        )
+        self.assertEqual(result, {"sim_snapshot_written": 1})
         self.assertNotEqual(observed["heartbeat_1"], "")
         self.assertNotEqual(observed["heartbeat_2"], "")
         self.assertNotEqual(observed["lease_1"], observed["lease_2"])

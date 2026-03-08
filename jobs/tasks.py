@@ -189,8 +189,9 @@ def broker_order_sync_job(context: TaskContext) -> Dict[str, int]:
 
 
 def broker_account_sync_job(context: TaskContext) -> Dict[str, Any]:
-    context.touch_runtime("broker_account_sync", {})
-    result = context.paper_broker.sync_account()
+    result = context.paper_broker.sync_account(
+        touch=lambda stage=None, details=None: context.touch_runtime(stage or "broker_account_sync", details),
+    )
     context.repository.log_event("INFO", "broker_sync", "broker_account_sync", "broker account sync completed", result)
     return result
 

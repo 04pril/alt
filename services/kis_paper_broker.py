@@ -295,17 +295,22 @@ class KISPaperBroker:
         )
         return order_id
 
-    def sync_account(self) -> Dict[str, Any]:
+    def sync_account(self, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
         if not self.is_enabled():
+            touch("kis_account_sync_skipped", {"enabled": False})
             return {"broker": "kis_mock", "enabled": False, "holding_count": 0}
+        touch("kis_account_sync_request", {"enabled": True})
         snapshot = self._client().get_account_snapshot()
-        return {
+        result = {
             "broker": "kis_mock",
             "enabled": True,
             "cash": float(snapshot.summary.get("cash", 0.0) or 0.0),
             "total_eval": float(snapshot.summary.get("total_eval", 0.0) or 0.0),
             "holding_count": int(snapshot.summary.get("holding_count", 0) or 0),
         }
+        touch("kis_account_sync_snapshot", result)
+        return result
 
     def process_open_orders(self, market_data_service, touch=None) -> int:
         touch = touch or (lambda *args, **kwargs: None)

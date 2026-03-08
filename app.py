@@ -22,7 +22,7 @@ import yfinance as yf
 
 from config.settings import load_settings
 from kis_paper import KISPaperError
-from monitoring.dashboard_hooks import load_dashboard_data
+from monitoring.dashboard_hooks import load_dashboard_data, set_trading_pause_state
 from prediction_memory import (
     filter_prediction_history,
     load_prediction_log,
@@ -42,7 +42,6 @@ from services.manual_kis_service import (
     load_manual_order_history,
     submit_manual_kis_order,
 )
-from storage.repository import TradingRepository
 from top100_universe import (
     KR_NAME_ALIASES,
     KR_MANUAL_SYMBOLS,
@@ -1427,17 +1426,15 @@ def render_prediction_tracking_section(result, asset_type: str, korea_market: st
 
 def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
     settings = settings or load_settings()
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
 
     st.subheader("운영 모니터링")
     st.caption("background worker가 저장한 예측/포지션/잡 상태를 읽기 전용으로 표시합니다.")
     control_cols = st.columns([1.0, 1.0, 1.1, 1.1, 1.1, 2.6])
     if control_cols[0].button("신규 진입 중단", key="ops_pause"):
-        repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
+        set_trading_pause_state(settings, paused=True)
         st.rerun()
     if control_cols[1].button("신규 진입 재개", key="ops_resume"):
-        repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
+        set_trading_pause_state(settings, paused=False)
         st.rerun()
     if control_cols[2].button("계좌 Sync", key="ops_broker_account_sync"):
         ok, message = run_manual_runtime_job("broker_account_sync")
