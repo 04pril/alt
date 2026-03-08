@@ -141,6 +141,21 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertFalse(data["broker_sync_status"].empty)
             self.assertEqual(data["kis_runtime"]["last_broker_order_sync"], "2026-03-09T06:20:00Z")
 
+    def test_dashboard_reader_broker_sync_errors_only_include_error_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.log_event("INFO", "broker_order_sync_job", "broker_order_sync", "broker order sync completed", {})
+            repo.log_event("ERROR", "kis_execution", "rejected", "KIS broker rejected entry", {"reason": "broker_rejected"})
+
+            data = load_dashboard_data(settings)
+
+            self.assertEqual(len(data["broker_sync_errors"]), 1)
+            self.assertEqual(str(data["broker_sync_errors"].iloc[0]["level"]), "ERROR")
+            self.assertEqual(str(data["broker_sync_errors"].iloc[0]["event_type"]), "rejected")
+
 
 if __name__ == "__main__":
     unittest.main()

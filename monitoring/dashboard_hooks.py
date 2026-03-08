@@ -176,9 +176,15 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     today_events = _parse_details(repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=2000))
     execution_summary = _execution_summary(today_events)
     broker_sync_status = _localize_timestamp_columns(_broker_sync_status(job_health))
-    recent_broker_errors = _localize_timestamp_columns(
-        today_events.loc[(today_events["level"].astype(str) == "ERROR") | (today_events["component"].astype(str).str.contains("kis_|execution|broker", na=False))].head(100)
+    broker_error_mask = (
+        (today_events["level"].astype(str) == "ERROR")
+        & (
+            today_events["component"].astype(str).str.contains("kis_|execution|broker", na=False)
+            | today_events["message"].astype(str).str.contains("broker_|KIS|execution", case=False, na=False)
+            | today_events["event_type"].astype(str).isin({"job_failed", "rejected", "cancelled", "expired", *BROKER_SYNC_JOBS})
+        )
     )
+    recent_broker_errors = _localize_timestamp_columns(today_events.loc[broker_error_mask].head(100))
     open_orders = _localize_timestamp_columns(repository.open_orders())
     kis_open_orders = open_orders.loc[
         open_orders["raw_json"].fillna("{}").astype(str).map(lambda value: json.loads(str(value or "{}")).get("broker") == "kis_mock")

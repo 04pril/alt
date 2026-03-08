@@ -14,9 +14,9 @@ The current routing model stays the same:
 
 KR-only routing rule:
 
-- KIS routing is limited to KR symbols (`.KS` / `.KQ`) and bare 6-digit KR stock codes
-- asset-level monitoring may still label `한국주식` as `kis_mock`
-- US equities and crypto stay on the sim broker path even if a broad `...주식` label is passed through by mistake
+- `asset_type` is authoritative for broker routing: `한국주식` uses `KISPaperBroker`, while `미국주식` and `코인` stay on the sim broker path
+- symbol suffix (`.KS` / `.KQ`) and bare 6-digit KR stock codes are only used as a fallback when `asset_type` is blank or ambiguous
+- README policy and `BrokerRouter` behavior now match: KR only goes to KIS, US equities and crypto remain sim-backed
 
 ## Runtime Architecture
 
@@ -74,6 +74,27 @@ Typical reason codes:
 - `no_sellable_qty`
 - `no_quote`
 - `broker_rejected`
+
+## Merge Readiness Notes
+
+Final source-of-truth:
+
+- KR execution paths use `account_snapshots(source="kis_account_sync")` first and only fall back to sim snapshots when no KIS account sync row exists yet.
+- US equities and crypto ignore `kis_account_sync` rows and keep using sim-only snapshots.
+- drawdown peaks are source-aware, so KIS and sim account peaks do not contaminate each other.
+
+An execution only proceeds when all of these line up:
+
+- market phase allows the trade
+- KR daily entries are inside the pre-close gate
+- buying power or sellable quantity check succeeds
+- RiskEngine allows the order
+- broker submit succeeds and later reconcile confirms `acknowledged` / `pending_fill` / `filled`
+
+When a trade does not go out:
+
+- look at `system_events` for `noop`, `entry_rejected`, `submit_requested`, `submitted`, `acknowledged`, `filled`, `rejected`, and `cancelled`
+- the monitoring read model surfaces the same execution counts, noop reason breakdown, and broker sync job status
 - `missing_prediction`
 - `no_candidate`
 - `no_submit`

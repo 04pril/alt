@@ -8,15 +8,33 @@ from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 
 KR_EQUITY_ASSET_TYPE = "한국주식"
+US_EQUITY_ASSET_TYPE = "미국주식"
+CRYPTO_ASSET_TYPE = "코인"
 KR_SYMBOL_SUFFIXES = (".KS", ".KQ")
 
 
-def is_kis_routable_kr_equity(symbol: str = "", asset_type: str = "") -> bool:
-    normalized_symbol = str(symbol).upper().strip()
+def _asset_bucket(asset_type: str = "") -> str:
     normalized_asset_type = str(asset_type).strip()
-    if normalized_symbol:
-        return normalized_symbol.endswith(KR_SYMBOL_SUFFIXES) or (normalized_symbol.isdigit() and len(normalized_symbol) == 6)
-    return normalized_asset_type == KR_EQUITY_ASSET_TYPE
+    if normalized_asset_type == KR_EQUITY_ASSET_TYPE:
+        return "kr"
+    if normalized_asset_type == US_EQUITY_ASSET_TYPE:
+        return "us"
+    if normalized_asset_type == CRYPTO_ASSET_TYPE:
+        return "crypto"
+    return ""
+
+
+def is_kis_routable_kr_equity(symbol: str = "", asset_type: str = "") -> bool:
+    bucket = _asset_bucket(asset_type)
+    if bucket == "kr":
+        return True
+    if bucket in {"us", "crypto"}:
+        return False
+    normalized_symbol = str(symbol).upper().strip()
+    return bool(
+        normalized_symbol
+        and (normalized_symbol.endswith(KR_SYMBOL_SUFFIXES) or (normalized_symbol.isdigit() and len(normalized_symbol) == 6))
+    )
 
 
 def resolve_broker_mode(symbol: str = "", asset_type: str = "", *, kis_enabled: bool) -> str:
