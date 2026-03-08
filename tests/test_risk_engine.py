@@ -86,7 +86,7 @@ class RiskEngineTest(unittest.TestCase):
             engine = RiskEngine(settings, repo)
             decision = engine.evaluate_entry(self._build_signal(), correlation_matrix=pd.DataFrame(), market_is_open=True)
             self.assertFalse(decision.allowed)
-            self.assertEqual(decision.reason, "already_holding_symbol")
+            self.assertEqual(decision.reason, "duplicate_pending_entry")
 
     def test_partially_filled_entry_blocks_until_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -123,7 +123,7 @@ class RiskEngineTest(unittest.TestCase):
             engine = RiskEngine(settings, repo)
             blocked = engine.evaluate_entry(self._build_signal(), correlation_matrix=pd.DataFrame(), market_is_open=True)
             self.assertFalse(blocked.allowed)
-            self.assertEqual(blocked.reason, "already_holding_symbol")
+            self.assertEqual(blocked.reason, "duplicate_pending_entry")
 
             repo.update_order("ord_partial", status="cancelled", filled_qty=1, remaining_qty=1)
             allowed = engine.evaluate_entry(self._build_signal(), correlation_matrix=pd.DataFrame(), market_is_open=True)

@@ -35,10 +35,12 @@ class UniverseScanner:
                 seen.add(symbol)
         return ordered
 
-    def scan_asset(self, asset_type: str) -> List[CandidateScanRecord]:
+    def scan_asset(self, asset_type: str, touch=None) -> List[CandidateScanRecord]:
         schedule = self.settings.asset_schedules[asset_type]
         candidates: List[CandidateScanRecord] = []
         for symbol in self._universe(asset_type):
+            if callable(touch):
+                touch("scan_symbol", {"asset_type": asset_type, "symbol": symbol})
             scan_id = make_id("scan")
             created_at = utc_now_iso()
             try:

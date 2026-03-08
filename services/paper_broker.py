@@ -135,6 +135,19 @@ class PaperBroker:
         self.repository.insert_order(record)
         return order_id
 
+    def submit_entry_order_result(
+        self,
+        signal: SignalDecision,
+        quantity: int,
+        scan_id: str | None = None,
+        *,
+        market_data_service: MarketDataService | None = None,
+    ) -> Dict[str, Any]:
+        order_id = self.submit_entry_order(signal, quantity, scan_id)
+        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim entry submit requested", {"order_id": order_id, "symbol": signal.symbol})
+        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim entry submitted", {"order_id": order_id, "symbol": signal.symbol})
+        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
+
     def submit_exit_order(self, position: pd.Series, reason: str) -> str:
         now_iso = utc_now_iso()
         order_id = make_id("ord")
@@ -171,6 +184,18 @@ class PaperBroker:
         )
         self.repository.insert_order(record)
         return order_id
+
+    def submit_exit_order_result(
+        self,
+        position: pd.Series,
+        reason: str,
+        *,
+        market_data_service: MarketDataService | None = None,
+    ) -> Dict[str, Any]:
+        order_id = self.submit_exit_order(position, reason)
+        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim exit submit requested", {"order_id": order_id, "symbol": str(position["symbol"])})
+        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim exit submitted", {"order_id": order_id, "symbol": str(position["symbol"])})
+        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
 
     def _slippage_price(self, side: str, price: float, volatility: float) -> float:
         bps = self.settings.broker.base_slippage_bps + max(volatility, 0.0) * 10000.0 * self.settings.broker.volatility_slippage_mult
@@ -349,7 +374,7 @@ class PaperBroker:
         self.snapshot_account(cash_override=cash_value)
         return True
 
-    def process_open_orders(self, market_data_service: MarketDataService) -> int:
+    def process_open_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> int:
         orders = self.repository.open_orders(statuses=("new", "partially_filled"))
         if not orders.empty and "raw_json" in orders.columns:
             broker_name = orders["raw_json"].fillna("{}").astype(str).map(
@@ -361,6 +386,8 @@ class PaperBroker:
         account = self._latest_account()
         cash_value = float(account.get("cash", self.settings.risk.starting_cash))
         for _, order in orders.iterrows():
+            if callable(touch):
+                touch("sim_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"])})
             asset_type = str(order["asset_type"])
             if not market_data_service.is_market_open(asset_type):
                 continue
@@ -410,8 +437,18 @@ class PaperBroker:
                 cash_value += fill_qty * fill_price - fees
             self._update_position_from_fill(order=order, fill_qty=fill_qty, fill_price=fill_price, fees=fees)
             filled_count += 1
+            self.repository.log_event(
+                "INFO",
+                "execution_pipeline",
+                "filled" if remaining_qty <= 0 else "partially_filled",
+                "sim order filled",
+                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty)},
+            )
         self.snapshot_account(cash_override=cash_value)
         return filled_count
+
+    def sync_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> Dict[str, int]:
+        return {"fills": int(self.process_open_orders(market_data_service, touch=touch))}
 
     def snapshot_account(self, cash_override: float | None = None) -> None:
         account = self._latest_account()
@@ -455,3 +492,12 @@ class PaperBroker:
                 raw_json="{}",
             )
         )
+
+    def sync_account(self) -> Dict[str, Any]:
+        latest = self._latest_account()
+        return {
+            "broker": "sim",
+            "enabled": True,
+            "summary": latest,
+            "cash": float(latest.get("cash", self.settings.risk.starting_cash)),
+        }

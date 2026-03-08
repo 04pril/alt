@@ -101,7 +101,9 @@ class RiskEngine:
             (pending_entries["symbol"].astype(str) == signal.symbol)
             & (pending_entries["timeframe"].astype(str) == signal.timeframe)
         ]
-        if not same_symbol.empty or not same_symbol_pending.empty:
+        if not same_symbol_pending.empty:
+            return RiskDecision(False, "duplicate_pending_entry", 0, 0.0, 0.0)
+        if not same_symbol.empty:
             return RiskDecision(False, "already_holding_symbol", 0, 0.0, 0.0)
 
         reserved_slots = pd.concat(

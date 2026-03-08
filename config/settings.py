@@ -103,6 +103,8 @@ class BrokerSettings:
     max_volume_participation: float = 0.05
     allow_partial_fills: bool = True
     default_order_type: str = "market"
+    websocket_reconnect_interval_seconds: int = 30
+    stale_submitted_order_timeout_minutes: int = 20
 
 
 @dataclass
@@ -113,6 +115,10 @@ class SchedulerSettings:
     job_lease_seconds: int = 180
     exit_management_interval_minutes: int = 15
     outcome_resolution_interval_minutes: int = 60
+    broker_market_status_interval_minutes: int = 5
+    broker_order_sync_interval_minutes: int = 5
+    broker_position_sync_interval_minutes: int = 5
+    broker_account_sync_interval_minutes: int = 15
     lock_owner: str = "paper-worker"
 
 

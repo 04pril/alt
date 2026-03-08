@@ -8,6 +8,10 @@ from zoneinfo import ZoneInfo
 
 from config.settings import load_settings
 from jobs.tasks import (
+    broker_account_sync_job,
+    broker_market_status_job,
+    broker_order_sync_job,
+    broker_position_sync_job,
     build_task_context,
     daily_report_job,
     entry_decision_job,
@@ -41,10 +45,18 @@ def _run_guarded(context, job_name: str, run_key: str, fn):
     )
     if not lease.acquired:
         return None
-    try:
+
+    def touch(stage=None, details=None):
         context.repository.refresh_job_lease(lease.job_run_id, context.settings.scheduler.job_lease_seconds)
+        context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), f"{job_name}:{stage or 'tick'}")
+        context.repository.set_control_flag("worker_heartbeat_job", job_name, "active job")
+
+    previous_touch = getattr(context, "job_touch", None)
+    context.job_touch = touch
+    try:
+        touch("job_start", {"job_name": job_name})
         result = fn()
-    except Exception as exc:  # pragma: no cover - exercised in runtime
+    except Exception as exc:  # pragma: no cover
         context.repository.finish_job_run(
             lease.job_run_id,
             status="failed",
@@ -55,6 +67,9 @@ def _run_guarded(context, job_name: str, run_key: str, fn):
         )
         context.repository.log_event("ERROR", "scheduler", "job_failed", f"{job_name} failed", {"error": str(exc)})
         return None
+    finally:
+        context.job_touch = previous_touch or (lambda _stage=None, _details=None: None)
+
     context.repository.finish_job_run(
         lease.job_run_id,
         status="completed",
@@ -85,9 +100,33 @@ def run_once(settings_path: str | None = None) -> None:
         )
     _run_guarded(
         context,
+        job_name="broker_market_status",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_market_status_interval_minutes),
+        fn=lambda: broker_market_status_job(context),
+    )
+    _run_guarded(
+        context,
+        job_name="broker_position_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_position_sync_interval_minutes),
+        fn=lambda: broker_position_sync_job(context),
+    )
+    _run_guarded(
+        context,
         job_name="exit_management",
         run_key=_bucket_key(_utc_now(), settings.scheduler.exit_management_interval_minutes),
         fn=lambda: exit_management_job(context),
+    )
+    _run_guarded(
+        context,
+        job_name="broker_order_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_order_sync_interval_minutes),
+        fn=lambda: broker_order_sync_job(context),
+    )
+    _run_guarded(
+        context,
+        job_name="broker_account_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_account_sync_interval_minutes),
+        fn=lambda: broker_account_sync_job(context),
     )
     _run_guarded(
         context,

@@ -777,6 +777,19 @@ class TradingRepository:
             row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
         return dict(row) if row else None
 
+    def recent_orders(self, limit: int = 200) -> pd.DataFrame:
+        with self.connect() as conn:
+            return pd.read_sql_query(
+                """
+                SELECT rowid, *
+                FROM orders
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                conn,
+                params=[int(limit)],
+            )
+
     def open_orders(self, statuses: Iterable[str] | None = None) -> pd.DataFrame:
         statuses = tuple(statuses or ACTIVE_ORDER_STATUSES)
         placeholders = ", ".join("?" for _ in statuses)
@@ -1024,6 +1037,40 @@ class TradingRepository:
         params.append(int(limit))
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
+
+    def system_events_by_date(
+        self,
+        created_date: str,
+        *,
+        level: str | None = None,
+        component_prefix: str | None = None,
+        limit: int = 2000,
+    ) -> pd.DataFrame:
+        clauses = ["substr(created_at, 1, 10) = ?"]
+        params: List[Any] = [created_date]
+        if level:
+            clauses.append("level = ?")
+            params.append(level)
+        if component_prefix:
+            clauses.append("component LIKE ?")
+            params.append(f"{component_prefix}%")
+        query = "SELECT rowid, * FROM system_events WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def latest_system_event(self, event_type: str, *, component: str | None = None) -> Dict[str, Any] | None:
+        clauses = ["event_type = ?"]
+        params: List[Any] = [event_type]
+        if component:
+            clauses.append("component = ?")
+            params.append(component)
+        query = "SELECT rowid, * FROM system_events WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT 1"
+        with self.connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return dict(row) if row else None
 
     def prediction_report(self, limit: int = 500) -> pd.DataFrame:
         with self.connect() as conn:

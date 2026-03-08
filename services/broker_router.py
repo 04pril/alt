@@ -31,13 +31,63 @@ class BrokerRouter:
             return self.kis_broker.submit_entry_order(signal=signal, quantity=quantity, scan_id=scan_id)
         return self.sim_broker.submit_entry_order(signal=signal, quantity=quantity, scan_id=scan_id)
 
+    def submit_entry_order_result(self, signal, quantity: int, scan_id: str | None = None, *, market_data_service=None):
+        if self._use_kis(signal.symbol, signal.asset_type):
+            return self.kis_broker.submit_entry_order_result(
+                signal=signal,
+                quantity=quantity,
+                scan_id=scan_id,
+                market_data_service=market_data_service,
+            )
+        return self.sim_broker.submit_entry_order_result(
+            signal=signal,
+            quantity=quantity,
+            scan_id=scan_id,
+            market_data_service=market_data_service,
+        )
+
     def submit_exit_order(self, position: pd.Series, reason: str) -> str:
         if self._use_kis(str(position["symbol"]), str(position["asset_type"])):
             return self.kis_broker.submit_exit_order(position=position, reason=reason)
         return self.sim_broker.submit_exit_order(position=position, reason=reason)
 
-    def process_open_orders(self, market_data_service: Any) -> int:
-        filled = self.sim_broker.process_open_orders(market_data_service)
+    def submit_exit_order_result(self, position: pd.Series, reason: str, *, market_data_service=None):
+        if self._use_kis(str(position["symbol"]), str(position["asset_type"])):
+            return self.kis_broker.submit_exit_order_result(
+                position=position,
+                reason=reason,
+                market_data_service=market_data_service,
+            )
+        return self.sim_broker.submit_exit_order_result(
+            position=position,
+            reason=reason,
+            market_data_service=market_data_service,
+        )
+
+    def preflight_entry(self, signal, quantity: int, *, market_data_service):
+        if self._use_kis(signal.symbol, signal.asset_type):
+            return self.kis_broker.preflight_entry(signal, quantity, market_data_service)
+        return {"allowed": True, "reason": "ok", "broker": "sim"}
+
+    def sync_account(self) -> dict[str, Any]:
+        sim_summary = self.sim_broker.sync_account()
+        result = {"sim": sim_summary}
         if self.kis_broker is not None and self.kis_broker.is_enabled():
-            filled += self.kis_broker.process_open_orders(market_data_service)
-        return filled
+            result["kis"] = self.kis_broker.sync_account()
+        return result
+
+    def sync_orders(self, market_data_service: Any, touch=None) -> dict[str, int]:
+        result = self.sim_broker.sync_orders(market_data_service, touch=touch)
+        if self.kis_broker is not None and self.kis_broker.is_enabled():
+            kis_result = self.kis_broker.sync_orders(market_data_service, touch=touch)
+            for key, value in kis_result.items():
+                result[key] = int(result.get(key, 0)) + int(value)
+        return result
+
+    def process_open_orders(self, market_data_service: Any) -> int:
+        return int(self.sync_orders(market_data_service).get("fills", 0))
+
+    def handle_websocket_execution_event(self, event: dict[str, Any]) -> bool:
+        if self.kis_broker is None or not self.kis_broker.is_enabled():
+            return False
+        return bool(self.kis_broker.handle_websocket_execution_event(event))

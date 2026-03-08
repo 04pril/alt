@@ -77,6 +77,38 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertEqual(int(row["retry_count"]), 1)
 
+    def test_broker_sync_job_uses_retry_backoff(self) -> None:
+        attempts = {"job": 0}
+
+        def flaky_sync():
+            attempts["job"] += 1
+            raise RuntimeError("sync failed")
+
+        first = _run_guarded(self.context, "broker_order_sync", "2026-03-08T15:20", flaky_sync)
+        second = _run_guarded(self.context, "broker_order_sync", "2026-03-08T15:20", flaky_sync)
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(attempts["job"], 1)
+
+    def test_long_running_job_refreshes_lease_and_worker_heartbeat(self) -> None:
+        observed = {"heartbeat_before": "", "heartbeat_after": ""}
+
+        def long_job():
+            observed["heartbeat_before"] = self.repo.get_control_flag("worker_heartbeat_at", "")
+            self.context.job_touch("stage_one", {"item": 1})
+            time.sleep(0.1)
+            self.context.job_touch("stage_two", {"item": 2})
+            observed["heartbeat_after"] = self.repo.get_control_flag("worker_heartbeat_at", "")
+            return {"ok": True}
+
+        result = _run_guarded(self.context, "broker_position_sync", "2026-03-08T15:30", long_job)
+        row = self.repo.get_job_run_by_key("broker_position_sync", "2026-03-08T15:30")
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(row["status"], "completed")
+        self.assertTrue(self.repo.get_control_flag("worker_heartbeat_job", "").startswith("broker_position_sync"))
+        self.assertNotEqual(observed["heartbeat_after"], "")
+
 
 if __name__ == "__main__":
     unittest.main()

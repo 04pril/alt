@@ -44,6 +44,9 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("recent_errors", data)
             self.assertIn("auto_trading_status", data)
             self.assertIn("asset_overview", data)
+            self.assertIn("execution_summary", data)
+            self.assertIn("broker_sync_status", data)
+            self.assertIn("kis_runtime", data)
 
     def test_asset_overview_contains_all_asset_types(self) -> None:
         settings = RuntimeSettings()
@@ -51,6 +54,13 @@ class DashboardHooksTest(unittest.TestCase):
         self.assertFalse(overview.empty)
         self.assertEqual(set(overview["자산유형"]), {"코인", "미국주식", "한국주식"})
         self.assertIn("대표 심볼", overview.columns)
+
+    def test_asset_overview_contains_all_asset_types(self) -> None:
+        settings = RuntimeSettings()
+        overview = build_asset_overview(settings)
+        self.assertFalse(overview.empty)
+        self.assertEqual(set(overview["자산유형"]), set(settings.asset_schedules.keys()))
+        self.assertIn("대표 종목", overview.columns)
 
     def test_auto_trading_status_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,6 +108,33 @@ class DashboardHooksTest(unittest.TestCase):
             now = datetime(2026, 3, 6, 12, 0, tzinfo=timezone.utc)
             status = compute_auto_trading_status(repo, loop_sleep_seconds=30, now=now)
             self.assertEqual(status["label"], "Stopped")
+
+    def test_dashboard_reader_exposes_execution_counts_and_broker_sync_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.log_event("INFO", "execution_pipeline", "candidate", "candidate", {"symbol": "005930.KS"})
+            repo.log_event("INFO", "execution_pipeline", "entry_allowed", "allowed", {"symbol": "005930.KS"})
+            repo.log_event("INFO", "execution_pipeline", "submit_requested", "submit", {"symbol": "005930.KS"})
+            repo.log_event("INFO", "execution_pipeline", "noop", "noop", {"reason": "outside_preclose_window"})
+            lease = repo.begin_job_run(
+                job_name="broker_order_sync",
+                run_key="2026-03-09T15:20",
+                scheduled_at="2026-03-09T15:20:00Z",
+                lock_owner="test",
+            )
+            repo.finish_job_run(lease.job_run_id, status="completed", metrics={"fills": 0})
+            repo.set_control_flag("kis_last_order_sync_at", "2026-03-09T06:20:00Z", "test")
+
+            data = load_dashboard_data(settings)
+            self.assertEqual(data["execution_summary"]["today_candidate_count"], 1)
+            self.assertEqual(data["execution_summary"]["today_entry_allowed_count"], 1)
+            self.assertEqual(data["execution_summary"]["today_submit_requested_count"], 1)
+            self.assertEqual(data["execution_summary"]["today_noop_count"], 1)
+            self.assertFalse(data["broker_sync_status"].empty)
+            self.assertEqual(data["kis_runtime"]["last_broker_order_sync"], "2026-03-09T06:20:00Z")
 
 
 if __name__ == "__main__":

@@ -1003,6 +1003,33 @@ Start-Process -FilePath $python -ArgumentList '-m','jobs.scheduler' -WorkingDire
 
 
 
+def run_manual_runtime_job(job_name: str) -> Tuple[bool, str]:
+    from jobs.scheduler import _run_guarded
+    from jobs.tasks import (
+        broker_account_sync_job,
+        broker_market_status_job,
+        broker_order_sync_job,
+        broker_position_sync_job,
+        build_task_context,
+    )
+
+    job_map = {
+        "broker_market_status": broker_market_status_job,
+        "broker_position_sync": broker_position_sync_job,
+        "broker_order_sync": broker_order_sync_job,
+        "broker_account_sync": broker_account_sync_job,
+    }
+    fn = job_map.get(job_name)
+    if fn is None:
+        return False, f"지원하지 않는 job 입니다: {job_name}"
+    context = build_task_context()
+    run_key = f"manual:{pd.Timestamp.utcnow().isoformat()}"
+    result = _run_guarded(context, job_name=job_name, run_key=run_key, fn=lambda: fn(context))
+    if result is None:
+        return False, f"{job_name} 실행에 실패했습니다."
+    return True, f"{job_name} 실행 완료"
+
+
 def render_global_footer() -> None:
     st.markdown(
         f"""
@@ -1479,6 +1506,161 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
             st.caption("candidate_scans가 없습니다.")
         else:
             st.dataframe(format_frame_timestamps_for_display(candidate_scans.head(200)), width="stretch", hide_index=True)
+    with tab_assets:
+        if asset_overview.empty:
+            st.caption("설정된 자산 유니버스가 없습니다.")
+        else:
+            st.dataframe(asset_overview, width="stretch", hide_index=True)
+    with tab_errors:
+        if recent_errors.empty:
+            st.caption("최근 ERROR 이벤트가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(recent_errors), width="stretch", hide_index=True)
+
+
+def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
+    settings = settings or load_settings()
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+
+    st.subheader("운영 모니터")
+    st.caption("worker 상태, 실행 보장 지표, broker sync 결과를 확인합니다.")
+    control_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.0, 2.0])
+    if control_cols[0].button("신규 진입 중단", key="ops_pause"):
+        repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
+        st.rerun()
+    if control_cols[1].button("신규 진입 재개", key="ops_resume"):
+        repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
+        st.rerun()
+    if control_cols[2].button("Market Sync", key="ops_sync_market"):
+        ok, message = run_manual_runtime_job("broker_market_status")
+        (st.success if ok else st.error)(message)
+    if control_cols[3].button("Order Sync", key="ops_sync_orders"):
+        ok, message = run_manual_runtime_job("broker_order_sync")
+        (st.success if ok else st.error)(message)
+    if control_cols[4].button("Account Sync", key="ops_sync_account"):
+        ok, message = run_manual_runtime_job("broker_account_sync")
+        (st.success if ok else st.error)(message)
+
+    data = dashboard_data or load_dashboard_data(settings)
+    summary = data["summary"]
+    trade_performance = data["trade_performance"]
+    auto_trading_status = data.get("auto_trading_status", {})
+    execution_summary = data.get("execution_summary", {})
+    broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
+    broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
+    kis_runtime = data.get("kis_runtime", {})
+
+    metrics = st.columns(6)
+    metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
+    metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
+    metrics[2].metric("오픈 주문", f"{int(summary.get('open_orders', 0))}")
+    metrics[3].metric("Today PnL", format_price_value(float(trade_performance.get("today_pnl", float("nan")))))
+    metrics[4].metric("누적 수익률", format_pct_value(float(trade_performance.get("total_return_pct", float("nan")))))
+    metrics[5].metric("최대 낙폭", format_pct_value(float(trade_performance.get("max_drawdown_pct", float("nan")))))
+    st.caption(
+        f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
+        f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
+    )
+
+    execution_cols = st.columns(5)
+    execution_cols[0].metric("Today Candidates", f"{int(execution_summary.get('today_candidate_count', 0))}")
+    execution_cols[1].metric("Entry Allowed", f"{int(execution_summary.get('today_entry_allowed_count', 0))}")
+    execution_cols[2].metric("Entry Rejected", f"{int(execution_summary.get('today_entry_rejected_count', 0))}")
+    execution_cols[3].metric("Submitted", f"{int(execution_summary.get('today_submitted_count', 0))}")
+    execution_cols[4].metric("Filled", f"{int(execution_summary.get('today_filled_count', 0))}")
+
+    execution_cols_2 = st.columns(5)
+    execution_cols_2[0].metric("Submit Requested", f"{int(execution_summary.get('today_submit_requested_count', 0))}")
+    execution_cols_2[1].metric("Acknowledged", f"{int(execution_summary.get('today_acknowledged_count', 0))}")
+    execution_cols_2[2].metric("Rejected", f"{int(execution_summary.get('today_rejected_count', 0))}")
+    execution_cols_2[3].metric("Cancelled", f"{int(execution_summary.get('today_cancelled_count', 0))}")
+    execution_cols_2[4].metric("No-op", f"{int(execution_summary.get('today_noop_count', 0))}")
+
+    kis_cols = st.columns(6)
+    kis_cols[0].metric("Last Account Sync", format_display_timestamp(kis_runtime.get("last_broker_account_sync")))
+    kis_cols[1].metric("Last Order Sync", format_display_timestamp(kis_runtime.get("last_broker_order_sync")))
+    last_position_sync = ""
+    if not broker_sync_status.empty:
+        pos_row = broker_sync_status.loc[broker_sync_status["job_name"].astype(str) == "broker_position_sync"]
+        if not pos_row.empty:
+            last_position_sync = pos_row.iloc[0].get("heartbeat_at")
+    kis_cols[2].metric("Last Position Sync", format_display_timestamp(last_position_sync))
+    kis_cols[3].metric("Last WS Event", format_display_timestamp(kis_runtime.get("last_websocket_execution_event")))
+    kis_cols[4].metric("Pending Submitted", f"{int(kis_runtime.get('pending_submitted_orders', 0))}")
+    kis_cols[5].metric("Broker Rejects Today", f"{int(kis_runtime.get('broker_rejects_today', 0))}")
+
+    job_health = data["job_health"]
+    recent_errors = data["recent_errors"]
+    open_positions = data["open_positions"]
+    open_orders = data["open_orders"]
+    candidate_scans = data["candidate_scans"]
+    asset_overview = data.get("asset_overview", pd.DataFrame())
+    prediction_report = data["prediction_report"]
+    equity_curve = data["equity_curve"]
+    today_execution_events = data.get("today_execution_events", pd.DataFrame())
+    noop_breakdown = execution_summary.get("today_noop_breakdown", pd.DataFrame())
+
+    if not equity_curve.empty:
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
+                    y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
+                    mode="lines+markers",
+                    name="Equity",
+                )
+            ]
+        )
+        fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+        st.plotly_chart(fig, width="stretch")
+
+    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_execution, tab_broker, tab_assets, tab_errors = st.tabs(
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Execution", "Broker Sync", "Assets", "Recent Errors"]
+    )
+    with tab_jobs:
+        if job_health.empty:
+            st.caption("job_runs가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(job_health), width="stretch", hide_index=True)
+    with tab_positions:
+        if open_positions.empty and open_orders.empty:
+            st.caption("오픈 포지션과 주문이 없습니다.")
+        else:
+            if not open_positions.empty:
+                st.caption("오픈 포지션")
+                st.dataframe(format_frame_timestamps_for_display(open_positions), width="stretch", hide_index=True)
+            if not open_orders.empty:
+                st.caption("오픈 주문")
+                st.dataframe(format_frame_timestamps_for_display(open_orders), width="stretch", hide_index=True)
+    with tab_predictions:
+        if prediction_report.empty:
+            st.caption("prediction ledger가 비어 있습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(prediction_report.head(200)), width="stretch", hide_index=True)
+    with tab_candidates:
+        if candidate_scans.empty:
+            st.caption("candidate_scans가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(candidate_scans.head(200)), width="stretch", hide_index=True)
+    with tab_execution:
+        if not noop_breakdown.empty:
+            st.caption("No-op reason breakdown")
+            st.dataframe(noop_breakdown, width="stretch", hide_index=True)
+        if today_execution_events.empty:
+            st.caption("오늘 execution event가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(today_execution_events.head(200)), width="stretch", hide_index=True)
+    with tab_broker:
+        if broker_sync_status.empty:
+            st.caption("broker sync 상태가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(broker_sync_status), width="stretch", hide_index=True)
+        if broker_sync_errors.empty:
+            st.caption("최근 broker sync 오류가 없습니다.")
+        else:
+            st.caption("최근 broker sync / execution 이벤트")
+            st.dataframe(format_frame_timestamps_for_display(broker_sync_errors.head(100)), width="stretch", hide_index=True)
     with tab_assets:
         if asset_overview.empty:
             st.caption("설정된 자산 유니버스가 없습니다.")

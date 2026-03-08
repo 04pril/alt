@@ -11,36 +11,64 @@ from kis_paper import KISPaperSnapshot
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 from services.signal_engine import SignalDecision
+from storage.models import OrderRecord
 from storage.repository import TradingRepository
+
+
+class _FakeMarketDataService:
+    def __init__(self, *, market_open: bool = True, pre_close: bool = True):
+        self.market_open = market_open
+        self.pre_close = pre_close
+
+    def is_market_open(self, asset_type: str, when=None) -> bool:
+        return self.market_open
+
+    def is_pre_close_window(self, asset_type: str, when=None) -> bool:
+        return self.pre_close
 
 
 class _FakeKISClient:
     def __init__(self) -> None:
-        self.config = SimpleNamespace(is_paper=True)
+        self.config = SimpleNamespace(is_paper=True, hts_id="demo-user")
         self.order_no = 0
-        self.holdings = pd.DataFrame(
-            columns=[
-                "symbol_code",
-                "quantity",
-                "avg_price",
-                "보유수량",
-                "매입평균가",
-            ]
-        )
+        self.place_calls = 0
+        self.holdings = pd.DataFrame(columns=["symbol_code", "quantity", "avg_price"])
+        self.buying_power = {"cash_buy_qty": 10, "max_buy_qty": 10, "cash_buy_amount": 1_000_000.0}
+        self.sellable = {"sellable_qty": 10}
+        self.daily_rows = pd.DataFrame()
 
     def get_account_snapshot(self) -> KISPaperSnapshot:
-        return KISPaperSnapshot(summary={}, holdings=self.holdings.copy(), raw_summary={})
+        return KISPaperSnapshot(summary={"cash": 30_000_000.0, "holding_count": int(len(self.holdings))}, holdings=self.holdings.copy(), raw_summary={})
+
+    def get_quote(self, symbol: str):
+        return {"symbol_code": "005930", "current_price": 70000.0, "raw": {}}
+
+    def get_orderbook(self, symbol: str):
+        return {"expected_price": 70000.0, "best_ask": 70000.0, "best_bid": 69900.0}
+
+    def get_market_status(self, symbol: str):
+        return {"is_halted": False, "phase_code": "open"}
+
+    def get_buying_power(self, symbol: str, *, order_price: float, order_division: str = "01", include_cma: str = "N", include_overseas: str = "N"):
+        return dict(self.buying_power)
+
+    def get_sellable_quantity(self, symbol: str):
+        return dict(self.sellable)
+
+    def get_daily_order_fills(self, **kwargs):
+        return self.daily_rows.copy()
+
+    def get_websocket_approval_key(self) -> str:
+        return "approval"
 
     def place_cash_order(self, symbol_or_code: str, side: str, quantity: int, order_type: str = "market", price: float | None = None):
+        self.place_calls += 1
         self.order_no += 1
         return {
             "order_no": f"ODR{self.order_no}",
-            "requested_at": "2026-03-08T09:00:00+09:00",
+            "requested_at": "2026-03-09T15:20:00+09:00",
             "message": "accepted",
         }
-
-    def get_quote(self, symbol: str):
-        return {"current_price": 70000.0}
 
 
 class KISPaperBrokerTest(unittest.TestCase):
@@ -49,16 +77,16 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.settings = RuntimeSettings()
         self.settings.storage.db_path = f"{self.tmp.name}/runtime.sqlite3"
         self.settings.broker.fee_bps = 0.0
+        self.settings.broker.stale_submitted_order_timeout_minutes = 1
         self.repo = TradingRepository(self.settings.storage.db_path)
         self.repo.initialize()
         self.sim_broker = PaperBroker(self.settings, self.repo)
         self.sim_broker.ensure_account_initialized()
         self.client = _FakeKISClient()
-        self.broker = KISPaperBroker(
-            self.settings,
-            self.repo,
-            self.sim_broker,
-            client_factory=lambda: self.client,
+        self.market = _FakeMarketDataService()
+        self.broker = KISPaperBroker(self.settings, self.repo, self.sim_broker, client_factory=lambda: self.client)
+        self.kr_asset_type = next(
+            asset_type for asset_type, schedule in self.settings.asset_schedules.items() if schedule.timeframe == "1d" and schedule.timezone == "Asia/Seoul"
         )
 
     def tearDown(self) -> None:
@@ -67,7 +95,7 @@ class KISPaperBrokerTest(unittest.TestCase):
     def _signal(self) -> SignalDecision:
         return SignalDecision(
             symbol="005930.KS",
-            asset_type="한국주식",
+            asset_type=self.kr_asset_type,
             timeframe="1d",
             prediction_id="pred-kr-1",
             scan_id="scan-kr-1",
@@ -90,45 +118,112 @@ class KISPaperBrokerTest(unittest.TestCase):
             result=None,
         )
 
-    def test_kis_order_is_acknowledged_before_fill_and_reconciles_idempotently(self) -> None:
-        order_id = self.broker.submit_entry_order(self._signal(), quantity=2)
-        created = self.repo.get_order(order_id)
+    def test_market_open_preclose_with_buying_power_submits_order(self) -> None:
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=2, market_data_service=self.market)
+        order = self.repo.get_order(result["order_id"])
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(self.client.place_calls, 1)
+        self.assertEqual(order["status"], "acknowledged")
 
-        self.assertEqual(created["status"], "acknowledged")
-        self.assertEqual(int(created["filled_qty"]), 0)
+    def test_market_closed_does_not_submit(self) -> None:
+        market = _FakeMarketDataService(market_open=False, pre_close=False)
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=market)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "market_closed")
+        self.assertEqual(self.client.place_calls, 0)
 
-        first_sync = self.broker.process_open_orders(market_data_service=None)
-        pending = self.repo.get_order(order_id)
-        self.assertEqual(first_sync, 0)
-        self.assertEqual(pending["status"], "pending_fill")
+    def test_outside_preclose_window_does_not_submit(self) -> None:
+        market = _FakeMarketDataService(market_open=True, pre_close=False)
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=market)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "outside_preclose_window")
+        self.assertEqual(self.client.place_calls, 0)
 
-        self.client.holdings = pd.DataFrame(
-            [
-                {
-                    "symbol_code": "005930",
-                    "quantity": 2,
-                    "avg_price": 70000.0,
-                    "보유수량": 2,
-                    "매입평균가": 70000.0,
-                }
-            ]
+    def test_insufficient_buying_power_does_not_submit(self) -> None:
+        self.client.buying_power = {"cash_buy_qty": 0, "max_buy_qty": 0, "cash_buy_amount": 0.0}
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "insufficient_buying_power")
+
+    def test_duplicate_pending_entry_does_not_submit(self) -> None:
+        self.repo.insert_order(
+            OrderRecord(
+                order_id="ord_pending",
+                created_at="2026-03-09T15:15:00Z",
+                updated_at="2026-03-09T15:15:00Z",
+                prediction_id="pred-old",
+                scan_id="scan-old",
+                symbol="005930.KS",
+                asset_type=self.kr_asset_type,
+                timeframe="1d",
+                side="buy",
+                order_type="market",
+                requested_qty=1,
+                filled_qty=0,
+                remaining_qty=1,
+                requested_price=70000.0,
+                limit_price=0.0,
+                status="submitted",
+                fees_estimate=0.0,
+                slippage_bps=0.0,
+                retry_count=0,
+                strategy_version="s1",
+                reason="entry",
+                raw_json='{"broker":"kis_mock"}',
+            )
         )
-        second_sync = self.broker.process_open_orders(market_data_service=None)
-        filled = self.repo.get_order(order_id)
-        positions = self.repo.open_positions()
-        fills = self.repo.open_orders(statuses=("filled",))
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
+        self.assertFalse(result["submitted"])
+        self.assertEqual(result["reason"], "duplicate_pending_entry")
 
-        self.assertEqual(second_sync, 1)
-        self.assertEqual(filled["status"], "filled")
-        self.assertEqual(int(filled["filled_qty"]), 2)
-        self.assertFalse(positions.empty)
-        self.assertEqual(int(positions.iloc[0]["quantity"]), 2)
-        self.assertEqual(len(fills), 1)
+    def test_order_sync_moves_acknowledged_to_pending_then_filled_idempotently(self) -> None:
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=2, market_data_service=self.market)
+        order_id = result["order_id"]
 
-        third_sync = self.broker.process_open_orders(market_data_service=None)
-        self.assertEqual(third_sync, 0)
-        still_filled = self.repo.get_order(order_id)
-        self.assertEqual(still_filled["status"], "filled")
+        first = self.broker.sync_orders(self.market)
+        self.assertEqual(first["fills"], 0)
+        self.assertEqual(self.repo.get_order(order_id)["status"], "pending_fill")
+
+        self.client.daily_rows = pd.DataFrame([{"broker_order_id": "ODR1", "tot_ccld_qty": 2, "avg_prvs": 70000.0}])
+        second = self.broker.sync_orders(self.market)
+        self.assertEqual(second["fills"], 1)
+        self.assertEqual(self.repo.get_order(order_id)["status"], "filled")
+        self.assertEqual(int(self.repo.open_positions().iloc[0]["quantity"]), 2)
+
+        third = self.broker.sync_orders(self.market)
+        self.assertEqual(third["fills"], 0)
+        self.assertEqual(self.repo.get_order(order_id)["status"], "filled")
+
+    def test_order_lifecycle_rejected_and_cancelled(self) -> None:
+        rejected = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
+        self.client.daily_rows = pd.DataFrame([{"broker_order_id": "ODR1", "rfus_yn": "Y", "status_text": "reject"}])
+        reject_sync = self.broker.sync_orders(self.market)
+        self.assertEqual(reject_sync["rejected"], 1)
+        self.assertEqual(self.repo.get_order(rejected["order_id"])["status"], "rejected")
+
+        self.client.daily_rows = pd.DataFrame()
+        cancelled = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
+        self.client.daily_rows = pd.DataFrame([{"broker_order_id": "ODR2", "status_text": "cancel"}])
+        cancel_sync = self.broker.sync_orders(self.market)
+        self.assertEqual(cancel_sync["cancelled"], 1)
+        self.assertEqual(self.repo.get_order(cancelled["order_id"])["status"], "cancelled")
+
+    def test_websocket_execution_event_updates_internal_state(self) -> None:
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=2, market_data_service=self.market)
+        updated = self.broker.handle_websocket_execution_event(
+            {"broker_order_id": "ODR1", "status": "filled", "filled_qty": 2, "fill_price": 70000.0}
+        )
+        self.assertTrue(updated)
+        self.assertEqual(self.repo.get_order(result["order_id"])["status"], "filled")
+        self.assertFalse(self.repo.open_positions().empty)
+
+    def test_rest_reconcile_is_fallback_when_websocket_missing(self) -> None:
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
+        self.client.daily_rows = pd.DataFrame([{"broker_order_id": "ODR1", "tot_ccld_qty": 1, "avg_prvs": 70000.0}])
+        sync = self.broker.sync_orders(self.market)
+        self.assertEqual(sync["fills"], 1)
+        self.assertEqual(self.repo.get_order(result["order_id"])["status"], "filled")
 
 
 if __name__ == "__main__":
