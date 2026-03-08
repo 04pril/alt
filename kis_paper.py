@@ -514,6 +514,42 @@ class KISPaperClient:
         }
         return KISPaperSnapshot(summary=summary, holdings=holdings, raw_summary=summary_raw)
 
+    def get_buying_power(
+        self,
+        symbol_or_code: str,
+        *,
+        order_price: float,
+        order_division: str = "01",
+        include_cma: str = "N",
+        include_overseas: str = "N",
+    ) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            "VTTC8908R" if self.config.is_paper else "TTTC8908R",
+            params={
+                "CANO": self.config.account_no,
+                "ACNT_PRDT_CD": self.config.product_code,
+                "PDNO": code,
+                "ORD_UNPR": str(int(round(float(order_price)))),
+                "ORD_DVSN": order_division,
+                "CMA_EVLU_AMT_ICLD_YN": include_cma,
+                "OVRS_ICLD_YN": include_overseas,
+            },
+        )
+        output = payload.get("output") or {}
+        return {
+            "symbol_code": code,
+            "max_buy_qty": int(_pick_numeric(output, ["max_buy_qty"], default=0.0)),
+            "cash_buy_qty": int(_pick_numeric(output, ["nrcvb_buy_qty"], default=0.0)),
+            "max_buy_amount": _pick_numeric(output, ["max_buy_amt"], default=0.0),
+            "cash_buy_amount": _pick_numeric(output, ["nrcvb_buy_amt"], default=0.0),
+            "order_price": float(order_price),
+            "order_division": order_division,
+            "raw": output,
+        }
+
     def place_cash_order(
         self,
         symbol_or_code: str,

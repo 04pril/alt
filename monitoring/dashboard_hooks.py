@@ -78,10 +78,129 @@ def build_broker_sync_read_model(
     broker_sync_errors = recent_events
     if not broker_sync_errors.empty:
         broker_sync_errors = broker_sync_errors[
-            broker_sync_errors["message"].astype(str).str.contains("broker_", case=False, na=False)
-            | broker_sync_errors["event_type"].astype(str).str.contains("broker_", case=False, na=False)
+            (
+                broker_sync_errors["message"].astype(str).str.contains("broker_", case=False, na=False)
+                | broker_sync_errors["event_type"].astype(str).str.contains("broker_", case=False, na=False)
+            )
+            & (broker_sync_errors["level"].astype(str).str.upper() == "ERROR")
         ].copy()
     return broker_sync_status, broker_sync_errors
+
+
+def build_account_snapshot_read_model(summary: Dict[str, Any]) -> Dict[str, Any]:
+    latest_account = dict(summary.get("latest_account") or {})
+    if not latest_account:
+        return {}
+    created_at_kst = _to_kst_timestamp(latest_account.get("created_at"))
+    latest_account["created_at_kst"] = (
+        created_at_kst.strftime("%Y-%m-%d %H:%M:%S") if not pd.isna(created_at_kst) else ""
+    )
+    return latest_account
+
+
+def build_broker_sync_status_frame(broker_sync_status: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for job_name in BROKER_SYNC_JOBS:
+        row = dict(broker_sync_status.get(job_name) or {})
+        rows.append(
+            {
+                "job": job_name,
+                "status": row.get("status", "never"),
+                "finished_at": row.get("finished_at", pd.NaT),
+                "retry_count": row.get("retry_count", 0),
+                "error_message": row.get("error_message", ""),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return _localize_timestamp_columns(pd.DataFrame(rows))
+
+
+def build_recent_job_status_summary(
+    job_health: pd.DataFrame,
+    auto_trading_status: Dict[str, Any],
+    *,
+    loop_sleep_seconds: int,
+    now: datetime | None = None,
+) -> Dict[str, str]:
+    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    stale_after_seconds = max(int(loop_sleep_seconds) * 3, 180)
+
+    latest_timestamp: datetime | None = None
+    latest_job_name = ""
+    latest_status = ""
+    if not job_health.empty:
+        latest_row = job_health.iloc[0]
+        latest_job_name = str(latest_row.get("job_name") or "")
+        latest_status = str(latest_row.get("status") or "").lower()
+        for column in ("finished_at", "started_at", "scheduled_at"):
+            parsed = _parse_utc_timestamp(latest_row.get(column))
+            if parsed is not None:
+                latest_timestamp = parsed
+                break
+
+    if latest_status == "failed":
+        return {
+            "label": "오류",
+            "reason": latest_job_name or "recent job failed",
+        }
+
+    if latest_timestamp is None:
+        state = str(auto_trading_status.get("state") or "").lower()
+        if state == "running":
+            return {"label": "정상", "reason": "worker heartbeat active"}
+        return {"label": "지연", "reason": "recent job history unavailable"}
+
+    if (now_utc - latest_timestamp).total_seconds() > stale_after_seconds:
+        return {
+            "label": "지연",
+            "reason": latest_job_name or "recent jobs are stale",
+        }
+
+    return {
+        "label": "정상",
+        "reason": latest_job_name or "recent jobs healthy",
+    }
+
+
+def build_kis_monitor_read_model(
+    repository: TradingRepository,
+    settings: RuntimeSettings,
+    *,
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    last_account_sync_at = repository.get_control_flag("kis_last_account_sync_at", "")
+    last_account_sync_status = repository.get_control_flag("kis_last_account_sync_status", "")
+    last_auth_error_at = repository.get_control_flag("kis_last_auth_error_at", "")
+    last_auth_error = repository.get_control_flag("kis_last_auth_error", "")
+    last_buying_power_success_at = repository.get_control_flag("kis_last_buying_power_success_at", "")
+    last_buying_power_symbol = repository.get_control_flag("kis_last_buying_power_symbol", "")
+
+    sync_dt = _parse_utc_timestamp(last_account_sync_at)
+    auth_error_dt = _parse_utc_timestamp(last_auth_error_at)
+    stale_after_seconds = max(int(settings.scheduler.broker_account_sync_interval_minutes) * 120, 900)
+
+    if auth_error_dt is not None and (sync_dt is None or auth_error_dt >= sync_dt):
+        connection_status = "인증오류"
+        status_reason = str(last_auth_error or "KIS 인증 오류")
+    elif sync_dt is None or (now_utc - sync_dt).total_seconds() > stale_after_seconds:
+        connection_status = "sync지연"
+        status_reason = "최근 account sync가 오래되었습니다."
+    else:
+        connection_status = "정상"
+        status_reason = "최근 account sync가 정상입니다."
+
+    return {
+        "connection_status": connection_status,
+        "status_reason": status_reason,
+        "last_account_sync_at": last_account_sync_at,
+        "last_account_sync_status": last_account_sync_status or ("ok" if sync_dt is not None else ""),
+        "last_auth_error_at": last_auth_error_at,
+        "last_auth_error": last_auth_error,
+        "last_buying_power_success_at": last_buying_power_success_at,
+        "last_buying_power_symbol": last_buying_power_symbol,
+    }
 
 
 def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
@@ -108,6 +227,16 @@ def build_asset_overview(settings: RuntimeSettings) -> pd.DataFrame:
     if frame.empty:
         return frame
     return frame.sort_values("자산유형").reset_index(drop=True)
+
+
+def load_monitor_open_positions(settings: RuntimeSettings) -> pd.DataFrame:
+    repository = _runtime_repository(settings)
+    return _localize_timestamp_columns(repository.open_positions())
+
+
+def load_monitor_recent_orders(settings: RuntimeSettings, limit: int = 30) -> pd.DataFrame:
+    repository = _runtime_repository(settings)
+    return _localize_timestamp_columns(repository.recent_orders(limit=limit))
 
 
 def compute_auto_trading_status(
@@ -145,7 +274,7 @@ def compute_auto_trading_status(
             "heartbeat_at": heartbeat_at.isoformat().replace("+00:00", "Z"),
             "heartbeat_at_kst": heartbeat_at_kst.strftime("%Y-%m-%d %H:%M:%S"),
             "heartbeat_age_seconds": heartbeat_age_seconds,
-            "reason": f"마지막 heartbeat는 {heartbeat_at_kst.strftime('%Y-%m-%d %H:%M:%S')} 입니다.",
+            "reason": "worker heartbeat가 지연되었습니다.",
             "source": heartbeat_source,
         }
 
@@ -178,8 +307,18 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     job_health = _localize_timestamp_columns(repository.recent_job_health(limit=200))
     recent_events = _localize_timestamp_columns(repository.recent_system_events(limit=100))
     broker_sync_status, broker_sync_errors = build_broker_sync_read_model(job_health, recent_events)
+    account_snapshot = build_account_snapshot_read_model(summary)
+    broker_sync_frame = build_broker_sync_status_frame(broker_sync_status)
+    auto_trading_status = compute_auto_trading_status(repository, settings.scheduler.loop_sleep_seconds)
+    recent_job_status_summary = build_recent_job_status_summary(
+        job_health,
+        auto_trading_status,
+        loop_sleep_seconds=settings.scheduler.loop_sleep_seconds,
+    )
+    kis_monitor = build_kis_monitor_read_model(repository, settings)
     return {
         "summary": summary,
+        "account_snapshot": account_snapshot,
         "prediction_report": _localize_timestamp_columns(repository.prediction_report(limit=200)),
         "open_positions": _localize_timestamp_columns(repository.open_positions()),
         "open_orders": _localize_timestamp_columns(repository.open_orders()),
@@ -190,7 +329,10 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "recent_errors": _localize_timestamp_columns(repository.recent_system_events(level="ERROR", limit=50)),
         "recent_events": recent_events,
         "broker_sync_status": broker_sync_status,
+        "broker_sync_frame": broker_sync_frame,
         "broker_sync_errors": broker_sync_errors,
         "trade_performance": repository.trade_performance_report(),
-        "auto_trading_status": compute_auto_trading_status(repository, settings.scheduler.loop_sleep_seconds),
+        "auto_trading_status": auto_trading_status,
+        "recent_job_status_summary": recent_job_status_summary,
+        "kis_monitor": kis_monitor,
     }

@@ -28,6 +28,63 @@ class KISPaperBroker:
         self.client_factory = client_factory
         self._enabled: bool | None = None
 
+    def _looks_like_auth_error(self, message: str) -> bool:
+        text = str(message or "").lower()
+        return any(
+            token in text
+            for token in (
+                "token",
+                "oauth",
+                "authorization",
+                "hashkey",
+                "appkey",
+                "appsecret",
+                "401",
+                "403",
+                "인증",
+                "토큰",
+            )
+        )
+
+    def _default_kr_probe_symbol(self) -> str:
+        for asset_type, schedule in self.settings.asset_schedules.items():
+            if str(schedule.timezone) != "Asia/Seoul" or str(schedule.timeframe) != "1d":
+                continue
+            universe = self.settings.universes.get(asset_type)
+            if universe is None:
+                continue
+            for symbol in list(universe.watchlist) + list(universe.top_universe):
+                text = str(symbol or "").strip()
+                if text:
+                    return text
+        return "005930.KS"
+
+    def _record_kis_error(self, *, flag_prefix: str, message: str, notes: str) -> None:
+        now_iso = utc_now_iso()
+        self.repository.set_control_flag(f"{flag_prefix}_error_at", now_iso, notes)
+        self.repository.set_control_flag(f"{flag_prefix}_error", str(message), notes)
+        if self._looks_like_auth_error(message):
+            self.repository.set_control_flag("kis_last_auth_error_at", now_iso, notes)
+            self.repository.set_control_flag("kis_last_auth_error", str(message), notes)
+
+    def _clear_kis_error(self, *, flag_prefix: str, notes: str) -> None:
+        self.repository.set_control_flag(f"{flag_prefix}_error_at", "", notes)
+        self.repository.set_control_flag(f"{flag_prefix}_error", "", notes)
+
+    def _probe_buying_power(self, client: KISPaperClient) -> Dict[str, Any]:
+        symbol = self._default_kr_probe_symbol()
+        quote = client.get_quote(symbol)
+        order_price = float(quote.get("current_price", 0.0) or 0.0)
+        if not np.isfinite(order_price) or order_price <= 0:
+            raise KISPaperError(f"매수가능조회 probe용 현재가가 유효하지 않습니다: {symbol}")
+        buying_power = client.get_buying_power(symbol, order_price=order_price)
+        now_iso = utc_now_iso()
+        self.repository.set_control_flag("kis_last_buying_power_success_at", now_iso, "broker_account_sync")
+        self.repository.set_control_flag("kis_last_buying_power_symbol", symbol, "broker_account_sync")
+        self.repository.set_control_flag("kis_last_buying_power_status", "ok", "broker_account_sync")
+        self._clear_kis_error(flag_prefix="kis_last_buying_power", notes="broker_account_sync")
+        return {"symbol": symbol, "order_price": order_price, **buying_power}
+
     def is_enabled(self) -> bool:
         if self._enabled is not None:
             return self._enabled
@@ -301,7 +358,12 @@ class KISPaperBroker:
             touch("kis_account_sync_skipped", {"enabled": False})
             return {"broker": "kis_mock", "enabled": False, "holding_count": 0}
         touch("kis_account_sync_request", {"enabled": True})
-        snapshot = self._client().get_account_snapshot()
+        client = self._client()
+        try:
+            snapshot = client.get_account_snapshot()
+        except Exception as exc:
+            self._record_kis_error(flag_prefix="kis_last_account_sync", message=str(exc), notes="broker_account_sync")
+            raise
         result = {
             "broker": "kis_mock",
             "enabled": True,
@@ -309,6 +371,18 @@ class KISPaperBroker:
             "total_eval": float(snapshot.summary.get("total_eval", 0.0) or 0.0),
             "holding_count": int(snapshot.summary.get("holding_count", 0) or 0),
         }
+        now_iso = utc_now_iso()
+        self.repository.set_control_flag("kis_last_account_sync_at", now_iso, "broker_account_sync")
+        self.repository.set_control_flag("kis_last_account_sync_status", "ok", "broker_account_sync")
+        self._clear_kis_error(flag_prefix="kis_last_account_sync", notes="broker_account_sync")
+        self.repository.set_control_flag("kis_last_auth_error_at", "", "broker_account_sync")
+        self.repository.set_control_flag("kis_last_auth_error", "", "broker_account_sync")
+        try:
+            probe = self._probe_buying_power(client)
+            result["buying_power_probe"] = probe
+        except Exception as exc:
+            self._record_kis_error(flag_prefix="kis_last_buying_power", message=str(exc), notes="broker_account_sync")
+            result["buying_power_probe_error"] = str(exc)
         touch("kis_account_sync_snapshot", result)
         return result
 

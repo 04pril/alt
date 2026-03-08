@@ -18,6 +18,11 @@ class _FakeKISClient:
     def __init__(self) -> None:
         self.config = SimpleNamespace(is_paper=True)
         self.order_no = 0
+        self.buying_power = {
+            "cash_buy_qty": 10,
+            "max_buy_qty": 10,
+            "cash_buy_amount": 1000000.0,
+        }
         self.holdings = pd.DataFrame(
             columns=[
                 "symbol_code",
@@ -41,6 +46,14 @@ class _FakeKISClient:
 
     def get_quote(self, symbol: str):
         return {"current_price": 70000.0}
+
+    def get_buying_power(
+        self,
+        symbol_or_code: str,
+        order_price: float | None = None,
+        order_type: str = "market",
+    ):
+        return dict(self.buying_power)
 
 
 class KISPaperBrokerTest(unittest.TestCase):
@@ -129,6 +142,15 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.assertEqual(third_sync, 0)
         still_filled = self.repo.get_order(order_id)
         self.assertEqual(still_filled["status"], "filled")
+
+    def test_sync_account_records_monitor_flags_and_buying_power_probe(self) -> None:
+        result = self.broker.sync_account()
+
+        self.assertTrue(result["enabled"])
+        self.assertNotEqual(self.repo.get_control_flag("kis_last_account_sync_at", ""), "")
+        self.assertEqual(self.repo.get_control_flag("kis_last_account_sync_status", ""), "ok")
+        self.assertNotEqual(self.repo.get_control_flag("kis_last_buying_power_success_at", ""), "")
+        self.assertEqual(self.repo.get_control_flag("kis_last_buying_power_symbol", ""), "005930.KS")
 
 
 if __name__ == "__main__":

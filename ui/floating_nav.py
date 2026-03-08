@@ -78,7 +78,7 @@ _FLOATING_NAV_CSS = """
 
 .alt-floating-nav {
   position: fixed;
-  top: calc(env(safe-area-inset-top, 0px) + var(--alt-nav-top-offset, 0.42rem));
+  top: var(--alt-nav-runtime-top, calc(env(safe-area-inset-top, 0px) + var(--alt-nav-top-offset, 0.42rem)));
   left: 50%;
   transform: translateX(-50%) translateY(0);
   width: fit-content;
@@ -94,6 +94,13 @@ _FLOATING_NAV_CSS = """
 }
 
 .alt-floating-nav.is-hidden {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-20px);
+  pointer-events: none;
+  filter: saturate(0.9);
+}
+
+.alt-floating-nav.is-suppressed {
   opacity: 0;
   transform: translateX(-50%) translateY(-20px);
   pointer-events: none;
@@ -336,7 +343,10 @@ _FLOATING_NAV_CSS = """
 @media (max-width: 768px) {
   .alt-floating-nav {
     max-width: calc(100vw - 0.8rem);
-    top: calc(env(safe-area-inset-top, 0px) + var(--alt-nav-top-offset-mobile, 0.28rem));
+    top: var(
+      --alt-nav-runtime-top-mobile,
+      calc(env(safe-area-inset-top, 0px) + var(--alt-nav-top-offset-mobile, 0.28rem))
+    );
   }
 
   .alt-floating-nav-shell {
@@ -516,6 +526,26 @@ export default function(component) {
     indicator.style.transform = `translateX(${activeButton.offsetLeft}px)`;
   };
 
+  const updateTopOffset = () => {
+    const header = document.querySelector('[data-testid="stHeader"]');
+    const mobile = isMobileViewport();
+    if (!header) {
+      nav.style.removeProperty('--alt-nav-runtime-top');
+      nav.style.removeProperty('--alt-nav-runtime-top-mobile');
+      return;
+    }
+    const rect = header.getBoundingClientRect();
+    const gap = mobile ? 0 : 2;
+    const computedTop = `${Math.ceil(Math.max(rect.bottom, 0) + gap)}px`;
+    if (mobile) {
+      nav.style.setProperty('--alt-nav-runtime-top-mobile', computedTop);
+      nav.style.removeProperty('--alt-nav-runtime-top');
+    } else {
+      nav.style.setProperty('--alt-nav-runtime-top', computedTop);
+      nav.style.removeProperty('--alt-nav-runtime-top-mobile');
+    }
+  };
+
   buttons.forEach((button) => {
     const pageKey = button.dataset.pageKey || '';
     button.addEventListener('click', () => {
@@ -542,9 +572,29 @@ export default function(component) {
   let ticking = false;
   let forcedVisible = false;
   let titleObserver = null;
+  let sidebarObserver = null;
+
+  const isMobileViewport = () => window.matchMedia('(max-width: 768px)').matches;
+
+  const isSidebarOpen = () => {
+    if (!isMobileViewport()) {
+      return false;
+    }
+    const sidebar = document.querySelector('[data-testid="stSidebar"]');
+    if (!sidebar) {
+      return false;
+    }
+    const expanded = sidebar.getAttribute('aria-expanded');
+    if (expanded === 'true') {
+      return true;
+    }
+    const rect = sidebar.getBoundingClientRect();
+    return rect.width >= Math.min(window.innerWidth * 0.45, 260);
+  };
 
   const setVisibility = (visible) => {
     nav.classList.toggle('is-hidden', !visible);
+    nav.classList.toggle('is-suppressed', isSidebarOpen());
   };
 
   const evaluateVisibility = () => {
@@ -574,6 +624,7 @@ export default function(component) {
 
   const onResize = () => {
     window.requestAnimationFrame(updateIndicator);
+    window.requestAnimationFrame(updateTopOffset);
     window.requestAnimationFrame(evaluateVisibility);
   };
 
@@ -613,9 +664,27 @@ export default function(component) {
     titleObserver.observe(titleAnchor);
   };
 
+  const bindSidebarObserver = () => {
+    if (typeof MutationObserver === 'undefined') {
+      return;
+    }
+    sidebarObserver = new MutationObserver(() => {
+      window.requestAnimationFrame(updateTopOffset);
+      window.requestAnimationFrame(evaluateVisibility);
+    });
+    sidebarObserver.observe(document.body, {
+      attributes: true,
+      attributeFilter: ['aria-expanded', 'class', 'style'],
+      childList: true,
+      subtree: true,
+    });
+  };
+
   updateIndicator();
+  updateTopOffset();
   evaluateVisibility();
   window.requestAnimationFrame(bindTitleObserver);
+  window.requestAnimationFrame(bindSidebarObserver);
 
   root.__cleanup = () => {
     window.removeEventListener('scroll', onScroll);
@@ -626,6 +695,9 @@ export default function(component) {
     nav.removeEventListener('focusout', onMouseLeave);
     if (titleObserver) {
       titleObserver.disconnect();
+    }
+    if (sidebarObserver) {
+      sidebarObserver.disconnect();
     }
   };
 }
@@ -685,8 +757,8 @@ def theme_tokens(theme_mode: str) -> dict[str, str]:
         "chip": chip,
         "chip_hover": chip_hover,
         "shadow": shadow,
-        "top_offset": "0.58rem",
-        "top_offset_mobile": "0.42rem",
+        "top_offset": "2.9rem",
+        "top_offset_mobile": "2.3rem",
     }
 
 

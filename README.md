@@ -56,7 +56,7 @@ Job Runs + System Events + Account Snapshots -> Monitoring / app read model
 
 즉, 운영 상태를 볼 때 기준은 repository이고, legacy wrapper는 prediction history 호환용으로만 남겨 둡니다.
 
-app??pause/resume 諛?broker sync ?곹깭 ?뺤씤?룄 repository read model helper瑜??듯빐 ?댁? ??援ъ“濡?留덈Т由ы뻽?듬땲??
+app의 pause/resume 및 broker sync 상태 확인도 repository read model helper를 통해 읽는 구조로 마무리했습니다.
 
 The app now uses repository-backed read-model helpers for pause/resume controls and broker sync status reads.
 
@@ -90,7 +90,7 @@ The app now uses repository-backed read-model helpers for pause/resume controls 
 - scheduler retry/backoff 대상
 - app에서 수동 강제 실행 가능
 
-`broker_account_sync_job`??account snapshot怨?KIS account summary ?⑥쐞 ?ъ씠?먯꽌?룄 touch callback??洹몄듃由?以묈컻 heartbeat / lease refresh瑜?吏?띿빀?덈떎.
+`broker_account_sync_job`은 account snapshot과 KIS account summary 단계 사이에서도 touch callback을 전달해 heartbeat / lease refresh를 지속합니다.
 
 `broker_account_sync_job` now propagates touch callbacks across account snapshot and KIS account summary steps so heartbeat and lease refresh continue during slower sync runs.
 
@@ -196,7 +196,7 @@ Long-running job 대응:
 - `exit_management_interval_minutes`
 - `outcome_resolution_interval_minutes`
 
-?대쾲 留덈Т由?뙣移섏뿉???꾨몢?꾨줈 `broker_account_sync_job` 寃쎈줈?룄 以묈컻 touch瑜??쒖슜?섍쾶 ???怨?怨꾨줈 怨듭쑀 lease/heartbeat ?뺤콉? ?숈씪?⑸땲??
+이번 마무리 패치에서는 추가로 `broker_account_sync_job` 경로에도 중간 touch를 사용하게 해서 공용 lease/heartbeat 갱신과 동일하게 맞췄습니다.
 
 The final polish patch extends the same shared lease and worker-heartbeat touch behavior to `broker_account_sync_job`.
 
@@ -218,7 +218,7 @@ The final polish patch extends the same shared lease and worker-heartbeat touch 
 
 거래 loop 자체는 계속 worker에서만 실행됩니다.
 
-broker sync ?곹깭? 理쒓렐 sync ?ㅻ쪟??`monitoring/dashboard_hooks.py`媛 repository?먯꽌 ?쎌뼱 app?먯꽌 紐낆떆?곸쑝濡?ㅽ뻾?쒕땲??
+broker sync 상태와 최근 sync 오류는 `monitoring/dashboard_hooks.py`가 repository에서 읽어 app에서 명시적으로 노출합니다.
 
 Broker sync status and recent sync errors are read from the repository in `monitoring/dashboard_hooks.py` and surfaced directly in the app monitor.
 

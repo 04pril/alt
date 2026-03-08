@@ -22,7 +22,7 @@ import yfinance as yf
 
 from config.settings import load_settings
 from kis_paper import KISPaperError
-from monitoring.dashboard_hooks import load_dashboard_data, set_trading_pause_state
+from monitoring.dashboard_hooks import load_dashboard_data, load_monitor_open_positions, load_monitor_recent_orders, set_trading_pause_state
 from prediction_memory import (
     filter_prediction_history,
     load_prediction_log,
@@ -227,7 +227,23 @@ def normalize_kr_name_key(text: str) -> str:
     return normalized
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def _read_krx_tables_with_fallback(html_text: str) -> List[pd.DataFrame]:
+    parse_attempts: List[dict[str, Any]] = [{}, {"flavor": ["bs4"]}, {"flavor": ["html5lib"]}]
+    last_error: Exception | None = None
+    for kwargs in parse_attempts:
+        try:
+            tables = quiet_external_call(lambda: pd.read_html(io.StringIO(html_text), **kwargs))
+        except Exception as exc:
+            last_error = exc
+            continue
+        if tables:
+            return tables
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     try:
         response = requests.get(
@@ -237,7 +253,7 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
         )
         response.raise_for_status()
         response.encoding = "euc-kr"
-        tables = quiet_external_call(lambda: pd.read_html(io.StringIO(response.text)))
+        tables = _read_krx_tables_with_fallback(response.text)
     except Exception:
         return {}
     if not tables:
@@ -410,7 +426,7 @@ def build_single_top100_entries(scope: str) -> List[Dict[str, str | int | None]]
     return output
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def resolve_single_top100_entries(scope: str, display_limit: int) -> Tuple[List[Dict[str, str | int | None]], List[str]]:
     entries = build_single_top100_entries(scope=scope)[: max(display_limit, 0)]
     resolved_map: Dict[Tuple[str, str], str] = {}
@@ -963,6 +979,25 @@ def format_frame_timestamps_for_display(frame: pd.DataFrame) -> pd.DataFrame:
     return view
 
 
+def format_job_health_for_display(frame: pd.DataFrame, limit: int | None = None) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    view = frame.head(limit).copy() if limit is not None else frame.copy()
+    preferred = [
+        "job_name",
+        "status",
+        "scheduled_at",
+        "started_at",
+        "finished_at",
+        "retry_count",
+        "error_message",
+        "run_key",
+    ]
+    remaining = [column for column in view.columns if column not in preferred]
+    ordered = [column for column in preferred if column in view.columns] + remaining
+    return format_frame_timestamps_for_display(view[ordered].rename(columns={"job_name": "job"}))
+
+
 def restart_background_worker() -> Tuple[bool, str]:
     workspace = Path(__file__).resolve().parent
     python_executable = Path(sys.executable)
@@ -1422,72 +1457,563 @@ def render_prediction_tracking_section(result, asset_type: str, korea_market: st
             st.caption("이 심볼에 확정된 예측 이력이 없습니다.")
         else:
             st.dataframe(resolved_view, width="stretch", hide_index=True)
+ 
+ 
+MONITOR_SYNC_LABELS = {
+    "broker_account_sync": "계좌 Sync",
+    "broker_order_sync": "주문 Sync",
+    "broker_position_sync": "포지션 Sync",
+}
 
 
-def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _operations_monitor_styles(theme_mode: str) -> str:
+    theme_mode = "dark" if str(theme_mode).lower() == "dark" else "light"
+    if theme_mode == "dark":
+        palette = {
+            "card_border": "rgba(148, 163, 184, 0.14)",
+            "card_bg": "linear-gradient(180deg, rgba(15, 23, 42, 0.88) 0%, rgba(9, 14, 28, 0.98) 100%), radial-gradient(circle at top right, rgba(59, 130, 246, 0.14), transparent 55%)",
+            "card_shadow": "0 20px 44px rgba(2, 6, 23, 0.26)",
+            "card_text": "rgba(241, 245, 249, 0.98)",
+            "kicker": "rgba(148, 163, 184, 0.88)",
+            "note": "rgba(226, 232, 240, 0.82)",
+            "pill_bg": "rgba(15, 23, 42, 0.58)",
+            "pill_border": "rgba(148, 163, 184, 0.12)",
+            "pill_text": "rgba(226, 232, 240, 0.9)",
+            "detail_bg": "rgba(15, 23, 42, 0.58)",
+            "detail_span": "rgba(148, 163, 184, 0.92)",
+            "chip_bg": "rgba(15, 23, 42, 0.52)",
+            "chip_border": "rgba(148, 163, 184, 0.12)",
+            "sync_meta": "rgba(226, 232, 240, 0.82)",
+            "sync_error": "rgba(252, 165, 165, 0.95)",
+        }
+    else:
+        palette = {
+            "card_border": "rgba(148, 163, 184, 0.28)",
+            "card_bg": "linear-gradient(180deg, rgba(255, 255, 255, 0.98) 0%, rgba(248, 250, 252, 0.98) 100%), radial-gradient(circle at top right, rgba(59, 130, 246, 0.10), transparent 58%)",
+            "card_shadow": "0 18px 40px rgba(148, 163, 184, 0.18)",
+            "card_text": "#0f172a",
+            "kicker": "#94a3b8",
+            "note": "#64748b",
+            "pill_bg": "rgba(226, 232, 240, 0.82)",
+            "pill_border": "rgba(148, 163, 184, 0.36)",
+            "pill_text": "#475569",
+            "detail_bg": "rgba(226, 232, 240, 0.78)",
+            "detail_span": "#64748b",
+            "chip_bg": "rgba(226, 232, 240, 0.88)",
+            "chip_border": "rgba(148, 163, 184, 0.32)",
+            "sync_meta": "#64748b",
+            "sync_error": "#b91c1c",
+        }
+    return f"""
+        <style>
+        .alt-ops-hero-card,
+        .alt-ops-runtime-card,
+        .alt-ops-sync-card {{
+          border-radius: 22px;
+          border: 1px solid {palette["card_border"]};
+          background: {palette["card_bg"]};
+          box-shadow: {palette["card_shadow"]};
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-hero-card,
+        .alt-ops-runtime-card {{
+          padding: 1.2rem 1.25rem;
+          min-height: 24rem;
+          display: flex;
+          flex-direction: column;
+          gap: 0.95rem;
+        }}
+        .alt-ops-sync-card {{
+          padding: 0.95rem 1rem;
+          min-height: 100%;
+        }}
+        .alt-ops-card-kicker {{
+          margin: 0;
+          font-size: 0.72rem;
+          font-weight: 700;
+          letter-spacing: 0.08em;
+          text-transform: uppercase;
+          color: {palette["kicker"]};
+        }}
+        .alt-ops-balance-value {{
+          margin: 0;
+          font-size: clamp(2.2rem, 4vw, 3.65rem);
+          line-height: 0.98;
+          font-weight: 800;
+          letter-spacing: -0.04em;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-balance-note {{
+          margin: 0;
+          font-size: 0.95rem;
+          color: {palette["note"]};
+        }}
+        .alt-ops-balance-summary {{
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.75rem 1rem;
+          margin-top: 0;
+        }}
+        .alt-ops-balance-pill {{
+          display: inline-flex;
+          align-items: center;
+          gap: 0.45rem;
+          padding: 0.42rem 0.7rem;
+          border-radius: 999px;
+          background: {palette["pill_bg"]};
+          border: 1px solid {palette["pill_border"]};
+          font-size: 0.84rem;
+          color: {palette["pill_text"]};
+        }}
+        .alt-ops-balance-pill strong {{
+          font-size: 0.92rem;
+          font-weight: 700;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-detail-grid {{
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 0.75rem;
+          margin-top: 0;
+        }}
+        .alt-ops-detail-item {{
+          padding: 0.8rem 0.9rem;
+          border-radius: 16px;
+          background: {palette["detail_bg"]};
+          border: 1px solid {palette["pill_border"]};
+        }}
+        .alt-ops-detail-item span {{
+          display: block;
+          margin-bottom: 0.2rem;
+          font-size: 0.74rem;
+          color: {palette["detail_span"]};
+        }}
+        .alt-ops-detail-item strong {{
+          display: block;
+          font-size: 1rem;
+          font-weight: 700;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-runtime-title {{
+          margin: 0;
+          font-size: 1.28rem;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-runtime-body,
+        .alt-ops-runtime-meta {{
+          margin: 0;
+          font-size: 0.88rem;
+          line-height: 1.5;
+          color: {palette["note"]};
+        }}
+        .alt-ops-runtime-body strong {{
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-runtime-grid {{
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 0.65rem;
+          margin-top: 0;
+          padding-top: 0.15rem;
+        }}
+        .alt-ops-runtime-chip {{
+          padding: 0.7rem 0.8rem;
+          border-radius: 14px;
+          background: {palette["chip_bg"]};
+          border: 1px solid {palette["chip_border"]};
+        }}
+        .alt-ops-runtime-chip span {{
+          display: block;
+          font-size: 0.73rem;
+          color: {palette["detail_span"]};
+        }}
+        .alt-ops-runtime-chip strong {{
+          display: block;
+          margin-top: 0.15rem;
+          font-size: 0.96rem;
+          font-weight: 700;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-runtime-chip small {{
+          display: block;
+          margin-top: 0.12rem;
+          font-size: 0.72rem;
+          color: {palette["note"]};
+        }}
+        .alt-ops-card-head {{
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 0.8rem;
+        }}
+        .alt-ops-sync-name {{
+          margin: 0.15rem 0 0;
+          font-size: 1rem;
+          font-weight: 700;
+          letter-spacing: -0.02em;
+          color: {palette["card_text"]};
+        }}
+        .alt-ops-sync-meta,
+        .alt-ops-sync-error {{
+          margin: 0.45rem 0 0;
+          font-size: 0.84rem;
+          line-height: 1.45;
+          color: {palette["sync_meta"]};
+        }}
+        .alt-ops-sync-error {{
+          color: {palette["sync_error"]};
+        }}
+        .alt-ops-sync-card.alt-ops-sync-failed {{
+          border-color: rgba(239, 68, 68, 0.34);
+        }}
+        .alt-ops-sync-card.alt-ops-sync-running {{
+          border-color: rgba(59, 130, 246, 0.34);
+        }}
+        .alt-ops-sync-card.alt-ops-sync-completed {{
+          border-color: rgba(16, 185, 129, 0.30);
+        }}
+        .alt-ops-sync-card.alt-ops-sync-never {{
+          border-color: rgba(148, 163, 184, 0.18);
+        }}
+        .alt-ops-section-gap {{
+          height: 1rem;
+        }}
+        </style>
+    """
+
+
+def _build_operations_balance_card_html(
+    account_snapshot: Dict[str, Any],
+    trade_performance: Dict[str, Any],
+) -> str:
+    equity_text = format_price_value(_safe_float(account_snapshot.get("equity")))
+    cash_text = format_price_value(_safe_float(account_snapshot.get("cash")))
+    today_pnl_text = format_price_value(_safe_float(trade_performance.get("today_pnl")))
+    total_return_text = format_pct_value(_safe_float(trade_performance.get("total_return_pct")))
+    gross_text = format_price_value(_safe_float(account_snapshot.get("gross_exposure")))
+    net_text = format_price_value(_safe_float(account_snapshot.get("net_exposure")))
+    updated_text = str(account_snapshot.get("created_at_kst") or format_display_timestamp(account_snapshot.get("created_at")) or "기록 없음")
+    return f"""
+        <div class="alt-ops-hero-card">
+          <p class="alt-ops-card-kicker">현재 계좌 잔고</p>
+          <div class="alt-ops-balance-value">{html.escape(equity_text)}</div>
+          <p class="alt-ops-balance-note">총자산 기준</p>
+          <div class="alt-ops-balance-summary">
+            <div class="alt-ops-balance-pill"><span>현금</span><strong>{html.escape(cash_text)}</strong></div>
+            <div class="alt-ops-balance-pill"><span>Today PnL</span><strong>{html.escape(today_pnl_text)}</strong></div>
+            <div class="alt-ops-balance-pill"><span>누적 수익률</span><strong>{html.escape(total_return_text)}</strong></div>
+          </div>
+          <div class="alt-ops-detail-grid">
+            <div class="alt-ops-detail-item">
+              <span>총 노출</span>
+              <strong>{html.escape(gross_text)}</strong>
+            </div>
+            <div class="alt-ops-detail-item">
+              <span>순 노출</span>
+              <strong>{html.escape(net_text)}</strong>
+            </div>
+          </div>
+          <p class="alt-ops-runtime-meta">마지막 스냅샷 {html.escape(updated_text)}</p>
+        </div>
+    """
+
+
+def _sync_status_label(status: str) -> str:
+    return {
+        "completed": "완료",
+        "running": "진행중",
+        "failed": "실패",
+        "never": "대기",
+        "queued": "대기",
+    }.get(str(status).lower(), str(status).title())
+
+
+def _sync_status_badge_class(status: str) -> str:
+    return {
+        "completed": "running",
+        "running": "running",
+        "failed": "stopped",
+        "never": "paused",
+        "queued": "paused",
+        "cancelled": "paused",
+    }.get(str(status).lower(), "paused")
+
+
+def _sync_status_summary_text(row: Dict[str, Any]) -> str:
+    status = str(row.get("status", "never") or "never")
+    finished_text = format_display_timestamp(row.get("finished_at")) or "아직 없음"
+    return f"{_sync_status_label(status)} · {finished_text}"
+
+
+def _build_operations_runtime_card_html(
+    auto_trading_status: Dict[str, Any],
+    account_snapshot: Dict[str, Any],
+    broker_sync_status: Dict[str, Dict[str, Any]],
+) -> str:
+    runtime_text = auto_trading_status_text(auto_trading_status)
+    badge_html = auto_trading_badge_html(auto_trading_status)
+    heartbeat_text = str(runtime_text or "heartbeat 정보가 없습니다.")
+    drawdown_text = format_pct_value(_safe_float(account_snapshot.get("drawdown_pct")))
+    account_sync = broker_sync_status.get("broker_account_sync", {})
+    order_sync = broker_sync_status.get("broker_order_sync", {})
+    position_sync = broker_sync_status.get("broker_position_sync", {})
+    return f"""
+        <div class="alt-ops-runtime-card">
+          <div class="alt-ops-card-head">
+            <p class="alt-ops-card-kicker">Runtime 상태</p>
+            {badge_html}
+          </div>
+          <p class="alt-ops-runtime-title">백그라운드 워커 상태</p>
+          <p class="alt-ops-runtime-body"><strong>{html.escape(heartbeat_text)}</strong></p>
+          <div class="alt-ops-runtime-grid">
+            <div class="alt-ops-runtime-chip">
+              <span>최근 계좌 Sync</span>
+              <strong>{html.escape(_sync_status_label(str(account_sync.get("status", "never"))))}</strong>
+              <small>{html.escape(_sync_status_summary_text(account_sync))}</small>
+            </div>
+            <div class="alt-ops-runtime-chip">
+              <span>최근 주문 Sync</span>
+              <strong>{html.escape(_sync_status_label(str(order_sync.get("status", "never"))))}</strong>
+              <small>{html.escape(_sync_status_summary_text(order_sync))}</small>
+            </div>
+            <div class="alt-ops-runtime-chip">
+              <span>최근 포지션 Sync</span>
+              <strong>{html.escape(_sync_status_label(str(position_sync.get("status", "never"))))}</strong>
+              <small>{html.escape(_sync_status_summary_text(position_sync))}</small>
+            </div>
+            <div class="alt-ops-runtime-chip">
+              <span>최대 낙폭</span>
+              <strong>{html.escape(drawdown_text)}</strong>
+              <small>계좌 스냅샷 기준</small>
+            </div>
+          </div>
+        </div>
+    """
+
+
+def _build_broker_sync_card_html(job_name: str, row: Dict[str, Any]) -> str:
+    status = str(row.get("status", "never") or "never")
+    status_class = {
+        "completed": "alt-ops-sync-completed",
+        "running": "alt-ops-sync-running",
+        "failed": "alt-ops-sync-failed",
+        "never": "alt-ops-sync-never",
+    }.get(status, "alt-ops-sync-never")
+    finished_text = format_display_timestamp(row.get("finished_at")) or "아직 없음"
+    retry_count = int(first_valid_float(row.get("retry_count"), default=0.0))
+    error_text = str(row.get("error_message", "") or "").strip()
+    error_block = (
+        f'<p class="alt-ops-sync-error">{html.escape(error_text[:120])}</p>'
+        if error_text
+        else '<p class="alt-ops-sync-meta">오류 없음</p>'
+    )
+    return f"""
+        <div class="alt-ops-sync-card {status_class}">
+          <div class="alt-ops-card-head">
+            <p class="alt-ops-card-kicker">Broker Sync</p>
+            <span class="alt-status-badge alt-status-{html.escape(_sync_status_badge_class(status))}">
+              {html.escape(_sync_status_label(status))}
+            </span>
+          </div>
+          <p class="alt-ops-sync-name">{html.escape(MONITOR_SYNC_LABELS.get(job_name, job_name))}</p>
+          <p class="alt-ops-sync-meta">마지막 완료 {html.escape(finished_text)} · retry {retry_count}</p>
+          {error_block}
+        </div>
+    """
+
+
+def build_live_open_positions_view(open_positions: pd.DataFrame, refresh_token: int) -> pd.DataFrame:
+    if open_positions.empty or "symbol" not in open_positions.columns:
+        return pd.DataFrame()
+    symbols = tuple(dict.fromkeys(open_positions["symbol"].dropna().astype(str).tolist()))
+    if not symbols:
+        return pd.DataFrame()
+    snapshots = fetch_quote_snapshots(symbols=symbols, refresh_token=refresh_token)
+    rows: List[Dict[str, object]] = []
+    for _, row in open_positions.iterrows():
+        symbol = str(row.get("symbol") or "")
+        snapshot = dict(snapshots.get(symbol) or {})
+        currency = str(snapshot.get("currency") or default_currency_from_symbol(symbol))
+        side = str(row.get("side") or "")
+        quantity = int(first_valid_float(row.get("quantity"), default=0.0))
+        entry_price = first_valid_float(row.get("entry_price"))
+        current_price = first_valid_float(snapshot.get("current_price"), row.get("mark_price"))
+        day_change_pct = first_valid_float(snapshot.get("change_pct"))
+        if np.isfinite(entry_price) and np.isfinite(current_price) and entry_price != 0 and quantity > 0:
+            signed_return_pct = ((current_price - entry_price) / entry_price) * 100.0
+            pnl_pct = signed_return_pct if side == "LONG" else -signed_return_pct
+            pnl_value = (current_price - entry_price) * quantity if side == "LONG" else (entry_price - current_price) * quantity
+            market_value = current_price * quantity
+        else:
+            pnl_pct = float("nan")
+            pnl_value = first_valid_float(row.get("unrealized_pnl"))
+            market_value = float("nan")
+        rows.append(
+            {
+                "종목": symbol,
+                "자산": str(row.get("asset_type") or ""),
+                "방향": side,
+                "수량": quantity,
+                "진입가": format_live_price(entry_price, currency),
+                "현재가": format_live_price(current_price, currency),
+                "전일대비": format_pct_value(day_change_pct),
+                "평가금액": format_live_price(market_value, currency),
+                "평가손익": format_live_price(pnl_value, currency),
+                "수익률": format_pct_value(pnl_pct),
+                "갱신시각": format_display_timestamp(row.get("updated_at")),
+            }
+        )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
+    return frame
+
+
+ORDER_SIDE_LABELS: Dict[str, str] = {
+    "buy": "매수",
+    "sell": "매도",
+}
+
+ORDER_STATUS_LABELS: Dict[str, str] = {
+    "new": "접수",
+    "submitted": "제출",
+    "acknowledged": "접수확인",
+    "pending_fill": "체결대기",
+    "partially_filled": "부분체결",
+    "filled": "체결완료",
+    "rejected": "거부",
+    "cancelled": "취소",
+    "expired": "만료",
+}
+
+ORDER_REASON_LABELS: Dict[str, str] = {
+    "entry": "신규진입",
+    "manual_exit": "수동청산",
+    "stop_loss": "손절",
+    "take_profit": "익절",
+    "trailing_stop": "추적손절",
+    "time_stop": "시간청산",
+    "opposite_signal": "반대신호",
+    "score_decay": "점수약화",
+}
+
+
+def build_recent_order_activity_view(recent_orders: pd.DataFrame) -> pd.DataFrame:
+    if recent_orders.empty or "symbol" not in recent_orders.columns:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    for _, row in recent_orders.iterrows():
+        symbol = str(row.get("symbol") or "")
+        currency = default_currency_from_symbol(symbol)
+        side = str(row.get("side") or "").lower()
+        status = str(row.get("status") or "").lower()
+        reason = str(row.get("reason") or "")
+        rows.append(
+            {
+                "종목": symbol,
+                "자산": str(row.get("asset_type") or ""),
+                "주문": ORDER_SIDE_LABELS.get(side, side.upper() or "-"),
+                "요청수량": int(first_valid_float(row.get("requested_qty"), default=0.0)),
+                "체결수량": int(first_valid_float(row.get("filled_qty"), default=0.0)),
+                "주문가": format_live_price(first_valid_float(row.get("requested_price")), currency),
+                "상태": ORDER_STATUS_LABELS.get(status, status or "-"),
+                "사유": ORDER_REASON_LABELS.get(reason, reason or "-"),
+                "갱신시각": format_display_timestamp(row.get("updated_at")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_live_open_positions_panel(settings) -> None:
+    with st.container(border=True):
+        st.caption("실시간 보유 포지션")
+        view_mode = st.radio(
+            "실시간 보유 패널 보기",
+            ["보유 포지션", "매수·매도 내역"],
+            horizontal=True,
+            key="ops_live_positions_mode",
+            label_visibility="collapsed",
+        )
+        if view_mode == "보유 포지션":
+            st.caption("15초 간격으로 현재가를 다시 읽어 평가손익과 수익률을 갱신합니다.")
+        else:
+            st.caption("최근 주문 기록을 15초 간격으로 다시 읽어 매수·매도 흐름을 확인합니다.")
+
+        @st.fragment(run_every=15)
+        def _render_live_open_positions_fragment() -> None:
+            if view_mode == "보유 포지션":
+                current_positions = load_monitor_open_positions(settings)
+                if current_positions.empty:
+                    st.caption("현재 보유 중인 포지션이 없습니다.")
+                    return
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                live_view = build_live_open_positions_view(current_positions, refresh_token=refresh_token)
+                metric_cols = st.columns(3, gap="small")
+                metric_cols[0].metric("보유 종목 수", f"{len(current_positions)}", border=True)
+                metric_cols[1].metric(
+                    "롱 포지션",
+                    f"{int((current_positions['side'].astype(str) == 'LONG').sum())}",
+                    border=True,
+                )
+                metric_cols[2].metric(
+                    "숏 포지션",
+                    f"{int((current_positions['side'].astype(str) == 'SHORT').sum())}",
+                    border=True,
+                )
+                st.dataframe(live_view, width="stretch", hide_index=True, height=260)
+                return
+
+            recent_orders = load_monitor_recent_orders(settings, limit=30)
+            if recent_orders.empty:
+                st.caption("최근 주문 기록이 없습니다.")
+                return
+            order_view = build_recent_order_activity_view(recent_orders)
+            metric_cols = st.columns(3, gap="small")
+            metric_cols[0].metric("최근 주문 수", f"{len(recent_orders)}", border=True)
+            metric_cols[1].metric(
+                "매수 주문",
+                f"{int((recent_orders['side'].astype(str).str.lower() == 'buy').sum())}",
+                border=True,
+            )
+            metric_cols[2].metric(
+                "매도 주문",
+                f"{int((recent_orders['side'].astype(str).str.lower() == 'sell').sum())}",
+                border=True,
+            )
+            st.dataframe(order_view, width="stretch", hide_index=True, height=260)
+
+        _render_live_open_positions_fragment()
+
+
+def render_operations_monitor(
+    settings=None,
+    dashboard_data: Dict[str, Any] | None = None,
+    theme_mode: str | None = None,
+) -> None:
     settings = settings or load_settings()
+    theme_mode = theme_mode or get_streamlit_theme_mode()
 
     st.subheader("운영 모니터링")
     st.caption("background worker가 저장한 예측/포지션/잡 상태를 읽기 전용으로 표시합니다.")
-    control_cols = st.columns([1.0, 1.0, 1.1, 1.1, 1.1, 2.6])
-    if control_cols[0].button("신규 진입 중단", key="ops_pause"):
-        set_trading_pause_state(settings, paused=True)
-        st.rerun()
-    if control_cols[1].button("신규 진입 재개", key="ops_resume"):
-        set_trading_pause_state(settings, paused=False)
-        st.rerun()
-    if control_cols[2].button("계좌 Sync", key="ops_broker_account_sync"):
-        ok, message = run_manual_runtime_job("broker_account_sync")
-        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
-        st.rerun()
-    if control_cols[3].button("주문 Sync", key="ops_broker_order_sync"):
-        ok, message = run_manual_runtime_job("broker_order_sync")
-        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
-        st.rerun()
-    if control_cols[4].button("포지션 Sync", key="ops_broker_position_sync"):
-        ok, message = run_manual_runtime_job("broker_position_sync")
-        st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
-        st.rerun()
 
     data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
+    account_snapshot = data.get("account_snapshot") or dict(summary.get("latest_account") or {})
     trade_performance = data["trade_performance"]
     auto_trading_status = data.get("auto_trading_status", {})
     broker_sync_status = data.get("broker_sync_status", {})
     broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
-    feedback = st.session_state.pop("broker_sync_feedback", None)
-    if isinstance(feedback, dict) and feedback.get("message"):
-        if feedback.get("ok"):
-            st.success(str(feedback["message"]))
-        else:
-            st.error(str(feedback["message"]))
-    metrics = st.columns(6)
-    metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
-    metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
-    metrics[2].metric("오픈 주문", f"{int(summary.get('open_orders', 0))}")
-    metrics[3].metric("Today PnL", format_price_value(float(trade_performance.get("today_pnl", float('nan')))))
-    metrics[4].metric("누적 수익률", format_pct_value(float(trade_performance.get("total_return_pct", float("nan")))))
-    metrics[5].metric("최대 낙폭", format_pct_value(float(trade_performance.get("max_drawdown_pct", float("nan")))))
-    st.caption(
-        f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
-        f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
-    )
-    if broker_sync_status:
-        sync_rows = pd.DataFrame(
-            [
-                {
-                    "job": key,
-                    "status": row.get("status", "never"),
-                    "finished_at": row.get("finished_at", pd.NaT),
-                    "retry_count": row.get("retry_count", 0),
-                    "error_message": row.get("error_message", ""),
-                }
-                for key, row in broker_sync_status.items()
-            ]
-        )
-        if not sync_rows.empty:
-            st.dataframe(format_frame_timestamps_for_display(sync_rows), width="stretch", hide_index=True)
-
+    recent_job_status_summary = data.get("recent_job_status_summary", {})
+    kis_monitor = data.get("kis_monitor", {})
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
     open_positions = data["open_positions"]
@@ -1497,19 +2023,134 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     prediction_report = data["prediction_report"]
     equity_curve = data["equity_curve"]
 
-    if not equity_curve.empty:
-        fig = go.Figure(
-            data=[
-                go.Scatter(
-                    x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
-                    y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
-                    mode="lines+markers",
-                    name="Equity",
-                )
-            ]
+    st.markdown(_operations_monitor_styles(theme_mode), unsafe_allow_html=True)
+
+    feedback = st.session_state.pop("broker_sync_feedback", None)
+    if isinstance(feedback, dict) and feedback.get("message"):
+        if feedback.get("ok"):
+            st.success(str(feedback["message"]))
+        else:
+            st.error(str(feedback["message"]))
+
+    hero_cols = st.columns([1.45, 1.0], gap="large")
+    with hero_cols[0]:
+        st.markdown(
+            _build_operations_balance_card_html(account_snapshot=account_snapshot, trade_performance=trade_performance),
+            unsafe_allow_html=True,
         )
-        fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
-        st.plotly_chart(fig, width="stretch")
+    with hero_cols[1]:
+        st.markdown(
+            _build_operations_runtime_card_html(
+                auto_trading_status=auto_trading_status,
+                account_snapshot=account_snapshot,
+                broker_sync_status=broker_sync_status,
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+
+    render_live_open_positions_panel(settings)
+
+    st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+
+    action_cols = st.columns([1.0, 1.35], gap="large")
+    with action_cols[0]:
+        with st.container(border=True):
+            st.caption("자동매매 제어")
+            control_cols = st.columns(2, gap="small")
+            pause_type = "secondary"
+            resume_type = "primary" if str(auto_trading_status.get("state", "")).lower() == "paused" else "secondary"
+            if control_cols[0].button("신규 진입 중단", key="ops_pause", use_container_width=True, type=pause_type):
+                set_trading_pause_state(settings, paused=True)
+                st.rerun()
+            if control_cols[1].button("신규 진입 재개", key="ops_resume", use_container_width=True, type=resume_type):
+                set_trading_pause_state(settings, paused=False)
+                st.rerun()
+            st.caption(f"현재 상태 {auto_trading_status.get('label', 'Stopped')}")
+    with action_cols[1]:
+        with st.container(border=True):
+            st.caption("브로커 동기화")
+            sync_buttons = st.columns(3, gap="small")
+            if sync_buttons[0].button("계좌 Sync", key="ops_broker_account_sync", use_container_width=True):
+                ok, message = run_manual_runtime_job("broker_account_sync")
+                st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+                st.rerun()
+            if sync_buttons[1].button("주문 Sync", key="ops_broker_order_sync", use_container_width=True):
+                ok, message = run_manual_runtime_job("broker_order_sync")
+                st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+                st.rerun()
+            if sync_buttons[2].button("포지션 Sync", key="ops_broker_position_sync", use_container_width=True):
+                ok, message = run_manual_runtime_job("broker_position_sync")
+                st.session_state["broker_sync_feedback"] = {"ok": ok, "message": message}
+                st.rerun()
+            st.caption("저장소 기준 계좌, 주문, 포지션 상태를 즉시 다시 읽습니다.")
+
+    st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+
+    primary_metrics = st.columns(3, gap="small")
+    primary_metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}", border=True)
+    primary_metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}", border=True)
+    primary_metrics[2].metric("오픈 주문", f"{int(summary.get('open_orders', 0))}", border=True)
+
+    st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+
+    status_cols = st.columns([1.35, 0.85], gap="large")
+    with status_cols[0]:
+        with st.container(border=True, height=360):
+            st.caption("최근 Job 상태")
+            if recent_job_status_summary:
+                st.markdown(
+                    f"**{str(recent_job_status_summary.get('label') or '지연')}**  \n"
+                    f"{str(recent_job_status_summary.get('reason') or '')}"
+                )
+            if kis_monitor:
+                buying_power_text = format_display_timestamp(kis_monitor.get("last_buying_power_success_at")) or "기록 없음"
+                buying_power_symbol = str(kis_monitor.get("last_buying_power_symbol") or "").strip()
+                if buying_power_symbol:
+                    buying_power_text = f"{buying_power_text} · {buying_power_symbol}"
+                st.caption(f"KIS 연결 상태 · {str(kis_monitor.get('connection_status') or 'sync지연')}")
+                st.caption(f"매수가능조회 최근 성공 · {buying_power_text}")
+            if job_health.empty:
+                st.caption("job_runs가 없습니다.")
+            else:
+                job_preview = format_job_health_for_display(job_health, limit=5)
+                preview_cols = [c for c in ["job", "status", "started_at", "finished_at", "retry_count", "error_message"] if c in job_preview.columns]
+                st.dataframe(job_preview[preview_cols], width="stretch", hide_index=True, height=250)
+    with status_cols[1]:
+        with st.container(border=True, height=360):
+            st.caption("최근 broker sync 오류")
+            if broker_sync_errors.empty:
+                st.caption("최근 broker sync 오류가 없습니다.")
+            else:
+                st.dataframe(
+                    format_frame_timestamps_for_display(broker_sync_errors.head(3)),
+                    width="stretch",
+                    hide_index=True,
+                    height=250,
+                )
+
+    st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+
+    if not equity_curve.empty:
+        with st.container(border=True):
+            st.caption("계좌 자산 곡선")
+            fig = go.Figure(
+                data=[
+                    go.Scatter(
+                        x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
+                        y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
+                        mode="lines+markers",
+                        name="Equity",
+                    )
+                ]
+            )
+            fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+            st.plotly_chart(fig, width="stretch")
+    else:
+        with st.container(border=True):
+            st.caption("계좌 자산 곡선")
+            st.caption("account_snapshots가 아직 없습니다.")
 
     tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_assets, tab_errors, tab_broker = st.tabs(
         ["Job Health", "Open Positions", "Predictions", "Candidates", "Assets", "Recent Errors", "Broker Sync"]
@@ -1518,7 +2159,7 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         if job_health.empty:
             st.caption("job_runs가 없습니다.")
         else:
-            st.dataframe(format_frame_timestamps_for_display(job_health), width="stretch", hide_index=True)
+            st.dataframe(format_job_health_for_display(job_health), width="stretch", hide_index=True)
     with tab_positions:
         if open_positions.empty and open_orders.empty:
             st.caption("오픈 포지션/주문이 없습니다.")
@@ -2739,7 +3380,11 @@ def switch_to_page(page_key: str) -> None:
 
 
 def render_monitor_page() -> None:
-    render_operations_monitor(settings=runtime_settings, dashboard_data=dashboard_data)
+    render_operations_monitor(
+        settings=runtime_settings,
+        dashboard_data=dashboard_data,
+        theme_mode=theme_mode,
+    )
 
 
 
@@ -3163,7 +3808,7 @@ try:
         items=NAV_ITEMS,
         status=dashboard_data.get("auto_trading_status", {}),
         theme_mode=theme_mode,
-        hide_on_scroll=True,
+        hide_on_scroll=not is_mobile_ui,
         scroll_threshold=88,
     )
 except Exception as exc:

@@ -5,6 +5,8 @@ from unittest.mock import patch
 
 from ui.floating_nav import (
     FloatingNavItem,
+    _FLOATING_NAV_CSS,
+    _FLOATING_NAV_JS,
     _theme_toggle_svg,
     _toolbar_status_label,
     build_nav_items,
@@ -71,6 +73,13 @@ class FloatingNavTest(unittest.TestCase):
         self.assertEqual(tokens["base"], "dark")
         self.assertEqual(tokens["background"], "rgba(12, 18, 32, 0.76)")
         self.assertEqual(tokens["text"], "rgba(226, 232, 240, 0.86)")
+
+    def test_mobile_nav_has_sidebar_suppression_hooks(self) -> None:
+        self.assertIn(".alt-floating-nav.is-suppressed", _FLOATING_NAV_CSS)
+        self.assertIn("const isSidebarOpen =", _FLOATING_NAV_JS)
+        self.assertIn("bindSidebarObserver", _FLOATING_NAV_JS)
+        self.assertIn("const updateTopOffset =", _FLOATING_NAV_JS)
+        self.assertIn("data-testid=\"stHeader\"", _FLOATING_NAV_JS)
 
 
 if __name__ == "__main__":
