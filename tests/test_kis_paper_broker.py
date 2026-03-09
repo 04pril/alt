@@ -13,7 +13,7 @@ from services.paper_broker import PaperBroker
 from services.risk_engine import RiskEngine
 from services.signal_engine import SignalDecision
 from storage.models import OrderRecord
-from storage.repository import TradingRepository
+from storage.repository import TradingRepository, utc_now_iso
 
 
 class _FakeMarketDataService:
@@ -80,7 +80,7 @@ class _FakeKISClient:
         self.order_no += 1
         return {
             "order_no": f"ODR{self.order_no}",
-            "requested_at": "2026-03-09T15:20:00+09:00",
+            "requested_at": utc_now_iso(),
             "message": "accepted",
         }
 

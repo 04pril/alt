@@ -29,9 +29,11 @@ function Find-ManagedProcess {
     )
 
     return @(
-        Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'py.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
+        Get-CimInstance Win32_Process |
         Where-Object {
-            $_.CommandLine -and $_.CommandLine -like "*$Needle*"
+            $_.CommandLine -and
+            $_.Name -match '^(python.*|py|powershell|pwsh)\.exe$' -and
+            $_.CommandLine -like "*$Needle*"
         }
     )
 }

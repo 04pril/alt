@@ -116,7 +116,7 @@ class _FakeKISClient:
         self.order_no += 1
         return {
             "order_no": f"ODR{self.order_no}",
-            "requested_at": "2026-03-09T15:20:00+09:00",
+            "requested_at": utc_now_iso(),
             "message": "accepted",
         }
 

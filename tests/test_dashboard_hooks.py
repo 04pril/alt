@@ -5,7 +5,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from config.settings import RuntimeSettings
-from monitoring.dashboard_hooks import build_asset_overview, compute_auto_trading_status, load_dashboard_data
+from monitoring.dashboard_hooks import (
+    build_asset_overview,
+    compute_auto_trading_status,
+    load_dashboard_data,
+    load_monitor_open_positions,
+)
 from storage.repository import TradingRepository
 
 
@@ -152,6 +157,55 @@ class DashboardHooksTest(unittest.TestCase):
             repo.log_event("INFO", "kis_execution", "filled", "fill", {"symbol": "005930.KS"})
             data = load_dashboard_data(settings)
             self.assertTrue(data["broker_sync_errors"].empty)
+
+    def test_load_monitor_open_positions_localizes_timestamp_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            with repo.connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO positions(
+                        position_id, created_at, updated_at, closed_at, prediction_id, symbol, asset_type, timeframe, side, status,
+                        quantity, entry_price, mark_price, stop_loss, take_profit, trailing_stop, highest_price, lowest_price,
+                        unrealized_pnl, realized_pnl, expected_risk, exposure_value, max_holding_until, strategy_version, cooldown_until, notes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "pos_1",
+                        "2026-03-09T01:00:00Z",
+                        "2026-03-09T01:05:00Z",
+                        None,
+                        None,
+                        "005930.KS",
+                        "한국주식",
+                        "1d",
+                        "LONG",
+                        "open",
+                        1,
+                        70000.0,
+                        71000.0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        1000.0,
+                        0.0,
+                        0.02,
+                        71000.0,
+                        None,
+                        "test",
+                        None,
+                        "",
+                    ),
+                )
+            frame = load_monitor_open_positions(settings)
+            self.assertEqual(len(frame), 1)
+            self.assertEqual(str(frame.iloc[0]["symbol"]), "005930.KS")
+            self.assertEqual(frame.iloc[0]["updated_at"].strftime("%Y-%m-%d %H:%M:%S"), "2026-03-09 10:05:00")
 
 
 if __name__ == "__main__":

@@ -84,6 +84,18 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
     }
 
 
+def load_monitor_open_positions(settings: RuntimeSettings) -> pd.DataFrame:
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+    return _localize_timestamp_columns(repository.open_positions())
+
+
+def load_monitor_recent_orders(settings: RuntimeSettings, limit: int = 30) -> pd.DataFrame:
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+    return _localize_timestamp_columns(repository.recent_orders(limit=limit))
+
+
 def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for asset_type, schedule in settings.asset_schedules.items():

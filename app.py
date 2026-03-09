@@ -30,7 +30,7 @@ from kis_paper import (
     load_equity_curve,
     load_order_log,
 )
-from monitoring.dashboard_hooks import load_dashboard_data
+from monitoring.dashboard_hooks import load_dashboard_data, load_monitor_open_positions, load_monitor_recent_orders
 from prediction_store import (
     attach_order_to_prediction,
     filter_prediction_history,
@@ -61,6 +61,27 @@ WATCHLIST_PRESETS: Dict[str, List[str]] = {
 
 PAPER_VIEW_NAME = "모의매매"
 PAPER_ORDER_SIDE_LABELS = {"buy": "매수", "sell": "매도", "hold": "관망"}
+OPERATIONS_ORDER_STATUS_LABELS = {
+    "new": "접수",
+    "submitted": "제출",
+    "acknowledged": "접수확인",
+    "pending_fill": "체결대기",
+    "partially_filled": "부분체결",
+    "filled": "체결완료",
+    "rejected": "거부",
+    "cancelled": "취소",
+    "expired": "만료",
+}
+OPERATIONS_ORDER_REASON_LABELS = {
+    "entry": "신규진입",
+    "manual_exit": "수동청산",
+    "stop_loss": "손절",
+    "take_profit": "익절",
+    "trailing_stop": "추적손절",
+    "time_stop": "시간청산",
+    "opposite_signal": "반대신호",
+    "score_decay": "점수약화",
+}
 PAPER_ORDER_TYPE_OPTIONS = {"시장가": "market", "지정가": "limit"}
 GLOBAL_DATA_PROVIDER_TEXT = (
     "미국주식·코인은 Yahoo Finance, 한국주식 분석은 KIS 우선(실패 시 네이버 fallback), "
@@ -228,7 +249,23 @@ def normalize_kr_name_key(text: str) -> str:
     return normalized
 
 
-@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def _read_krx_tables_with_fallback(html_text: str) -> List[pd.DataFrame]:
+    parse_attempts: List[dict[str, Any]] = [{}, {"flavor": ["bs4"]}, {"flavor": ["html5lib"]}]
+    last_error: Exception | None = None
+    for kwargs in parse_attempts:
+        try:
+            tables = quiet_external_call(lambda: pd.read_html(io.StringIO(html_text), **kwargs))
+        except Exception as exc:
+            last_error = exc
+            continue
+        if tables:
+            return tables
+    if last_error is not None:
+        raise last_error
+    return []
+
+
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     try:
         response = requests.get(
@@ -238,7 +275,7 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
         )
         response.raise_for_status()
         response.encoding = "euc-kr"
-        tables = quiet_external_call(lambda: pd.read_html(io.StringIO(response.text)))
+        tables = _read_krx_tables_with_fallback(response.text)
     except Exception:
         return {}
     if not tables:
@@ -411,7 +448,7 @@ def build_single_top100_entries(scope: str) -> List[Dict[str, str | int | None]]
     return output
 
 
-@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+@st.cache_data(ttl=60 * 10, show_spinner=False)
 def resolve_single_top100_entries(scope: str, display_limit: int) -> Tuple[List[Dict[str, str | int | None]], List[str]]:
     entries = build_single_top100_entries(scope=scope)[: max(display_limit, 0)]
     resolved_map: Dict[Tuple[str, str], str] = {}
@@ -1518,6 +1555,137 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
             st.dataframe(format_frame_timestamps_for_display(recent_errors), width="stretch", hide_index=True)
 
 
+def build_live_open_positions_view(open_positions: pd.DataFrame, refresh_token: int) -> pd.DataFrame:
+    if open_positions.empty or "symbol" not in open_positions.columns:
+        return pd.DataFrame()
+    symbols = tuple(dict.fromkeys(open_positions["symbol"].dropna().astype(str).tolist()))
+    if not symbols:
+        return pd.DataFrame()
+    snapshots = fetch_quote_snapshots(symbols=symbols, refresh_token=refresh_token)
+    rows: List[Dict[str, object]] = []
+    for _, row in open_positions.iterrows():
+        symbol = str(row.get("symbol") or "")
+        snapshot = dict(snapshots.get(symbol) or {})
+        currency = str(snapshot.get("currency") or default_currency_from_symbol(symbol))
+        side = str(row.get("side") or "")
+        quantity = int(first_valid_float(row.get("quantity"), default=0.0))
+        entry_price = first_valid_float(row.get("entry_price"))
+        current_price = first_valid_float(snapshot.get("current_price"), row.get("mark_price"))
+        day_change_pct = first_valid_float(snapshot.get("change_pct"))
+        if np.isfinite(entry_price) and np.isfinite(current_price) and entry_price != 0 and quantity > 0:
+            signed_return_pct = ((current_price - entry_price) / entry_price) * 100.0
+            pnl_pct = signed_return_pct if side == "LONG" else -signed_return_pct
+            pnl_value = (current_price - entry_price) * quantity if side == "LONG" else (entry_price - current_price) * quantity
+            market_value = current_price * quantity
+        else:
+            pnl_pct = float("nan")
+            pnl_value = first_valid_float(row.get("unrealized_pnl"))
+            market_value = float("nan")
+        rows.append(
+            {
+                "종목": symbol,
+                "자산": str(row.get("asset_type") or ""),
+                "방향": side,
+                "수량": quantity,
+                "진입가": format_live_price(entry_price, currency),
+                "현재가": format_live_price(current_price, currency),
+                "전일대비": format_pct_value(day_change_pct),
+                "평가금액": format_live_price(market_value, currency),
+                "평가손익": format_live_price(pnl_value, currency),
+                "수익률": format_pct_value(pnl_pct),
+                "갱신시각": format_display_timestamp(row.get("updated_at")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_recent_order_activity_view(recent_orders: pd.DataFrame) -> pd.DataFrame:
+    if recent_orders.empty or "symbol" not in recent_orders.columns:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    for _, row in recent_orders.iterrows():
+        symbol = str(row.get("symbol") or "")
+        currency = default_currency_from_symbol(symbol)
+        side = str(row.get("side") or "").lower()
+        status = str(row.get("status") or "").lower()
+        reason = str(row.get("reason") or "")
+        rows.append(
+            {
+                "종목": symbol,
+                "자산": str(row.get("asset_type") or ""),
+                "주문": PAPER_ORDER_SIDE_LABELS.get(side, side.upper() or "-"),
+                "요청수량": int(first_valid_float(row.get("requested_qty"), default=0.0)),
+                "체결수량": int(first_valid_float(row.get("filled_qty"), default=0.0)),
+                "주문가": format_live_price(first_valid_float(row.get("requested_price")), currency),
+                "상태": OPERATIONS_ORDER_STATUS_LABELS.get(status, status or "-"),
+                "사유": OPERATIONS_ORDER_REASON_LABELS.get(reason, reason or "-"),
+                "갱신시각": format_display_timestamp(row.get("updated_at")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def render_live_open_positions_panel(settings) -> None:
+    with st.container(border=True):
+        st.caption("실시간 보유 포지션")
+        view_mode = st.radio(
+            "실시간 보유 패널 보기",
+            ["보유 포지션", "매수·매도 내역"],
+            horizontal=True,
+            key="ops_live_positions_mode",
+            label_visibility="collapsed",
+        )
+        if view_mode == "보유 포지션":
+            st.caption("15초 간격으로 현재가를 다시 읽어 평가손익과 수익률을 갱신합니다.")
+        else:
+            st.caption("최근 주문 기록을 15초 간격으로 다시 읽어 매수·매도 흐름을 확인합니다.")
+
+        @st.fragment(run_every=15)
+        def _render_live_open_positions_fragment() -> None:
+            if view_mode == "보유 포지션":
+                current_positions = load_monitor_open_positions(settings)
+                if current_positions.empty:
+                    st.caption("현재 보유 중인 포지션이 없습니다.")
+                    return
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                live_view = build_live_open_positions_view(current_positions, refresh_token=refresh_token)
+                metric_cols = st.columns(3, gap="small")
+                metric_cols[0].metric("보유 종목 수", f"{len(current_positions)}", border=True)
+                metric_cols[1].metric(
+                    "롱 포지션",
+                    f"{int((current_positions['side'].astype(str) == 'LONG').sum())}",
+                    border=True,
+                )
+                metric_cols[2].metric(
+                    "숏 포지션",
+                    f"{int((current_positions['side'].astype(str) == 'SHORT').sum())}",
+                    border=True,
+                )
+                st.dataframe(live_view, width="stretch", hide_index=True, height=260)
+                return
+
+            recent_orders = load_monitor_recent_orders(settings, limit=30)
+            if recent_orders.empty:
+                st.caption("최근 주문 기록이 없습니다.")
+                return
+            order_view = build_recent_order_activity_view(recent_orders)
+            metric_cols = st.columns(3, gap="small")
+            metric_cols[0].metric("최근 주문 수", f"{len(recent_orders)}", border=True)
+            metric_cols[1].metric(
+                "매수 주문",
+                f"{int((recent_orders['side'].astype(str).str.lower() == 'buy').sum())}",
+                border=True,
+            )
+            metric_cols[2].metric(
+                "매도 주문",
+                f"{int((recent_orders['side'].astype(str).str.lower() == 'sell').sum())}",
+                border=True,
+            )
+            st.dataframe(order_view, width="stretch", hide_index=True, height=260)
+
+        _render_live_open_positions_fragment()
+
+
 def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
     settings = settings or load_settings()
     repository = TradingRepository(settings.storage.db_path)
@@ -1574,6 +1742,8 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
             for _, row in asset_overview.iterrows()
         )
         st.caption(f"자산별 실행 브로커 · {broker_mode_text}")
+
+    render_live_open_positions_panel(settings)
 
     execution_cols = st.columns(5)
     execution_cols[0].metric("Today Candidates", f"{int(execution_summary.get('today_candidate_count', 0))}")
