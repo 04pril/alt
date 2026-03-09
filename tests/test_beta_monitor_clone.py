@@ -4,10 +4,26 @@ import unittest
 
 import pandas as pd
 
-from beta_monitor_clone import _account_card_compact, _build_entry_result_rows, _candidate_tabs_html, _equity_svg, _money_display_pair
+from beta_monitor_clone import (
+    _account_card_compact,
+    _build_entry_result_rows,
+    _candidate_tabs_html,
+    _equity_svg,
+    _money_display_pair,
+    _replace_template_script,
+)
 
 
 class BetaMonitorCloneTest(unittest.TestCase):
+    def test_replace_template_script_swaps_original_template_script(self) -> None:
+        template = """<html><body><div>content</div><script>window.template = true;</script></body></html>"""
+
+        markup = _replace_template_script(template, "<script>window.injected = true;</script>")
+
+        self.assertIn("window.injected = true;", markup)
+        self.assertNotIn("window.template = true;", markup)
+        self.assertEqual(markup.count("<script"), 1)
+
     def test_build_entry_result_rows_filters_non_symbol_noise(self) -> None:
         events = pd.DataFrame(
             [

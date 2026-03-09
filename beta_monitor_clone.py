@@ -164,6 +164,16 @@ def _replace_block(source: str, marker: str, replacement: str) -> str:
     return source
 
 
+def _replace_template_script(source: str, replacement: str) -> str:
+    pattern = re.compile(r"<script\b[^>]*>[\s\S]*?</script>\s*</body>", re.IGNORECASE)
+    if pattern.search(source):
+        return pattern.sub(replacement + "\n</body>", source, count=1)
+    body_match = re.search(r"</body>", source, re.IGNORECASE)
+    if not body_match:
+        return source + replacement
+    return source[: body_match.start()] + replacement + "\n" + source[body_match.start() :]
+
+
 def _account_label(account_id: object) -> str:
     text = str(account_id or "").strip()
     for candidate_id, broker, scope, _, _ in ACCOUNT_VIEW_SPECS:
@@ -1209,5 +1219,5 @@ def render_beta_overview_component(
 }})();
 </script>
 """
-    template = re.sub(r"<script>[\\s\\S]*?</script>\\s*</body>", script_html + "\\n</body>", template, count=1)
+    template = _replace_template_script(template, script_html)
     components.html(template, height=component_height, scrolling=True)
