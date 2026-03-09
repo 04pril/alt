@@ -33,6 +33,7 @@
     "max_holding_bars": 5,
     "time_stop_bars": 3,
     "allow_short": false,
+    "allow_short_asset_types": [],
     "target_daily_vol_pct": 1.0,
     "max_position_size": 1.0
   }

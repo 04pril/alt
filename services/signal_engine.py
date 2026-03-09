@@ -142,6 +142,7 @@ class SignalEngine:
         volatility: float = np.nan,
     ) -> SignalDecision:
         strategy = self.settings.strategy
+        shortable_assets = {str(value) for value in getattr(strategy, "allow_short_asset_types", [])}
         result = run_forecast_on_price_data(
             symbol=symbol,
             price_data=bars,
@@ -157,7 +158,7 @@ class SignalEngine:
             embargo_days=strategy.embargo_bars,
             target_mode=strategy.target_mode,
             validation_days=strategy.validation_bars,
-            allow_short=strategy.allow_short,
+            allow_short=bool(strategy.allow_short or asset_type in shortable_assets),
             trade_mode=strategy.trade_mode,
             target_daily_vol_pct=strategy.target_daily_vol_pct,
             max_position_size=strategy.max_position_size,

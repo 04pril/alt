@@ -41,6 +41,7 @@ class Retrainer:
         metrics: List[Dict[str, float]] = []
         for symbol in self.settings.retraining.benchmark_symbols:
             asset_type = "코인" if symbol.endswith("-USD") else ("한국주식" if symbol.endswith(".KS") or symbol.endswith(".KQ") else "미국주식")
+            shortable_assets = {str(value) for value in getattr(self.settings.strategy, "allow_short_asset_types", [])}
             try:
                 result = run_forecast(
                     symbol=symbol,
@@ -54,7 +55,7 @@ class Retrainer:
                     min_signal_strength_pct=self.settings.strategy.min_signal_strength_pct,
                     trade_mode=self.settings.strategy.trade_mode,
                     target_mode=self.settings.strategy.target_mode,
-                    allow_short=self.settings.strategy.allow_short,
+                    allow_short=bool(self.settings.strategy.allow_short or asset_type in shortable_assets),
                     target_daily_vol_pct=self.settings.strategy.target_daily_vol_pct,
                     max_position_size=self.settings.strategy.max_position_size,
                     stop_loss_atr_mult=self.settings.strategy.stop_loss_atr_mult,

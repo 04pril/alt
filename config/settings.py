@@ -64,6 +64,7 @@ class StrategySettings:
     max_holding_bars: int = 5
     time_stop_bars: int = 3
     allow_short: bool = False
+    allow_short_asset_types: List[str] = field(default_factory=list)
     target_daily_vol_pct: float = 1.0
     max_position_size: float = 1.0
     scan_score_weights: Dict[str, float] = field(
