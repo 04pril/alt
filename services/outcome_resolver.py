@@ -13,16 +13,21 @@ class OutcomeResolver:
         self.repository = repository
         self.market_data_service = market_data_service
 
+    @staticmethod
+    def _coerce_utc_timestamp(value: object) -> pd.Timestamp:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            return timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("UTC")
+
     def resolve(self, limit: int = 500) -> int:
         unresolved = self.repository.unresolved_predictions(limit=limit)
         if unresolved.empty:
             return 0
         resolved_count = 0
-        now_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+        now_utc = pd.Timestamp.now(tz="UTC")
         for _, row in unresolved.iterrows():
-            target_at = pd.Timestamp(row["target_at"])
-            if target_at.tzinfo is None:
-                target_at = target_at.tz_localize("UTC")
+            target_at = self._coerce_utc_timestamp(row["target_at"])
             if target_at > now_utc:
                 continue
             try:
@@ -34,7 +39,7 @@ class OutcomeResolver:
                 )
             except Exception:
                 continue
-            index = pd.to_datetime(bars.index)
+            index = pd.to_datetime(bars.index, utc=True)
             if str(row["timeframe"]) == "1d":
                 target_key = target_at.tz_convert("UTC").tz_localize(None).normalize()
                 close_map = pd.Series(bars["Close"].astype(float).values, index=index.tz_localize(None).normalize())

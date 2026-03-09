@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import timedelta
 from math import floor
 from typing import Any, Dict
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,12 +18,14 @@ from storage.repository import TradingRepository, make_id, utc_now_iso
 
 
 class PaperBroker:
+    SIM_ONLY_EXCLUDED_SOURCES = ("kis_account_sync",)
+
     def __init__(self, settings: RuntimeSettings, repository: TradingRepository):
         self.settings = settings
         self.repository = repository
 
     def ensure_account_initialized(self) -> None:
-        if self.repository.latest_account_snapshot() is not None:
+        if self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) is not None:
             return
         self.repository.insert_account_snapshot(
             AccountSnapshotRecord(
@@ -46,15 +49,156 @@ class PaperBroker:
 
     def _latest_account(self) -> Dict[str, Any]:
         self.ensure_account_initialized()
-        return self.repository.latest_account_snapshot() or {}
+        return self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) or {}
+
+    def _store_account_snapshot(
+        self,
+        *,
+        cash: float,
+        equity: float,
+        gross_exposure: float,
+        net_exposure: float,
+        realized_pnl: float,
+        unrealized_pnl: float,
+        daily_pnl: float,
+        open_positions: int,
+        open_orders: int,
+        source: str,
+        raw_json: str = "{}",
+        touch=None,
+    ) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        if str(source) == "kis_account_sync":
+            peak_source = float(self.repository.max_account_equity(source="kis_account_sync"))
+        else:
+            peak_source = float(self.repository.max_account_equity(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES))
+        peak = max(peak_source, float(equity))
+        drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
+        record = AccountSnapshotRecord(
+            snapshot_id=make_id("snap"),
+            created_at=utc_now_iso(),
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized_pnl),
+            unrealized_pnl=float(unrealized_pnl),
+            daily_pnl=float(daily_pnl),
+            drawdown_pct=float(drawdown_pct),
+            open_positions=int(open_positions),
+            open_orders=int(open_orders),
+            paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
+            source=source,
+            raw_json=raw_json,
+        )
+        self.repository.insert_account_snapshot(record)
+        touch(
+            "account_snapshot_stored",
+            {
+                "source": source,
+                "equity": float(equity),
+                "cash": float(cash),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+            },
+        )
+        return {
+            "snapshot_id": record.snapshot_id,
+            "created_at": record.created_at,
+            "cash": record.cash,
+            "equity": record.equity,
+            "gross_exposure": record.gross_exposure,
+            "net_exposure": record.net_exposure,
+            "realized_pnl": record.realized_pnl,
+            "unrealized_pnl": record.unrealized_pnl,
+            "daily_pnl": record.daily_pnl,
+            "drawdown_pct": record.drawdown_pct,
+            "open_positions": record.open_positions,
+            "open_orders": record.open_orders,
+            "source": record.source,
+        }
+
+    def record_external_account_snapshot(
+        self,
+        *,
+        cash: float,
+        equity: float,
+        gross_exposure: float,
+        net_exposure: float,
+        unrealized_pnl: float,
+        open_positions: int,
+        source: str,
+        raw_json: str = "{}",
+        touch=None,
+    ) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("external_account_snapshot_start", {"source": source})
+        realized = self.repository.total_realized_pnl()
+        today = str(pd.Timestamp.utcnow().date())
+        daily_pnl = self.repository.recent_closed_realized_pnl(today)
+        open_order_count = int(len(self.repository.open_orders()))
+        return self._store_account_snapshot(
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized),
+            unrealized_pnl=float(unrealized_pnl),
+            daily_pnl=float(daily_pnl),
+            open_positions=int(open_positions),
+            open_orders=open_order_count,
+            source=source,
+            raw_json=raw_json,
+            touch=touch,
+        )
+
+    def _position_side_from_order(self, order_side: str) -> str:
+        return "LONG" if order_side == "buy" else "SHORT"
+
+    def _signed_market_value(self, side: str, quantity: int, price: float) -> float:
+        notional = float(quantity) * float(price)
+        return notional if side == "LONG" else -notional
+
+    def _compute_unrealized(self, side: str, entry_price: float, mark_price: float, quantity: int) -> float:
+        if side == "LONG":
+            return (mark_price - entry_price) * quantity
+        return (entry_price - mark_price) * quantity
+
+    def _timeframe_delta(self, timeframe: str) -> timedelta:
+        if timeframe == "1h":
+            return timedelta(hours=1)
+        return timedelta(days=1)
+
+    def _compute_cooldown_until(self, asset_type: str, timeframe: str, now_iso: str) -> str:
+        bars = max(int(self.settings.risk.cooldown_bars_after_exit), 0)
+        current = pd.Timestamp(now_iso)
+        if current.tzinfo is None:
+            current = current.tz_localize("UTC")
+        if bars <= 0:
+            return current.isoformat()
+        if timeframe == "1h":
+            return (current + pd.Timedelta(hours=bars)).isoformat()
+
+        schedule = self.settings.asset_schedules.get(asset_type)
+        if schedule is None:
+            return (current + pd.Timedelta(days=bars)).isoformat()
+
+        local = current.tz_convert(ZoneInfo(schedule.timezone))
+        cursor = local
+        remaining = bars
+        while remaining > 0:
+            cursor = cursor + pd.Timedelta(days=1)
+            if cursor.weekday() >= 5:
+                continue
+            remaining -= 1
+        return cursor.tz_convert("UTC").isoformat()
 
     def submit_entry_order(self, signal: SignalDecision, quantity: int, scan_id: str | None = None) -> str:
         now_iso = utc_now_iso()
         order_id = make_id("ord")
         side = "buy" if signal.signal == "LONG" else "sell"
-        timeframe_delta = timedelta(hours=1) if signal.timeframe == "1h" else timedelta(days=1)
         max_holding_until = (
-            pd.Timestamp.utcnow().tz_localize("UTC") + timeframe_delta * int(self.settings.strategy.max_holding_bars)
+            pd.Timestamp.now(tz="UTC") + self._timeframe_delta(signal.timeframe) * int(self.settings.strategy.max_holding_bars)
         ).isoformat()
         record = OrderRecord(
             order_id=order_id,
@@ -80,6 +224,7 @@ class PaperBroker:
             reason="entry",
             raw_json=json.dumps(
                 {
+                    "broker": "sim",
                     "prediction_id": signal.prediction_id,
                     "stop_level": signal.stop_level,
                     "take_level": signal.take_level,
@@ -92,6 +237,19 @@ class PaperBroker:
         )
         self.repository.insert_order(record)
         return order_id
+
+    def submit_entry_order_result(
+        self,
+        signal: SignalDecision,
+        quantity: int,
+        scan_id: str | None = None,
+        *,
+        market_data_service: MarketDataService | None = None,
+    ) -> Dict[str, Any]:
+        order_id = self.submit_entry_order(signal, quantity, scan_id)
+        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim entry submit requested", {"order_id": order_id, "symbol": signal.symbol})
+        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim entry submitted", {"order_id": order_id, "symbol": signal.symbol})
+        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
 
     def submit_exit_order(self, position: pd.Series, reason: str) -> str:
         now_iso = utc_now_iso()
@@ -119,10 +277,28 @@ class PaperBroker:
             retry_count=0,
             strategy_version=str(position["strategy_version"]),
             reason=reason,
-            raw_json=json.dumps({"position_id": str(position["position_id"])}, ensure_ascii=False),
+            raw_json=json.dumps(
+                {
+                    "broker": "sim",
+                    "position_id": str(position["position_id"]),
+                },
+                ensure_ascii=False,
+            ),
         )
         self.repository.insert_order(record)
         return order_id
+
+    def submit_exit_order_result(
+        self,
+        position: pd.Series,
+        reason: str,
+        *,
+        market_data_service: MarketDataService | None = None,
+    ) -> Dict[str, Any]:
+        order_id = self.submit_exit_order(position, reason)
+        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim exit submit requested", {"order_id": order_id, "symbol": str(position["symbol"])})
+        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim exit submitted", {"order_id": order_id, "symbol": str(position["symbol"])})
+        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
 
     def _slippage_price(self, side: str, price: float, volatility: float) -> float:
         bps = self.settings.broker.base_slippage_bps + max(volatility, 0.0) * 10000.0 * self.settings.broker.volatility_slippage_mult
@@ -139,10 +315,9 @@ class PaperBroker:
     def _update_position_from_fill(self, order: pd.Series, fill_qty: int, fill_price: float, fees: float) -> None:
         latest = self.repository.latest_position_by_symbol(symbol=str(order["symbol"]), timeframe=str(order["timeframe"]))
         now_iso = utc_now_iso()
-        side = "LONG" if str(order["side"]) == "buy" else "SHORT"
+        side = self._position_side_from_order(str(order["side"]))
         order_meta = json.loads(str(order.get("raw_json") or "{}"))
         if latest.empty or str(latest.iloc[0]["status"]) != "open":
-            exposure_value = fill_qty * fill_price
             self.repository.upsert_position(
                 PositionRecord(
                     position_id=make_id("pos"),
@@ -166,7 +341,7 @@ class PaperBroker:
                     unrealized_pnl=-fees,
                     realized_pnl=0.0,
                     expected_risk=float(order_meta.get("expected_risk", np.nan)),
-                    exposure_value=float(exposure_value),
+                    exposure_value=self._signed_market_value(side, int(fill_qty), float(fill_price)),
                     max_holding_until=str(order_meta.get("max_holding_until") or now_iso),
                     strategy_version=str(order_meta.get("strategy_version") or order["strategy_version"]),
                     cooldown_until=None,
@@ -179,7 +354,9 @@ class PaperBroker:
         current_qty = int(position["quantity"])
         entry_price = float(position["entry_price"])
         position_side = str(position["side"])
-        same_direction = (position_side == "LONG" and str(order["side"]) == "buy") or (position_side == "SHORT" and str(order["side"]) == "sell")
+        same_direction = (position_side == "LONG" and str(order["side"]) == "buy") or (
+            position_side == "SHORT" and str(order["side"]) == "sell"
+        )
         if same_direction:
             new_qty = current_qty + fill_qty
             avg_price = ((entry_price * current_qty) + (fill_price * fill_qty)) / max(new_qty, 1)
@@ -195,8 +372,8 @@ class PaperBroker:
                         "take_profit": float(order_meta.get("take_level", position["take_profit"])),
                         "highest_price": max(float(position["highest_price"]), float(fill_price)),
                         "lowest_price": min(float(position["lowest_price"]), float(fill_price)),
-                        "unrealized_pnl": float(position["unrealized_pnl"]),
-                        "exposure_value": float(new_qty * fill_price),
+                        "unrealized_pnl": self._compute_unrealized(position_side, float(avg_price), float(fill_price), int(new_qty)),
+                        "exposure_value": self._signed_market_value(position_side, int(new_qty), float(fill_price)),
                         "notes": "scaled_position",
                     }
                 )
@@ -221,7 +398,12 @@ class PaperBroker:
                         "mark_price": float(fill_price),
                         "unrealized_pnl": 0.0,
                         "realized_pnl": float(position["realized_pnl"]) + realized,
-                        "cooldown_until": now_iso,
+                        "exposure_value": 0.0,
+                        "cooldown_until": self._compute_cooldown_until(
+                            asset_type=str(position["asset_type"]),
+                            timeframe=str(position["timeframe"]),
+                            now_iso=now_iso,
+                        ),
                         "notes": f"closed_by_{order['reason']}",
                     }
                 )
@@ -234,19 +416,81 @@ class PaperBroker:
                         "updated_at": now_iso,
                         "quantity": int(remaining),
                         "mark_price": float(fill_price),
+                        "unrealized_pnl": self._compute_unrealized(position_side, entry_price, float(fill_price), int(remaining)),
                         "realized_pnl": float(position["realized_pnl"]) + realized,
-                        "exposure_value": float(remaining * fill_price),
+                        "exposure_value": self._signed_market_value(position_side, int(remaining), float(fill_price)),
                         "notes": "partial_close",
                     }
                 )
             )
 
-    def process_open_orders(self, market_data_service: MarketDataService) -> int:
-        orders = self.repository.open_orders()
+    def apply_external_fill(
+        self,
+        order_id: str,
+        *,
+        fill_qty: int,
+        fill_price: float,
+        fees: float | None = None,
+        raw_json: Dict[str, Any] | None = None,
+        final_status: str | None = None,
+    ) -> bool:
+        order_record = self.repository.get_order(order_id)
+        if not order_record:
+            return False
+        order = pd.Series(order_record)
+        remaining_qty = int(order["remaining_qty"])
+        applied_qty = min(max(int(fill_qty), 0), remaining_qty)
+        if applied_qty <= 0:
+            return False
+        effective_fees = float(fees if fees is not None else applied_qty * fill_price * self.settings.broker.fee_bps / 10000.0)
+        self.repository.insert_fill(
+            FillRecord(
+                fill_id=make_id("fill"),
+                created_at=utc_now_iso(),
+                order_id=str(order["order_id"]),
+                symbol=str(order["symbol"]),
+                side=str(order["side"]),
+                quantity=int(applied_qty),
+                fill_price=float(fill_price),
+                fees=float(effective_fees),
+                slippage_bps=float(order["slippage_bps"]),
+                status="filled",
+                raw_json=json.dumps(raw_json or {}, default=str, ensure_ascii=False),
+            )
+        )
+        new_remaining = remaining_qty - applied_qty
+        new_filled = int(order["filled_qty"]) + applied_qty
+        self.repository.update_order(
+            str(order["order_id"]),
+            status=final_status or ("filled" if new_remaining <= 0 else "partially_filled"),
+            filled_qty=new_filled,
+            remaining_qty=new_remaining,
+            raw_json={"last_fill_price": float(fill_price), **(raw_json or {})},
+        )
+        account = self._latest_account()
+        cash_value = float(account.get("cash", self.settings.risk.starting_cash))
+        if str(order["side"]) == "buy":
+            cash_value -= applied_qty * fill_price + effective_fees
+        else:
+            cash_value += applied_qty * fill_price - effective_fees
+        self._update_position_from_fill(order=order, fill_qty=applied_qty, fill_price=float(fill_price), fees=float(effective_fees))
+        self.snapshot_account(cash_override=cash_value)
+        return True
+
+    def process_open_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> int:
+        orders = self.repository.open_orders(statuses=("new", "partially_filled"))
+        if not orders.empty and "raw_json" in orders.columns:
+            broker_name = orders["raw_json"].fillna("{}").astype(str).map(
+                lambda payload: str(json.loads(payload).get("broker", "sim")) if payload else "sim"
+            )
+            orders = orders.loc[broker_name.isin({"", "sim"})].copy()
+
         filled_count = 0
         account = self._latest_account()
         cash_value = float(account.get("cash", self.settings.risk.starting_cash))
         for _, order in orders.iterrows():
+            if callable(touch):
+                touch("sim_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"])})
             asset_type = str(order["asset_type"])
             if not market_data_service.is_market_open(asset_type):
                 continue
@@ -257,10 +501,12 @@ class PaperBroker:
                     timeframe=str(order["timeframe"]),
                 )
             except Exception as exc:
-                self.repository.update_order(str(order["order_id"]), status="new", error_message=str(exc))
+                self.repository.update_order(str(order["order_id"]), status=str(order["status"]), error_message=str(exc))
                 continue
             requested_qty = int(order["remaining_qty"])
             fill_qty = self._max_fill_qty(requested_qty=requested_qty, volume=quote.volume)
+            if not self.settings.broker.allow_partial_fills and fill_qty < requested_qty:
+                continue
             if fill_qty <= 0:
                 continue
             fill_price = self._slippage_price(str(order["side"]), float(quote.price), float(0.0))
@@ -294,39 +540,76 @@ class PaperBroker:
                 cash_value += fill_qty * fill_price - fees
             self._update_position_from_fill(order=order, fill_qty=fill_qty, fill_price=fill_price, fees=fees)
             filled_count += 1
+            self.repository.log_event(
+                "INFO",
+                "execution_pipeline",
+                "filled" if remaining_qty <= 0 else "partially_filled",
+                "sim order filled",
+                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty)},
+            )
         self.snapshot_account(cash_override=cash_value)
         return filled_count
 
-    def snapshot_account(self, cash_override: float | None = None) -> None:
+    def sync_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> Dict[str, int]:
+        return {"fills": int(self.process_open_orders(market_data_service, touch=touch))}
+
+    def snapshot_account(self, cash_override: float | None = None, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("sim_account_snapshot_start", {"source": "paper_broker"})
         account = self._latest_account()
         open_positions = self.repository.open_positions()
         open_orders = self.repository.open_orders()
         cash = float(cash_override if cash_override is not None else account.get("cash", self.settings.risk.starting_cash))
-        realized = float(pd.to_numeric(open_positions.get("realized_pnl"), errors="coerce").fillna(0.0).sum()) if not open_positions.empty else 0.0
-        unrealized = float(pd.to_numeric(open_positions.get("unrealized_pnl"), errors="coerce").fillna(0.0).sum()) if not open_positions.empty else 0.0
-        gross_exposure = float(pd.to_numeric(open_positions.get("exposure_value"), errors="coerce").fillna(0.0).abs().sum()) if not open_positions.empty else 0.0
-        equity = cash + gross_exposure + unrealized
-        previous_snapshots = self.repository.load_account_snapshots(limit=1000).sort_values("created_at")
-        peak = float(pd.to_numeric(previous_snapshots.get("equity"), errors="coerce").dropna().max()) if not previous_snapshots.empty else equity
-        drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
+        realized = self.repository.total_realized_pnl()
+        unrealized = (
+            float(pd.to_numeric(open_positions.get("unrealized_pnl"), errors="coerce").fillna(0.0).sum())
+            if not open_positions.empty
+            else 0.0
+        )
+        exposures = (
+            pd.to_numeric(open_positions.get("exposure_value"), errors="coerce").fillna(0.0)
+            if not open_positions.empty
+            else pd.Series(dtype=float)
+        )
+        gross_exposure = float(exposures.abs().sum()) if not exposures.empty else 0.0
+        net_exposure = float(exposures.sum()) if not exposures.empty else 0.0
+        equity = cash + net_exposure
         today = str(pd.Timestamp.utcnow().date())
         daily_pnl = self.repository.recent_closed_realized_pnl(today)
-        self.repository.insert_account_snapshot(
-            AccountSnapshotRecord(
-                snapshot_id=make_id("snap"),
-                created_at=utc_now_iso(),
-                cash=float(cash),
-                equity=float(equity),
-                gross_exposure=float(gross_exposure),
-                net_exposure=float(gross_exposure),
-                realized_pnl=float(realized),
-                unrealized_pnl=float(unrealized),
-                daily_pnl=float(daily_pnl),
-                drawdown_pct=float(drawdown_pct),
-                open_positions=int(len(open_positions)),
-                open_orders=int(len(open_orders)),
-                paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
-                source="paper_broker",
-                raw_json="{}",
-            )
+        touch(
+            "sim_account_snapshot_metrics",
+            {
+                "equity": float(equity),
+                "cash": float(cash),
+                "gross_exposure": float(gross_exposure),
+                "net_exposure": float(net_exposure),
+                "open_positions": int(len(open_positions)),
+                "open_orders": int(len(open_orders)),
+            },
         )
+        return self._store_account_snapshot(
+            cash=float(cash),
+            equity=float(equity),
+            gross_exposure=float(gross_exposure),
+            net_exposure=float(net_exposure),
+            realized_pnl=float(realized),
+            unrealized_pnl=float(unrealized),
+            daily_pnl=float(daily_pnl),
+            open_positions=int(len(open_positions)),
+            open_orders=int(len(open_orders)),
+            source="paper_broker",
+            raw_json="{}",
+            touch=touch,
+        )
+
+    def sync_account(self, touch=None) -> Dict[str, Any]:
+        touch = touch or (lambda *args, **kwargs: None)
+        touch("sim_account_sync_start", {"broker": "sim"})
+        latest = self._latest_account()
+        touch("sim_account_sync_complete", {"source": str(latest.get("source") or "paper_broker")})
+        return {
+            "broker": "sim",
+            "enabled": True,
+            "summary": latest,
+            "cash": float(latest.get("cash", self.settings.risk.starting_cash)),
+        }

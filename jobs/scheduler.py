@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from config.settings import load_settings
 from jobs.tasks import (
+    broker_account_sync_job,
+    broker_market_status_job,
+    broker_order_sync_job,
+    broker_position_sync_job,
     build_task_context,
     daily_report_job,
     entry_decision_job,
@@ -19,6 +23,10 @@ from jobs.tasks import (
 from storage.repository import utc_now_iso
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _bucket_key(dt: datetime, minutes: int) -> str:
     bucket = (dt.minute // max(minutes, 1)) * max(minutes, 1)
     rounded = dt.replace(minute=bucket, second=0, microsecond=0)
@@ -26,21 +34,49 @@ def _bucket_key(dt: datetime, minutes: int) -> str:
 
 
 def _run_guarded(context, job_name: str, run_key: str, fn):
-    job_run_id = context.repository.begin_job_run(
+    lease = context.repository.begin_job_run(
         job_name=job_name,
         run_key=run_key,
-        scheduled_at=datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+        scheduled_at=_utc_now().replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         lock_owner=context.settings.scheduler.lock_owner,
+        retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+        max_retry_count=context.settings.scheduler.max_retry_count,
+        lease_seconds=context.settings.scheduler.job_lease_seconds,
     )
-    if job_run_id is None:
+    if not lease.acquired:
         return None
+
+    def touch(stage=None, details=None):
+        context.repository.refresh_job_lease(lease.job_run_id, context.settings.scheduler.job_lease_seconds)
+        context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), f"{job_name}:{stage or 'tick'}")
+        context.repository.set_control_flag("worker_heartbeat_job", job_name, "active job")
+
+    previous_touch = getattr(context, "job_touch", None)
+    context.job_touch = touch
     try:
+        touch("job_start", {"job_name": job_name})
         result = fn()
-    except Exception as exc:  # pragma: no cover - exercised in runtime
-        context.repository.finish_job_run(job_run_id, status="failed", error_message=str(exc), metrics={})
+    except Exception as exc:  # pragma: no cover
+        context.repository.finish_job_run(
+            lease.job_run_id,
+            status="failed",
+            error_message=str(exc),
+            metrics={},
+            retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+            max_retry_count=context.settings.scheduler.max_retry_count,
+        )
         context.repository.log_event("ERROR", "scheduler", "job_failed", f"{job_name} failed", {"error": str(exc)})
         return None
-    context.repository.finish_job_run(job_run_id, status="completed", metrics=result if isinstance(result, dict) else {})
+    finally:
+        context.job_touch = previous_touch or (lambda _stage=None, _details=None: None)
+
+    context.repository.finish_job_run(
+        lease.job_run_id,
+        status="completed",
+        metrics=result if isinstance(result, dict) else {},
+        retry_backoff_seconds=context.settings.scheduler.retry_backoff_seconds,
+        max_retry_count=context.settings.scheduler.max_retry_count,
+    )
     return result
 
 
@@ -48,6 +84,18 @@ def run_once(settings_path: str | None = None) -> None:
     context = build_task_context(settings_path)
     settings = context.settings
     context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), "scheduler loop heartbeat")
+    _run_guarded(
+        context,
+        job_name="broker_market_status",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_market_status_interval_minutes),
+        fn=lambda: broker_market_status_job(context),
+    )
+    _run_guarded(
+        context,
+        job_name="broker_account_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_account_sync_interval_minutes),
+        fn=lambda: broker_account_sync_job(context),
+    )
     for asset_type, schedule in settings.asset_schedules.items():
         now = datetime.now(ZoneInfo(schedule.timezone))
         _run_guarded(
@@ -64,26 +112,38 @@ def run_once(settings_path: str | None = None) -> None:
         )
     _run_guarded(
         context,
+        job_name="broker_position_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_position_sync_interval_minutes),
+        fn=lambda: broker_position_sync_job(context),
+    )
+    _run_guarded(
+        context,
         job_name="exit_management",
-        run_key=_bucket_key(datetime.utcnow(), 15),
+        run_key=_bucket_key(_utc_now(), settings.scheduler.exit_management_interval_minutes),
         fn=lambda: exit_management_job(context),
     )
     _run_guarded(
         context,
+        job_name="broker_order_sync",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.broker_order_sync_interval_minutes),
+        fn=lambda: broker_order_sync_job(context),
+    )
+    _run_guarded(
+        context,
         job_name="outcome_resolution",
-        run_key=_bucket_key(datetime.utcnow(), 60),
+        run_key=_bucket_key(_utc_now(), settings.scheduler.outcome_resolution_interval_minutes),
         fn=lambda: outcome_resolution_job(context),
     )
     _run_guarded(
         context,
         job_name="daily_report",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(_utc_now().date()),
         fn=lambda: daily_report_job(context),
     )
     _run_guarded(
         context,
         job_name="retrain_check",
-        run_key=str(datetime.utcnow().date()),
+        run_key=str(_utc_now().date()),
         fn=lambda: retrain_check_job(context),
     )
 

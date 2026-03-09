@@ -1,304 +1,288 @@
-# 멀티마켓 예측 + 24/7 Paper Trading
+# Streamlit Monitor + 24/7 Paper Trading Runtime
 
-이 저장소는 두 계층으로 나뉩니다.
+This repository separates the operator UI from the runtime worker.
 
-- `predictor.py`: 연구/검증/백테스트용 signal engine
-- `services/`, `storage/`, `jobs/`: 24/7 background paper trading 운영 계층
+- `app.py`: monitoring and manual intervention UI
+- `jobs/`, `services/`, `storage/`: Streamlit-independent worker/runtime
+- `storage/repository.py`: single source of truth for predictions, orders, fills, positions, account snapshots, job runs, and system events
 
-중요 원칙:
+The current routing model stays the same:
 
-- `predictor.py`의 검증 로직은 유지하고, 운영 계층이 감싸서 사용합니다.
-- Streamlit은 거래 루프를 돌리지 않습니다.
-- 예측 레코드는 append-only로 저장하고, outcome/evaluation은 만기 후 별도 확정합니다.
-- 예측 정확도와 매매 성과는 분리 저장/표시합니다.
+- KR equities: `KISPaperBroker` first when KIS mock config is available
+- US equities and crypto: SQLite-backed `PaperBroker`
+- predictor semantics and `run_forecast_on_price_data(...)` reuse are unchanged
 
-## 현재 코드 기준 누락 요소와 이번 구현 범위
+KR-only routing rule:
 
-기존 누락:
+- `한국주식` + KR symbol (`.KS` / `.KQ`) or bare 6-digit KR stock code only: `kis_mock`
+- `미국주식` and `코인`: always `sim`
+- if `asset_type` is blank or ambiguous, KR suffix / bare 6-digit KR code is the fallback safety check
+- non-KR symbols never route to KIS, even if a wrong `한국주식` label is passed in
 
-- worker/service/process 계층 부재
-- 시장시간/휴장일/자산군별 실행 주기 분리 부재
-- candidate scan, job_runs, system_events, control_flags 부재
-- 내부 paper broker 부재
-- 재시작 복구 가능한 주문/포지션 라이프사이클 부재
-- 배치 재학습 파이프라인 부재
-
-이번 구현:
-
-- `predictor.py` 재사용형 `run_forecast_on_price_data(...)`
-- `storage/repository.py` SQLite 운영 저장소
-- `services/*` 운영 모듈
-- `jobs/scheduler.py` 별도 worker 루프
-- `monitoring/dashboard_hooks.py` 읽기 전용 대시보드 reader
-- `scripts/init_runtime.py` 초기화 코드
-- `tests/*` 기본 테스트
-
-## 최종 아키텍처
+## Runtime Architecture
 
 ```text
-Market Data -> Universe Scanner -> Signal Engine(predictor wrapper) -> Candidate Scans
-                                                             |
-                                                             v
-                                                    Prediction Ledger
+Market Data -> Universe Scanner -> Signal Engine -> Candidate Scans
+                                           |
+                                           v
+                                   Prediction Ledger
 
-Candidate Scans -> Risk Engine -> Paper Broker -> Orders -> Fills -> Positions
-                                                \-> Account Snapshots
+Candidate -> Risk Gate -> Broker Preflight -> Submit -> Ack/Pending/Fill/Reject
+                                              |
+                                              +-> PaperBroker (sim)
+                                              +-> KISPaperBroker (KR mock)
 
-Unresolved Predictions -> Outcome Resolver -> Outcomes -> Evaluations
-
-Evaluations + Account Snapshots + Job Runs + System Events
-    -> Monitoring Dashboard Hooks
-    -> Daily Reports
-    -> Retrainer(weekly/monthly)
+Orders -> Fills -> Positions -> Account Snapshots
+Predictions -> Outcome Resolver -> Outcomes -> Evaluations
+Job Runs + System Events + Account Snapshots -> Monitoring
 ```
 
-## 디렉터리 구조
+`account_snapshots` in `storage/repository.py` remain the canonical account-state ledger.
 
-```text
-config/
-  settings.py
-  runtime_settings.example.json
-jobs/
-  scheduler.py
-  tasks.py
-monitoring/
-  dashboard_hooks.py
-scripts/
-  init_runtime.py
-services/
-  market_data_service.py
-  universe_scanner.py
-  signal_engine.py
-  risk_engine.py
-  portfolio_manager.py
-  paper_broker.py
-  outcome_resolver.py
-  evaluator.py
-  retrainer.py
-storage/
-  models.py
-  repository.py
-tests/
-  test_repository.py
-  test_risk_engine.py
-  test_dashboard_hooks.py
-predictor.py
-app.py
-```
+- sim broker snapshots are written with sim-oriented sources such as `paper_broker`
+- KIS account sync writes `source=kis_account_sync` rows into the same table
+- `RiskEngine` reads `kis_account_sync` for KR execution paths and sim-only snapshots for US equities / crypto
+- KR drawdown peaks are computed from `kis_account_sync` rows only, while sim drawdown peaks exclude `kis_account_sync`
+- this keeps KIS buying power, persisted account state, and risk gating aligned
 
-## DB 스키마
+## Execution Assurance Pipeline
 
-운영 DB는 `config/settings.py`의 `storage.db_path`를 사용합니다. 기본값은 `.runtime/paper_trading.sqlite3` 입니다.
+The worker now treats execution as an explicit state machine instead of a best-effort side effect.
 
-필수 테이블:
+Entry pipeline:
 
-- `predictions`
-- `outcomes`
-- `evaluations`
-- `candidate_scans`
-- `orders`
-- `fills`
-- `positions`
-- `account_snapshots`
-- `model_registry`
-- `retrain_runs`
-- `job_runs`
-- `system_events`
+1. `candidate`
+2. `entry_allowed` or `entry_rejected`
+3. `submit_requested`
+4. `submitted`
+5. `acknowledged`
+6. `pending_fill`
+7. `partially_filled`
+8. `filled`
+9. `rejected`
+10. `cancelled`
+11. `expired`
 
-추가 테이블:
+Silent skips are not allowed. If the worker does not trade, it records a reason in `system_events`.
 
-- `control_flags`
+Typical reason codes:
 
-각 테이블은 최소한 아래를 저장합니다.
+- `market_closed`
+- `outside_preclose_window`
+- `duplicate_pending_entry`
+- `cooldown_active`
+- `insufficient_buying_power`
+- `no_sellable_qty`
+- `no_quote`
+- `broker_rejected`
+- `missing_prediction`
+- `no_candidate`
+- `no_submit`
 
-- timestamps: `created_at`, `updated_at`, `resolved_at`, `finished_at`
-- symbol / asset_type / timeframe
-- model_version / feature_version / strategy_version
-- signal / score / confidence / threshold
-- expected_return / expected_risk / position_size
-- order status / fill price / fees / slippage
-- pnl / drawdown / exposure
-- error message / retry count / job status
+## Explicit Broker Sync Jobs
 
-## 설정 파일 예시
+The scheduler now runs broker-facing sync work as explicit jobs.
 
-기본 설정은 코드에 내장되어 있고, 선택적으로 `config/runtime_settings.json`으로 override 할 수 있습니다.
+- `broker_market_status`
+- `broker_position_sync`
+- `broker_order_sync`
+- `broker_account_sync`
 
-생성:
+These jobs are:
 
-```bash
-python scripts/init_runtime.py
-```
+- idempotent
+- visible in `job_runs`
+- visible in `system_events`
+- eligible for retry/backoff
+- manually runnable from the monitor UI
 
-예시 파일:
+`broker_account_sync` also propagates runtime `touch()` callbacks through the router and broker layers, so a slow account sync refreshes lease and worker heartbeat mid-run instead of only at job start.
 
-- [config/runtime_settings.example.json](C:/Users/admin/Desktop/develop/codex/config/runtime_settings.example.json)
+## KR Execution Path
 
-핵심 가정:
+KR daily entries keep pre-close gating. The system does not submit KR daily entry orders outside the allowed pre-close window unless a separate reservation policy is added later.
 
-- 코인: `1h` bar, 24/7, bar close 기준 진입/청산
-- 미국주식/한국주식: `1d` predictor 유지, `pre-close` 윈도우에서 paper MOC proxy로 진입
-- 휴장일: `holidays` 패키지 기반 국가 휴일 + 주말
-- 반일장/특수 휴장일은 완전 정밀하게 모델링하지 않음
+Current KR execution order:
 
-## 운영 로직
+1. schedule gate and market phase check
+2. pre-close gate
+3. KIS quote and expected/ask-bid price lookup
+4. KIS buying power or sellable quantity lookup
+5. repository checks for pending entry, holding state, cooldown, and risk budget
+6. broker submit
+7. broker order sync via:
+   - websocket execution event if available
+   - REST daily order/fill query
+   - holdings/account fallback only as last resort
 
-### 1) 후보 스캔
+Source-of-truth priorities for KR mock execution:
 
-- `watchlist + top_universe`를 주기적으로 스캔
-- 최소 히스토리 길이, 결측, 이상치, 유동성 검사
-- 기대수익, confidence, 비용, 변동성, 최근 성능으로 score 계산
-- 보유 중 / cooldown 종목은 scan row에 표시
+1. websocket execution event
+2. REST order/fill reconcile
+3. account/holdings delta fallback
 
-### 2) 진입 규칙
+`broker_order_id` is preserved alongside internal `order_id`, and `FillRecord` is only written after execution is actually confirmed.
 
-- `min_expected_return_pct`
-- `min_confidence`
-- `max_expected_risk_pct`
-- `max_cost_bps`
-- 시장 open 필요
-- `max_open_positions`
-- `max_daily_new_entries`
-- `symbol_max_weight`
-- `asset_type_max_weight`
-- `max_same_direction_correlation`
-- `daily_loss_limit_pct`
-- `max_drawdown_limit_pct`
+## KIS API Surface Used
 
-### 3) 청산 규칙
+The runtime now has code paths for these KIS mock capabilities:
 
-- stop loss
-- take profit
-- trailing stop
-- time stop
-- opposite signal exit
-- score decay exit
+- OAuth access token
+- hashkey issuance
+- websocket approval key issuance
+- cash stock order
+- order cancel
+- domestic balance / account snapshot
+- buying power lookup
+- sellable quantity lookup
+- daily order/fill lookup
+- quote lookup
+- expected execution / orderbook lookup
 
-### 4) 리스크 관리
+HTS ID:
 
-- 종목당 risk budget
-- 자산군별 risk budget
-- 계좌 총 risk budget
-- 일일 손실 한도
-- 최대 드로우다운 도달 시 신규 진입 중단
+- `kis_devlp.yaml` may include `my_htsid`
+- websocket-style execution handling depends on it being configured
+- the runtime records whether HTS ID and websocket approval key are available during account sync
 
-### 5) 스케줄링
+## Scheduler / Retry / Lease
 
-- `scan job`
-- `entry decision job`
-- `exit management job`
-- `outcome resolution job`
-- `daily report job`
-- `retrain check job`
+Scheduler behavior:
 
-각 job은:
+- failed jobs get per-job backoff through `next_retry_at`
+- one failing job does not block unrelated jobs
+- long-running jobs refresh lease and worker heartbeat via runtime `touch()` callbacks
+- broker sync jobs use their own cadence from settings
 
-- `job_runs` 기반 idempotent run key 사용
-- 중복 실행 방지
-- 실패 시 error log 기록
+Relevant settings:
 
-## 로컬 실행 방법
+- `scheduler.loop_sleep_seconds`
+- `scheduler.retry_backoff_seconds`
+- `scheduler.max_retry_count`
+- `scheduler.job_lease_seconds`
+- `scheduler.broker_market_status_interval_minutes`
+- `scheduler.broker_order_sync_interval_minutes`
+- `scheduler.broker_position_sync_interval_minutes`
+- `scheduler.broker_account_sync_interval_minutes`
+- `broker.websocket_reconnect_interval_seconds`
+- `broker.stale_submitted_order_timeout_minutes`
 
-설치:
+## Runtime Tuning Profiles
+
+Gate tuning is tracked as explicit runtime profiles instead of editing the embedded defaults in place.
+
+- `baseline`: current production-equivalent gate values
+- `balanced`: recommended default for live paper trading; relaxes stock entry gates enough to reduce `outside_preclose_window`, `expected_return_too_low`, and `confidence_too_low` pressure without changing the core loss-budget controls
+- `active`: higher-submission experimental profile; keeps the same drawdown and daily-loss ceilings but further lowers stock entry thresholds and expands daily entry capacity
+
+This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
+
+When trades are too sparse, inspect these breakdowns first:
+
+- `today_noop_reason_breakdown`
+- `today_entry_rejected_reason_breakdown`
+- `outside_preclose_window`
+- `expected_return_too_low`
+- `confidence_too_low`
+- `cooldown_active`
+- `max_daily_entries`
+
+The worker writes the loaded runtime profile name/source into control flags, and the operations monitor reads that value back so operators can verify which profile is active. The recommended default profile is `balanced`.
+
+## Monitoring Read Model
+
+`monitoring/dashboard_hooks.py` builds the monitor view from repository data.
+
+It exposes:
+
+- today candidate / allowed / rejected / submit requested / submitted / acknowledged / filled / rejected / cancelled / noop counts
+- noop reason breakdown
+- latest broker sync statuses
+- pending submitted KR orders
+- broker rejects today
+- last websocket execution timestamp
+
+## Accounting Definitions
+
+Runtime accounting uses these definitions consistently:
+
+- `gross_exposure`: sum of absolute open position exposure
+- `net_exposure`: sum of signed open position exposure
+- `equity`: `cash + net_exposure`
+- `unrealized_pnl`: sum of mark-to-market PnL across open positions
+- `drawdown_pct`: drawdown versus peak account equity
+
+`unrealized_pnl` is not added on top of market value a second time.
+
+## Local Run
+
+Install:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-초기화:
-
-```bash
-python scripts/init_runtime.py
-```
-
-DB만 초기화:
+Initialize DB only:
 
 ```bash
 python -m jobs.scheduler --init-db
 ```
 
-worker 1회 실행:
+Run one worker cycle:
 
 ```bash
 python -m jobs.scheduler --once
 ```
 
-worker 루프 실행:
+Run worker loop:
 
 ```bash
 python -m jobs.scheduler
 ```
 
-기존 Streamlit 앱:
+Run monitor:
 
 ```bash
 python -m streamlit run app.py
 ```
 
-주의:
+## Tests
 
-- worker는 Streamlit과 분리된 별도 프로세스로 띄워야 합니다.
-- app은 read-only 모니터링 용도로 같은 DB를 읽는 구조를 전제로 합니다.
-
-## 테스트
+Run all tests:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-## 운영 섹션
+Execution assurance coverage includes:
 
-### pause / resume
+- pending entry duplicate blocking
+- KR market closed / outside pre-close / insufficient buying power rejection
+- KR submit -> acknowledged -> pending_fill -> filled / rejected / cancelled
+- websocket execution event state transition
+- REST reconcile fallback when websocket is absent
+- scheduler retry/backoff and lease refresh
+- dashboard execution summary and broker sync state
 
-`control_flags.trading_paused`를 사용합니다.
+## Known Limitations
 
-초기값:
+- KR websocket execution handling is implemented as an ingest path, but a persistent websocket manager is not auto-started by the worker yet.
+- If websocket events are unavailable, KR execution falls back to REST daily order/fill reconcile.
+- Reservation orders are not wired into the worker yet.
+- KR daily pre-close gating is still schedule-based, not exchange-calendar-perfect.
+- US equities and crypto still use the sim broker path.
 
-- `0`: 신규 진입 허용
-- `1`: 신규 진입 중단
+## Final Merge Note
 
-현재 구현에서는 DB flag를 기준으로 entry job이 차단됩니다.
+- Merge recommendation: `go`
+- Recommended default profile: `balanced`
+- Broker policy: `한국주식 + KR 심볼 -> kis_mock`, `미국주식/코인 -> sim`
+- Canonical ledger: `account_snapshots`
+  - KR risk path -> `kis_account_sync` first
+  - US/crypto risk path -> sim-only snapshots
 
-### 재시작 복구
+Manual pre-merge checks:
 
-- 주문, 포지션, 계좌 스냅샷은 모두 DB에 저장됩니다.
-- worker 재시작 후 `open_orders`, `open_positions`, `account_snapshots`를 읽어 복구합니다.
-
-### 모델 재평가 / 재학습
-
-- 즉시 온라인 학습은 하지 않습니다.
-- `services/retrainer.py`는 benchmark universe에 대해 batch 평가를 수행합니다.
-- promotion 조건을 통과하면 `model_registry.is_champion=1`로 승격합니다.
-- 현재 최소 버전은 “새 모델 생성”보다 “현행 predictor 버전 재평가 및 승격 체크”에 초점을 둡니다.
-
-## systemd 예시
-
-```ini
-[Unit]
-Description=Paper Trading Worker
-After=network.target
-
-[Service]
-WorkingDirectory=C:/Users/admin/Desktop/develop/codex
-ExecStart=python -m jobs.scheduler
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## 장시간 운영 시 주의사항
-
-- `yfinance`는 무료 데이터이므로 지연/누락/제한 가능성이 있습니다.
-- 국가 공휴일 기반 휴장일 처리라서 거래소 특수 휴장일/반일장은 완전 정밀하지 않습니다.
-- 미국/한국주식은 `pre-close proxy fill` 가정이라 실제 MOC 체결과 다를 수 있습니다.
-- 코인 `1h` 데이터는 bar close 기준이며, 초단타 타이밍 시스템이 아닙니다.
-- worker는 단일 프로세스 기준입니다. 다중 worker를 돌리면 DB lock 충돌이 생길 수 있습니다.
-
-## 향후 바로 확장 가능한 것
-
-- `fills`에 부분 체결 history를 더 정교하게 확장
-- app에서 `monitoring/dashboard_hooks.py`를 직접 읽는 전용 관제 탭 추가
-- retrainer에 challenger artifact 저장/rollback 추가
-- 거래소 캘린더를 국가 휴일 근사치에서 더 정밀한 exchange calendar로 교체
+1. Start the worker with the balanced profile and confirm `runtime_profile_name=balanced` and the same value in the monitoring read model.
+2. Verify one KR candidate flows through `broker_account_sync -> candidate -> entry_allowed -> submit_requested -> submitted/acknowledged -> filled` with matching order/fill/position rows.
+3. Confirm operations monitoring still shows `한국주식=kis_mock`, `미국주식=sim`, `코인=sim` and `broker_sync_errors=0` on a healthy path.

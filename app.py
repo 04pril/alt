@@ -14,9 +14,10 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.io as pio
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
+import streamlit.config as st_config
 import yfinance as yf
 
 from config.settings import load_settings
@@ -49,6 +50,7 @@ from top100_universe import (
     US_NAME_QUERY_OVERRIDES,
     US_TOP100_NAME_SYMBOLS,
 )
+from ui.floating_nav import FloatingNavItem, render_floating_nav, render_navigation_fallback, resolve_current_page_key
 
 
 WATCHLIST_PRESETS: Dict[str, List[str]] = {
@@ -74,7 +76,13 @@ VIEW_CODE_TO_LABEL = {
     "paper": PAPER_VIEW_NAME,
     "scan": "종목 스캔",
 }
-VIEW_LABEL_TO_CODE = {label: code for code, label in VIEW_CODE_TO_LABEL.items()}
+NAV_ITEMS: List[FloatingNavItem] = [
+    FloatingNavItem(key="analysis", label="종목 분석", icon="◌"),
+    FloatingNavItem(key="paper", label=PAPER_VIEW_NAME, icon="◎"),
+    FloatingNavItem(key="dashboard", label="대시보드", icon="◫"),
+    FloatingNavItem(key="monitor", label="운영 모니터", icon="◧"),
+    FloatingNavItem(key="scan", label="종목 스캔", icon="▣"),
+]
 
 VALIDATION_LABEL_TO_MODE = {
     "빠름(홀드아웃)": "holdout",
@@ -720,24 +728,58 @@ def detect_mobile_client() -> bool:
     return bool(re.search(r"mobile|android|iphone|ipad|ipod", user_agent, flags=re.IGNORECASE))
 
 
-def apply_responsive_css(is_mobile_ui: bool) -> None:
+def get_streamlit_theme_mode() -> str:
+    try:
+        mode = str(getattr(st.context.theme, "type", "") or "").lower()
+    except Exception:
+        mode = ""
+    if mode in {"light", "dark"}:
+        return mode
+    configured = str(st.get_option("theme.base") or "").lower()
+    if configured in {"light", "dark"}:
+        return configured
+    return "light"
+
+
+def apply_responsive_css(is_mobile_ui: bool, theme_mode: str) -> None:
+    theme_mode = "dark" if theme_mode == "dark" else "light"
+    border = "rgba(148, 163, 184, 0.16)"
+    text = "inherit"
+    muted = "#94a3b8" if theme_mode == "dark" else "#64748b"
+    status_running = "#6ee7b7" if theme_mode == "dark" else "#059669"
+    status_paused = "#fcd34d" if theme_mode == "dark" else "#d97706"
+    status_stopped = "#fca5a5" if theme_mode == "dark" else "#dc2626"
+    pio.templates.default = "plotly_dark" if theme_mode == "dark" else "plotly_white"
+
+    css_vars = {
+        "theme_mode": theme_mode,
+        "border": border,
+        "text": text,
+        "muted": muted,
+        "status_running": status_running,
+        "status_paused": status_paused,
+        "status_stopped": status_stopped,
+    }
+
     if is_mobile_ui:
-        st.markdown(
-            """
+        css = """
             <style>
+            :root {
+              color-scheme: %(theme_mode)s;
+            }
             .block-container {
-              padding-top: 0.8rem !important;
+              padding-top: 3.45rem !important;
               padding-bottom: 1.0rem !important;
               padding-left: 0.8rem !important;
               padding-right: 0.8rem !important;
             }
             .alt-page-title {
-              margin: 0.1rem 0 0.9rem 0 !important;
+              margin: 0.2rem 0 1.0rem 0 !important;
               font-size: 3rem !important;
               line-height: 1.0 !important;
               font-weight: 800 !important;
               letter-spacing: -0.04em;
-              color: inherit;
+              color: %(text)s;
             }
             .alt-status-badge {
               display: inline-flex;
@@ -753,28 +795,28 @@ def apply_responsive_css(is_mobile_ui: bool) -> None:
             .alt-status-running {
               background: rgba(16, 185, 129, 0.14);
               border-color: rgba(16, 185, 129, 0.35);
-              color: #6ee7b7;
+              color: %(status_running)s;
             }
             .alt-status-paused {
               background: rgba(245, 158, 11, 0.14);
               border-color: rgba(245, 158, 11, 0.35);
-              color: #fcd34d;
+              color: %(status_paused)s;
             }
             .alt-status-stopped {
               background: rgba(239, 68, 68, 0.14);
               border-color: rgba(239, 68, 68, 0.35);
-              color: #fca5a5;
+              color: %(status_stopped)s;
             }
             .alt-global-footer {
               margin-top: 2.1rem;
               padding-top: 1.0rem;
-              border-top: 1px solid rgba(148, 163, 184, 0.18);
+              border-top: 1px solid %(border)s;
             }
             .alt-global-footer p {
               margin: 0.2rem 0;
               font-size: 0.76rem;
               line-height: 1.45;
-              color: #94a3b8;
+              color: %(muted)s;
             }
             h1 { font-size: 1.4rem !important; }
             h2, h3 { font-size: 1.08rem !important; }
@@ -784,30 +826,28 @@ def apply_responsive_css(is_mobile_ui: bool) -> None:
               font-size: 0.85rem !important;
               padding: 0.45rem 0.5rem !important;
             }
-            [data-testid="stDataFrame"] {
-              font-size: 0.84rem !important;
-            }
             </style>
-            """,
-            unsafe_allow_html=True,
-        )
+        """ % css_vars
+        st.markdown(css, unsafe_allow_html=True)
     else:
-        st.markdown(
-            """
+        css = """
             <style>
+            :root {
+              color-scheme: %(theme_mode)s;
+            }
             .block-container {
-              padding-top: 1.0rem !important;
+              padding-top: 3.75rem !important;
               padding-bottom: 1.2rem !important;
               padding-left: 1.4rem !important;
               padding-right: 1.4rem !important;
             }
             .alt-page-title {
-              margin: 0.1rem 0 1.0rem 0 !important;
+              margin: 0.2rem 0 1.05rem 0 !important;
               font-size: 4rem !important;
               line-height: 0.98 !important;
               font-weight: 800 !important;
               letter-spacing: -0.05em;
-              color: inherit;
+              color: %(text)s;
             }
             .alt-status-badge {
               display: inline-flex;
@@ -823,33 +863,32 @@ def apply_responsive_css(is_mobile_ui: bool) -> None:
             .alt-status-running {
               background: rgba(16, 185, 129, 0.14);
               border-color: rgba(16, 185, 129, 0.35);
-              color: #6ee7b7;
+              color: %(status_running)s;
             }
             .alt-status-paused {
               background: rgba(245, 158, 11, 0.14);
               border-color: rgba(245, 158, 11, 0.35);
-              color: #fcd34d;
+              color: %(status_paused)s;
             }
             .alt-status-stopped {
               background: rgba(239, 68, 68, 0.14);
               border-color: rgba(239, 68, 68, 0.35);
-              color: #fca5a5;
+              color: %(status_stopped)s;
             }
             .alt-global-footer {
               margin-top: 2.4rem;
               padding-top: 1.15rem;
-              border-top: 1px solid rgba(148, 163, 184, 0.18);
+              border-top: 1px solid %(border)s;
             }
             .alt-global-footer p {
               margin: 0.22rem 0;
               font-size: 0.8rem;
               line-height: 1.5;
-              color: #94a3b8;
+              color: %(muted)s;
             }
             </style>
-            """,
-            unsafe_allow_html=True,
-        )
+        """ % css_vars
+        st.markdown(css, unsafe_allow_html=True)
 
 
 def format_heartbeat_age_text(seconds: object) -> str:
@@ -895,33 +934,34 @@ def auto_trading_badge_html(auto_trading_status: Dict[str, Any]) -> str:
     return f'<span class="alt-status-badge {state_class}">{html.escape(label)}</span>'
 
 
-def current_view_code() -> str:
-    return VIEW_LABEL_TO_CODE.get(str(st.session_state.get("active_view", "운영 모니터")), "monitor")
-
-
-def sync_active_view_from_query_params() -> None:
+def format_display_timestamp(value: object) -> str:
+    if value is None:
+        return ""
     try:
-        raw_value = st.query_params.get("view", "")
+        timestamp = pd.to_datetime(value, errors="coerce")
     except Exception:
-        return
-    if isinstance(raw_value, list):
-        raw_value = raw_value[0] if raw_value else ""
-    view_label = VIEW_CODE_TO_LABEL.get(str(raw_value).strip())
-    if view_label:
-        st.session_state["active_view"] = view_label
+        return str(value)
+    if pd.isna(timestamp):
+        return str(value)
+    if getattr(timestamp, "tzinfo", None) is not None:
+        try:
+            timestamp = timestamp.tz_convert("Asia/Seoul")
+        except Exception:
+            try:
+                timestamp = timestamp.tz_localize(None)
+            except Exception:
+                pass
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def sync_query_params_from_active_view() -> None:
-    desired = current_view_code()
-    try:
-        current = st.query_params.get("view", "")
-    except Exception:
-        return
-    if isinstance(current, list):
-        current = current[0] if current else ""
-    current = str(current).strip()
-    if current != desired:
-        st.query_params["view"] = desired
+def format_frame_timestamps_for_display(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    view = frame.copy()
+    for column in view.columns:
+        if column.endswith("_at") or column in {"created_at", "updated_at", "resolved_at", "closed_at", "cooldown_until"}:
+            view[column] = view[column].map(format_display_timestamp)
+    return view
 
 
 def restart_background_worker() -> Tuple[bool, str]:
@@ -961,380 +1001,33 @@ Start-Process -FilePath $python -ArgumentList '-m','jobs.scheduler' -WorkingDire
     return False, "worker 재시작 버튼은 현재 Windows 환경에서만 지원합니다."
 
 
-def render_top_nav_bar(active_view: str, auto_trading_status: Dict[str, Any], is_mobile_ui: bool) -> None:
-    visual_links: List[str] = []
-    hit_links: List[str] = []
-    for code, label in VIEW_CODE_TO_LABEL.items():
-        active_class = "is-active" if label == active_view else ""
-        visual_links.append(
-            f'<span class="alt-toolbar-link {active_class}" data-view="{html.escape(code)}">{html.escape(label)}</span>'
-        )
-        hit_links.append(
-            f'<button type="button" class="alt-toolbar-hit-link" data-view="{html.escape(code)}" aria-label="{html.escape(label)}">{html.escape(label)}</button>'
-        )
-    badge_html = auto_trading_badge_html(auto_trading_status).replace("alt-status-badge", "alt-status-badge alt-toolbar-badge")
-    visual_toolbar_inner = (
-        '<div class="alt-toolbar-nav-inner">'
-        '<span class="alt-toolbar-mini-brand" aria-hidden="true">Alt</span>'
-        f"{''.join(visual_links)}"
-        f'<span class="alt-toolbar-status">{badge_html}</span>'
-        "</div>"
+
+
+def run_manual_runtime_job(job_name: str) -> Tuple[bool, str]:
+    from jobs.scheduler import _run_guarded
+    from jobs.tasks import (
+        broker_account_sync_job,
+        broker_market_status_job,
+        broker_order_sync_job,
+        broker_position_sync_job,
+        build_task_context,
     )
-    hit_toolbar_inner = (
-        '<div class="alt-toolbar-hit-inner">'
-        '<span class="alt-toolbar-hit-brand" aria-hidden="true">Alt</span>'
-        f"{''.join(hit_links)}"
-        "</div>"
-    )
-    escaped_visual_toolbar_inner = visual_toolbar_inner.replace("\\", "\\\\").replace("`", "\\`")
-    escaped_hit_toolbar_inner = hit_toolbar_inner.replace("\\", "\\\\").replace("`", "\\`")
-    components.html(
-        f"""
-        <script>
-        (function () {{
-          const doc = window.parent.document;
-          let style = doc.getElementById("alt-toolbar-nav-style");
-          if (!style) {{
-            style = doc.createElement("style");
-            style.id = "alt-toolbar-nav-style";
-            style.textContent = `
-              #alt-toolbar-visual-host {{
-                position: absolute;
-                left: 1rem;
-                right: 16.5rem;
-                top: 50%;
-                transform: translateY(-50%);
-                display: flex;
-                align-items: center;
-                justify-content: flex-start;
-                overflow: hidden;
-                pointer-events: none !important;
-                z-index: 1000;
-              }}
-              #alt-toolbar-click-layer {{
-                position: fixed;
-                left: 0;
-                right: 0;
-                top: 0;
-                height: 3.5rem;
-                pointer-events: none !important;
-                z-index: 10001;
-              }}
-              #alt-toolbar-click-host {{
-                position: absolute;
-                left: 1rem;
-                right: 16.5rem;
-                top: 50%;
-                transform: translateY(-50%);
-                display: flex;
-                align-items: center;
-                justify-content: flex-start;
-                overflow: hidden;
-                pointer-events: auto !important;
-              }}
-              header[data-testid="stHeader"] {{
-                background: rgba(248, 250, 252, 0.88) !important;
-                backdrop-filter: blur(10px);
-                -webkit-backdrop-filter: blur(10px);
-                border-bottom: 1px solid rgba(15, 23, 42, 0.08);
-                overflow: visible !important;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-nav-inner,
-              #alt-toolbar-click-host .alt-toolbar-hit-inner {{
-                display: inline-flex;
-                align-items: center;
-                gap: 0.3rem;
-                min-width: 0;
-                flex-wrap: nowrap;
-                overflow-x: auto;
-                scrollbar-width: none;
-              }}
-              #alt-toolbar-click-host .alt-toolbar-hit-inner {{
-                pointer-events: auto !important;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-nav-inner::-webkit-scrollbar,
-              #alt-toolbar-click-host .alt-toolbar-hit-inner::-webkit-scrollbar {{
-                display: none;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-mini-brand,
-              #alt-toolbar-click-host .alt-toolbar-hit-brand {{
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                font-size: 0.92rem;
-                font-weight: 900;
-                letter-spacing: -0.03em;
-                max-width: 0;
-                opacity: 0;
-                transform: translateX(-8px);
-                margin-right: 0;
-                overflow: hidden;
-                transition: max-width 0.22s ease, opacity 0.22s ease, transform 0.22s ease, margin-right 0.22s ease;
-                white-space: nowrap;
-                flex: 0 0 auto;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-mini-brand {{
-                color: rgba(15, 23, 42, 0.92);
-              }}
-              #alt-toolbar-click-host .alt-toolbar-hit-brand {{
-                color: transparent;
-                user-select: none;
-              }}
-              #alt-toolbar-visual-host.show-brand .alt-toolbar-mini-brand,
-              #alt-toolbar-click-host.show-brand .alt-toolbar-hit-brand {{
-                max-width: 2.4rem;
-                opacity: 1;
-                transform: translateX(0);
-                margin-right: 0.55rem;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-link {{
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                white-space: nowrap;
-                color: rgba(49, 51, 63, 0.86);
-                font-size: 0.9rem;
-                font-weight: 700;
-                padding: 0.18rem 0.42rem;
-                border-radius: 999px;
-                transition: background 0.16s ease, color 0.16s ease;
-              }}
-              #alt-toolbar-click-host .alt-toolbar-hit-link {{
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                white-space: nowrap;
-                font-size: 0.9rem;
-                font-weight: 700;
-                padding: 0.18rem 0.42rem;
-                border-radius: 999px;
-                border: 0;
-                background: transparent;
-                color: transparent;
-                opacity: 0;
-                cursor: pointer;
-                pointer-events: auto !important;
-                appearance: none;
-                -webkit-appearance: none;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-link.is-active {{
-                background: rgba(59, 130, 246, 0.12);
-                color: rgb(29, 78, 216);
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-status {{
-                display: inline-flex;
-                align-items: center;
-                margin-left: 0.35rem;
-                flex: 0 0 auto;
-              }}
-              #alt-toolbar-visual-host .alt-toolbar-badge {{
-                font-size: 0.78rem;
-                padding: 0.18rem 0.5rem;
-              }}
-              @media (max-width: 980px) {{
-                #alt-toolbar-visual-host,
-                #alt-toolbar-click-host {{
-                  right: 9.5rem;
-                }}
-                #alt-toolbar-visual-host .alt-toolbar-link,
-                #alt-toolbar-click-host .alt-toolbar-hit-link {{
-                  font-size: 0.82rem;
-                  padding: 0.15rem 0.35rem;
-                }}
-                #alt-toolbar-visual-host .alt-toolbar-status {{
-                  display: none;
-                }}
-              }}
-              @media (max-width: 680px) {{
-                #alt-toolbar-visual-host,
-                #alt-toolbar-click-host {{
-                  right: 6.2rem;
-                }}
-              }}
-            `;
-            doc.head.appendChild(style);
-          }}
 
-          const header = doc.querySelector('header[data-testid="stHeader"]');
-          if (!header) return;
-          if (getComputedStyle(header).position === "static") {{
-            header.style.position = "sticky";
-          }}
-
-          let visualHost = doc.getElementById("alt-toolbar-visual-host");
-          if (!visualHost) {{
-            visualHost = doc.createElement("div");
-            visualHost.id = "alt-toolbar-visual-host";
-            header.appendChild(visualHost);
-          }} else if (visualHost.parentElement !== header) {{
-            header.appendChild(visualHost);
-          }}
-
-          let clickLayer = doc.getElementById("alt-toolbar-click-layer");
-          if (!clickLayer) {{
-            clickLayer = doc.createElement("div");
-            clickLayer.id = "alt-toolbar-click-layer";
-            doc.body.appendChild(clickLayer);
-          }}
-
-          let clickHost = doc.getElementById("alt-toolbar-click-host");
-          if (!clickHost) {{
-            clickHost = doc.createElement("div");
-            clickHost.id = "alt-toolbar-click-host";
-            clickLayer.appendChild(clickHost);
-          }} else if (clickHost.parentElement !== clickLayer) {{
-            clickLayer.appendChild(clickHost);
-          }}
-
-          visualHost.innerHTML = `{escaped_visual_toolbar_inner}`;
-          clickHost.innerHTML = `{escaped_hit_toolbar_inner}`;
-          clickHost.querySelectorAll('.alt-toolbar-hit-link').forEach((link) => {{
-            if (!(link instanceof HTMLButtonElement)) return;
-            const view = link.getAttribute('data-view');
-            if (!view) return;
-            const url = new URL(window.parent.location.href);
-            url.searchParams.set('view', view);
-            link.onclick = (event) => {{
-              event.preventDefault();
-              event.stopPropagation();
-              window.parent.location.assign(url.toString());
-            }};
-          }});
-
-          const updateLayout = () => {{
-            const headerRect = header.getBoundingClientRect();
-            let leftPx = window.parent.innerWidth <= 680 ? 40 : 52;
-            let rightPx = window.parent.innerWidth <= 680 ? 70 : window.parent.innerWidth <= 980 ? 120 : 180;
-            const sidebarNode = doc.querySelector('[data-testid="stSidebar"]');
-            let sidebarRect = null;
-            let sidebarIsOpen = false;
-            if (sidebarNode instanceof HTMLElement) {{
-              const rect = sidebarNode.getBoundingClientRect();
-              const visibleWidth = Math.max(0, Math.min(rect.right, window.parent.innerWidth) - Math.max(rect.left, 0));
-              if (rect.width >= 180 && visibleWidth >= 180 && rect.right > headerRect.left + 120) {{
-                sidebarRect = rect;
-                sidebarIsOpen = true;
-              }}
-            }}
-
-            let leftControlRect = null;
-            const preferredLeftControls = [
-              '[data-testid="collapsedControl"]',
-              'button[aria-label*="sidebar" i]',
-              'button[title*="sidebar" i]',
-              'button[kind="header"]',
-            ];
-            for (const selector of preferredLeftControls) {{
-              const node = header.querySelector(selector);
-              if (node instanceof HTMLElement) {{
-                const rect = node.getBoundingClientRect();
-                if (
-                  rect.width >= 18 &&
-                  rect.width <= 72 &&
-                  rect.height >= 18 &&
-                  rect.height <= 72 &&
-                  rect.left < headerRect.left + headerRect.width * 0.35
-                ) {{
-                  leftControlRect = rect;
-                  break;
-                }}
-              }}
-            }}
-
-            const headerButtons = Array.from(header.querySelectorAll('button, [role="button"]'))
-              .filter((el) => !visualHost.contains(el) && el instanceof HTMLElement)
-              .map((el) => el.getBoundingClientRect())
-              .filter(
-                (rect) =>
-                  rect.width >= 18 &&
-                  rect.width <= 72 &&
-                  rect.height >= 18 &&
-                  rect.height <= 72 &&
-                  rect.left < headerRect.left + headerRect.width * 0.45
-              )
-              .sort((a, b) => a.right - b.right);
-
-            if (!leftControlRect && headerButtons.length > 0) {{
-              leftControlRect = headerButtons[0];
-            }}
-
-            if (sidebarIsOpen && sidebarRect) {{
-              leftPx = Math.max(Math.round(sidebarRect.right - headerRect.left + 12), window.parent.innerWidth <= 680 ? 12 : 16);
-            }} else if (leftControlRect) {{
-              leftPx = Math.max(Math.round(leftControlRect.right - headerRect.left + 10), leftPx);
-            }}
-
-            const toolbar = header.querySelector('div[data-testid="stToolbar"]');
-            if (toolbar instanceof HTMLElement) {{
-              const toolbarRect = toolbar.getBoundingClientRect();
-              rightPx = Math.max(Math.round(headerRect.right - toolbarRect.left + 12), rightPx);
-            }}
-
-            if (clickLayer instanceof HTMLElement) {{
-              clickLayer.style.top = `${{Math.max(0, Math.round(headerRect.top))}}px`;
-              clickLayer.style.height = `${{Math.max(44, Math.round(headerRect.height))}}px`;
-            }}
-            visualHost.style.left = `${{leftPx}}px`;
-            visualHost.style.right = `${{rightPx}}px`;
-            clickHost.style.left = `${{leftPx}}px`;
-            clickHost.style.right = `${{rightPx}}px`;
-          }};
-
-          if (window.parent.__altToolbarResizeHandler) {{
-            window.parent.removeEventListener('resize', window.parent.__altToolbarResizeHandler);
-          }}
-          window.parent.__altToolbarResizeHandler = () => window.parent.requestAnimationFrame(updateLayout);
-          window.parent.addEventListener('resize', window.parent.__altToolbarResizeHandler);
-
-          if (window.parent.__altToolbarResizeObserver) {{
-            try {{
-              window.parent.__altToolbarResizeObserver.disconnect();
-            }} catch (error) {{}}
-          }}
-          const resizeObserver = new window.parent.ResizeObserver(() => window.parent.requestAnimationFrame(updateLayout));
-          resizeObserver.observe(header);
-          const sidebar = doc.querySelector('[data-testid="stSidebar"]');
-          if (sidebar instanceof HTMLElement) {{
-            resizeObserver.observe(sidebar);
-          }}
-          window.parent.__altToolbarResizeObserver = resizeObserver;
-
-          updateLayout();
-          window.parent.setTimeout(updateLayout, 60);
-          window.parent.setTimeout(updateLayout, 260);
-
-          const titleAnchor = doc.getElementById("alt-page-title-anchor");
-          if (window.parent.__altToolbarTitleObserver) {{
-            try {{
-              window.parent.__altToolbarTitleObserver.disconnect();
-            }} catch (error) {{}}
-          }}
-          if (titleAnchor && window.parent.IntersectionObserver) {{
-            const observer = new window.parent.IntersectionObserver(
-              (entries) => {{
-                const entry = entries[0];
-                if (entry && entry.isIntersecting) {{
-                  visualHost.classList.remove("show-brand");
-                  clickHost.classList.remove("show-brand");
-                }} else {{
-                  visualHost.classList.add("show-brand");
-                  clickHost.classList.add("show-brand");
-                }}
-              }},
-              {{
-                threshold: 0.15,
-                rootMargin: "-6px 0px 0px 0px",
-              }}
-            );
-            observer.observe(titleAnchor);
-            window.parent.__altToolbarTitleObserver = observer;
-          }}
-        }})();
-        </script>
-        """,
-        height=0,
-        width=0,
-    )
+    job_map = {
+        "broker_market_status": broker_market_status_job,
+        "broker_position_sync": broker_position_sync_job,
+        "broker_order_sync": broker_order_sync_job,
+        "broker_account_sync": broker_account_sync_job,
+    }
+    fn = job_map.get(job_name)
+    if fn is None:
+        return False, f"지원하지 않는 job 입니다: {job_name}"
+    context = build_task_context()
+    run_key = f"manual:{pd.Timestamp.utcnow().isoformat()}"
+    result = _run_guarded(context, job_name=job_name, run_key=run_key, fn=lambda: fn(context))
+    if result is None:
+        return False, f"{job_name} 실행에 실패했습니다."
+    return True, f"{job_name} 실행 완료"
 
 
 def render_global_footer() -> None:
@@ -1767,6 +1460,7 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     open_positions = data["open_positions"]
     open_orders = data["open_orders"]
     candidate_scans = data["candidate_scans"]
+    asset_overview = data.get("asset_overview", pd.DataFrame())
     prediction_report = data["prediction_report"]
     equity_curve = data["equity_curve"]
 
@@ -1784,39 +1478,210 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
         fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
         st.plotly_chart(fig, width="stretch")
 
-    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_errors = st.tabs(
-        ["Job Health", "Open Positions", "Predictions", "Candidates", "Recent Errors"]
+    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_assets, tab_errors = st.tabs(
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Assets", "Recent Errors"]
     )
     with tab_jobs:
         if job_health.empty:
             st.caption("job_runs가 없습니다.")
         else:
-            st.dataframe(job_health, width="stretch", hide_index=True)
+            st.dataframe(format_frame_timestamps_for_display(job_health), width="stretch", hide_index=True)
     with tab_positions:
         if open_positions.empty and open_orders.empty:
             st.caption("오픈 포지션/주문이 없습니다.")
         else:
             if not open_positions.empty:
                 st.caption("오픈 포지션")
-                st.dataframe(open_positions, width="stretch", hide_index=True)
+                st.dataframe(format_frame_timestamps_for_display(open_positions), width="stretch", hide_index=True)
             if not open_orders.empty:
                 st.caption("오픈 주문")
-                st.dataframe(open_orders, width="stretch", hide_index=True)
+                st.dataframe(format_frame_timestamps_for_display(open_orders), width="stretch", hide_index=True)
     with tab_predictions:
         if prediction_report.empty:
             st.caption("예측 ledger가 비어 있습니다.")
         else:
-            st.dataframe(prediction_report.head(200), width="stretch", hide_index=True)
+            st.dataframe(format_frame_timestamps_for_display(prediction_report.head(200)), width="stretch", hide_index=True)
     with tab_candidates:
         if candidate_scans.empty:
             st.caption("candidate_scans가 없습니다.")
         else:
-            st.dataframe(candidate_scans.head(200), width="stretch", hide_index=True)
+            st.dataframe(format_frame_timestamps_for_display(candidate_scans.head(200)), width="stretch", hide_index=True)
+    with tab_assets:
+        if asset_overview.empty:
+            st.caption("설정된 자산 유니버스가 없습니다.")
+        else:
+            st.dataframe(asset_overview, width="stretch", hide_index=True)
     with tab_errors:
         if recent_errors.empty:
             st.caption("최근 ERROR 이벤트가 없습니다.")
         else:
-            st.dataframe(recent_errors, width="stretch", hide_index=True)
+            st.dataframe(format_frame_timestamps_for_display(recent_errors), width="stretch", hide_index=True)
+
+
+def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | None = None) -> None:
+    settings = settings or load_settings()
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+
+    st.subheader("운영 모니터")
+    st.caption("worker 상태, 실행 보장 지표, broker sync 결과를 확인합니다.")
+    control_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.0, 2.0])
+    if control_cols[0].button("신규 진입 중단", key="ops_pause"):
+        repository.set_control_flag("trading_paused", "1", "set from streamlit monitor")
+        st.rerun()
+    if control_cols[1].button("신규 진입 재개", key="ops_resume"):
+        repository.set_control_flag("trading_paused", "0", "set from streamlit monitor")
+        st.rerun()
+    if control_cols[2].button("Market Sync", key="ops_sync_market"):
+        ok, message = run_manual_runtime_job("broker_market_status")
+        (st.success if ok else st.error)(message)
+    if control_cols[3].button("Order Sync", key="ops_sync_orders"):
+        ok, message = run_manual_runtime_job("broker_order_sync")
+        (st.success if ok else st.error)(message)
+    if control_cols[4].button("Account Sync", key="ops_sync_account"):
+        ok, message = run_manual_runtime_job("broker_account_sync")
+        (st.success if ok else st.error)(message)
+
+    data = dashboard_data or load_dashboard_data(settings)
+    summary = data["summary"]
+    trade_performance = data["trade_performance"]
+    auto_trading_status = data.get("auto_trading_status", {})
+    execution_summary = data.get("execution_summary", {})
+    broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
+    broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
+    kis_runtime = data.get("kis_runtime", {})
+    runtime_profile = data.get("runtime_profile", {})
+    asset_overview = data.get("asset_overview", pd.DataFrame())
+
+    metrics = st.columns(6)
+    metrics[0].metric("미해결 예측", f"{int(summary.get('unresolved_predictions', 0))}")
+    metrics[1].metric("오픈 포지션", f"{int(summary.get('open_positions', 0))}")
+    metrics[2].metric("오픈 주문", f"{int(summary.get('open_orders', 0))}")
+    metrics[3].metric("Today PnL", format_price_value(float(trade_performance.get("today_pnl", float("nan")))))
+    metrics[4].metric("누적 수익률", format_pct_value(float(trade_performance.get("total_return_pct", float("nan")))))
+    metrics[5].metric("최대 낙폭", format_pct_value(float(trade_performance.get("max_drawdown_pct", float("nan")))))
+    st.caption(
+        f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
+        f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
+    )
+    st.caption(
+        f"현재 프로파일 · {str(runtime_profile.get('name') or settings.profile_name)}"
+        f" · source={str(runtime_profile.get('source') or settings.profile_source)}"
+    )
+    if not asset_overview.empty and {"자산유형", "실행브로커"}.issubset(asset_overview.columns):
+        broker_mode_text = " · ".join(
+            f"{str(row['자산유형'])}={str(row['실행브로커'])}"
+            for _, row in asset_overview.iterrows()
+        )
+        st.caption(f"자산별 실행 브로커 · {broker_mode_text}")
+
+    execution_cols = st.columns(5)
+    execution_cols[0].metric("Today Candidates", f"{int(execution_summary.get('today_candidate_count', 0))}")
+    execution_cols[1].metric("Entry Allowed", f"{int(execution_summary.get('today_entry_allowed_count', 0))}")
+    execution_cols[2].metric("Entry Rejected", f"{int(execution_summary.get('today_entry_rejected_count', 0))}")
+    execution_cols[3].metric("Submitted", f"{int(execution_summary.get('today_submitted_count', 0))}")
+    execution_cols[4].metric("Filled", f"{int(execution_summary.get('today_filled_count', 0))}")
+
+    execution_cols_2 = st.columns(5)
+    execution_cols_2[0].metric("Submit Requested", f"{int(execution_summary.get('today_submit_requested_count', 0))}")
+    execution_cols_2[1].metric("Acknowledged", f"{int(execution_summary.get('today_acknowledged_count', 0))}")
+    execution_cols_2[2].metric("Rejected", f"{int(execution_summary.get('today_rejected_count', 0))}")
+    execution_cols_2[3].metric("Cancelled", f"{int(execution_summary.get('today_cancelled_count', 0))}")
+    execution_cols_2[4].metric("No-op", f"{int(execution_summary.get('today_noop_count', 0))}")
+
+    kis_cols = st.columns(6)
+    kis_cols[0].metric("Last Account Sync", format_display_timestamp(kis_runtime.get("last_broker_account_sync")))
+    kis_cols[1].metric("Last Order Sync", format_display_timestamp(kis_runtime.get("last_broker_order_sync")))
+    last_position_sync = ""
+    if not broker_sync_status.empty:
+        pos_row = broker_sync_status.loc[broker_sync_status["job_name"].astype(str) == "broker_position_sync"]
+        if not pos_row.empty:
+            last_position_sync = pos_row.iloc[0].get("heartbeat_at")
+    kis_cols[2].metric("Last Position Sync", format_display_timestamp(last_position_sync))
+    kis_cols[3].metric("Last WS Event", format_display_timestamp(kis_runtime.get("last_websocket_execution_event")))
+    kis_cols[4].metric("Pending Submitted", f"{int(kis_runtime.get('pending_submitted_orders', 0))}")
+    kis_cols[5].metric("Broker Rejects Today", f"{int(kis_runtime.get('broker_rejects_today', 0))}")
+
+    job_health = data["job_health"]
+    recent_errors = data["recent_errors"]
+    open_positions = data["open_positions"]
+    open_orders = data["open_orders"]
+    candidate_scans = data["candidate_scans"]
+    prediction_report = data["prediction_report"]
+    equity_curve = data["equity_curve"]
+    today_execution_events = data.get("today_execution_events", pd.DataFrame())
+    noop_breakdown = execution_summary.get("today_noop_breakdown", pd.DataFrame())
+
+    if not equity_curve.empty:
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
+                    y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
+                    mode="lines+markers",
+                    name="Equity",
+                )
+            ]
+        )
+        fig.update_layout(height=280, margin=dict(l=20, r=20, t=20, b=20), hovermode="x unified")
+        st.plotly_chart(fig, width="stretch")
+
+    tab_jobs, tab_positions, tab_predictions, tab_candidates, tab_execution, tab_broker, tab_assets, tab_errors = st.tabs(
+        ["Job Health", "Open Positions", "Predictions", "Candidates", "Execution", "Broker Sync", "Assets", "Recent Errors"]
+    )
+    with tab_jobs:
+        if job_health.empty:
+            st.caption("job_runs가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(job_health), width="stretch", hide_index=True)
+    with tab_positions:
+        if open_positions.empty and open_orders.empty:
+            st.caption("오픈 포지션과 주문이 없습니다.")
+        else:
+            if not open_positions.empty:
+                st.caption("오픈 포지션")
+                st.dataframe(format_frame_timestamps_for_display(open_positions), width="stretch", hide_index=True)
+            if not open_orders.empty:
+                st.caption("오픈 주문")
+                st.dataframe(format_frame_timestamps_for_display(open_orders), width="stretch", hide_index=True)
+    with tab_predictions:
+        if prediction_report.empty:
+            st.caption("prediction ledger가 비어 있습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(prediction_report.head(200)), width="stretch", hide_index=True)
+    with tab_candidates:
+        if candidate_scans.empty:
+            st.caption("candidate_scans가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(candidate_scans.head(200)), width="stretch", hide_index=True)
+    with tab_execution:
+        if not noop_breakdown.empty:
+            st.caption("No-op reason breakdown")
+            st.dataframe(noop_breakdown, width="stretch", hide_index=True)
+        if today_execution_events.empty:
+            st.caption("오늘 execution event가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(today_execution_events.head(200)), width="stretch", hide_index=True)
+    with tab_broker:
+        if broker_sync_status.empty:
+            st.caption("broker sync 상태가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(broker_sync_status), width="stretch", hide_index=True)
+        if broker_sync_errors.empty:
+            st.caption("최근 broker sync 오류가 없습니다.")
+        else:
+            st.caption("최근 broker sync / execution 이벤트")
+            st.dataframe(format_frame_timestamps_for_display(broker_sync_errors.head(100)), width="stretch", hide_index=True)
+    with tab_assets:
+        if asset_overview.empty:
+            st.caption("설정된 자산 유니버스가 없습니다.")
+        else:
+            st.dataframe(asset_overview, width="stretch", hide_index=True)
+    with tab_errors:
+        if recent_errors.empty:
+            st.caption("최근 ERROR 이벤트가 없습니다.")
+        else:
+            st.dataframe(format_frame_timestamps_for_display(recent_errors), width="stretch", hide_index=True)
 
 
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
@@ -2191,7 +2056,6 @@ def set_analysis_target(asset_type: str, raw_symbol: str, korea_market: str) -> 
         "asset_type": asset_type,
         "raw_symbol": raw_symbol,
         "korea_market": korea_market,
-        "active_view": "종목 분석",
     }
     st.session_state["analysis_result"] = None
     st.session_state["analysis_result_symbol"] = ""
@@ -2858,18 +2722,16 @@ if pending_analysis_target:
     st.session_state["sidebar_raw_symbol"] = str(pending_analysis_target["raw_symbol"])
     st.session_state["sidebar_korea_market"] = str(pending_analysis_target["korea_market"])
     st.session_state["sidebar_asset_type_prev"] = str(pending_analysis_target["asset_type"])
-    st.session_state["active_view"] = str(pending_analysis_target.get("active_view", "종목 분석"))
 
 
 st.session_state.setdefault("ui_mode_choice", "자동")
+st.session_state.setdefault("ui_theme_mode", get_streamlit_theme_mode())
+st.session_state.setdefault("ui_theme_toggle_event", "")
 st.session_state.setdefault("sidebar_asset_type", "한국주식")
 st.session_state.setdefault("sidebar_raw_symbol", default_symbol_for_asset(st.session_state["sidebar_asset_type"]))
 st.session_state.setdefault("sidebar_korea_market", "KOSPI")
 st.session_state.setdefault("sidebar_asset_type_prev", st.session_state["sidebar_asset_type"])
-if "active_view" not in st.session_state:
-    st.session_state["active_view"] = "운영 모니터"
-if pending_analysis_target is None:
-    sync_active_view_from_query_params()
+
 st.session_state.setdefault("analysis_auto_run", False)
 st.session_state.setdefault("analysis_result", None)
 st.session_state.setdefault("analysis_result_symbol", "")
@@ -2988,21 +2850,43 @@ analysis_inputs = {
     "take_profit_atr_mult": take_profit_atr_mult,
 }
 
-apply_responsive_css(is_mobile_ui=is_mobile_ui)
+
+def render_remote_access_help() -> None:
+    with st.expander("원격 접속(Tailscale) 안내"):
+        st.markdown(
+            """
+            1. 이 PC와 원격 기기에 Tailscale을 설치하고 같은 Tailnet에 로그인합니다.
+            2. 서버 PC에서 앱 실행: `python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true`
+            3. 서버 PC Tailscale IP 확인: `tailscale ip -4`
+            4. 원격 기기 브라우저에서 접속: `http://<TAILSCALE_IP>:8501`
+            """
+        )
+
+
+theme_mode = get_streamlit_theme_mode()
+stored_theme_mode = str(st.session_state.get("ui_theme_mode", theme_mode) or theme_mode).lower()
+if stored_theme_mode in {"light", "dark"} and stored_theme_mode != theme_mode:
+    st_config.set_option("theme.base", stored_theme_mode)
+    theme_mode = stored_theme_mode
+apply_responsive_css(is_mobile_ui=is_mobile_ui, theme_mode=theme_mode)
 runtime_settings = load_settings()
 dashboard_data = load_dashboard_data(runtime_settings)
-active_view = str(st.session_state.get("active_view", "운영 모니터"))
-sync_query_params_from_active_view()
-render_top_nav_bar(
-    active_view=active_view,
-    auto_trading_status=dashboard_data.get("auto_trading_status", {}),
-    is_mobile_ui=is_mobile_ui,
-)
-render_page_header()
+page_objects: Dict[str, Any] = {}
 
-if st.session_state["active_view"] == "운영 모니터":
+
+def switch_to_page(page_key: str) -> None:
+    page = page_objects.get(page_key)
+    if page is not None:
+        st.switch_page(page)
+
+
+
+def render_monitor_page() -> None:
     render_operations_monitor(settings=runtime_settings, dashboard_data=dashboard_data)
-elif st.session_state["active_view"] == "대시보드":
+
+
+
+def render_dashboard_page() -> None:
     st.subheader(f"{asset_type} 대시보드")
     st.caption("리스트에서 종목을 고르면 종목 분석 화면으로 이동해 바로 예측을 실행합니다.")
 
@@ -3041,115 +2925,102 @@ elif st.session_state["active_view"] == "대시보드":
     if not dashboard_initialized:
         st.info("모바일에서는 첫 화면 로딩을 줄이기 위해 대시보드 시세를 바로 불러오지 않습니다.")
         st.caption("필요할 때 `대시보드 불러오기`를 누르면 목록과 현재가를 가져옵니다.")
-        with st.expander("원격 접속(Tailscale) 안내"):
-            st.markdown(
-                """
-                1. 이 PC와 원격 기기에 Tailscale을 설치하고 같은 Tailnet에 로그인합니다.
-                2. 서버 PC에서 앱 실행: `python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true`
-                3. 서버 PC Tailscale IP 확인: `tailscale ip -4`
-                4. 원격 기기 브라우저에서 접속: `http://<TAILSCALE_IP>:8501`
-                """
-            )
+        render_remote_access_help()
+        return
+
+    with st.spinner("대시보드 시세를 불러오는 중..."):
+        dashboard_rows, unresolved_dashboard_names = build_dashboard_market_rows(
+            asset_type=asset_type,
+            display_limit=display_limit,
+            refresh_token=int(st.session_state["dashboard_quote_refresh_token"]),
+        )
+
+    dashboard_filtered = dashboard_rows
+    keyword = search_keyword.strip().lower()
+    if keyword:
+        dashboard_filtered = [
+            row
+            for row in dashboard_filtered
+            if keyword in str(row.get("종목명", "")).lower()
+            or keyword in str(row.get("심볼", "")).lower()
+            or keyword in str(row.get("시장", "")).lower()
+        ]
+
+    if sort_mode == "전일대비 상승순":
+        dashboard_filtered = sorted(
+            dashboard_filtered,
+            key=lambda row: (
+                not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
+                -first_valid_float(row.get("전일대비(%)")),
+            ),
+        )
+    elif sort_mode == "전일대비 하락순":
+        dashboard_filtered = sorted(
+            dashboard_filtered,
+            key=lambda row: (
+                not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
+                first_valid_float(row.get("전일대비(%)")),
+            ),
+        )
     else:
-        with st.spinner("대시보드 시세를 불러오는 중..."):
-            dashboard_rows, unresolved_dashboard_names = build_dashboard_market_rows(
-                asset_type=asset_type,
-                display_limit=display_limit,
-                refresh_token=int(st.session_state["dashboard_quote_refresh_token"]),
-            )
+        dashboard_filtered = sorted(dashboard_filtered, key=lambda row: int(row["순위"]))
 
-        dashboard_filtered = dashboard_rows
-        keyword = search_keyword.strip().lower()
-        if keyword:
-            dashboard_filtered = [
-                row
-                for row in dashboard_filtered
-                if keyword in str(row.get("종목명", "")).lower()
-                or keyword in str(row.get("심볼", "")).lower()
-                or keyword in str(row.get("시장", "")).lower()
-            ]
+    st.caption("현재가와 전일대비는 자산별 실시간 또는 지연 시세 기준입니다.")
 
-        if sort_mode == "전일대비 상승순":
-            dashboard_filtered = sorted(
-                dashboard_filtered,
-                key=lambda row: (
-                    not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
-                    -first_valid_float(row.get("전일대비(%)")),
-                ),
-            )
-        elif sort_mode == "전일대비 하락순":
-            dashboard_filtered = sorted(
-                dashboard_filtered,
-                key=lambda row: (
-                    not np.isfinite(first_valid_float(row.get("전일대비(%)"))),
-                    first_valid_float(row.get("전일대비(%)")),
-                ),
-            )
-        else:
-            dashboard_filtered = sorted(dashboard_filtered, key=lambda row: int(row["순위"]))
+    if dashboard_filtered:
+        for idx, row in enumerate(dashboard_filtered):
+            symbol = str(row.get("심볼") or "")
+            market = str(row.get("시장") or "")
+            row_asset_type = str(row.get("자산유형") or asset_type)
+            current_price = float(row.get("현재가", float("nan")))
+            currency = str(row.get("통화", default_currency_from_symbol(symbol) if symbol else "USD"))
+            change_pct = float(row.get("전일대비(%)", float("nan")))
+            price_text = format_live_price(current_price, currency)
+            if np.isfinite(change_pct):
+                change_color = "#ef4444" if change_pct > 0 else "#3b82f6" if change_pct < 0 else "#9ca3af"
+                change_html = f"<span style='color:{change_color};font-weight:700;'>{change_pct:+.2f}%</span>"
+            else:
+                change_html = "<span style='color:#9ca3af;'>N/A</span>"
 
-        st.caption("현재가와 전일대비는 자산별 실시간 또는 지연 시세 기준입니다.")
+            row_market = "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI"
+            button_key = f"dashboard_analyze_{idx}_{symbol or row.get('종목명', '')}"
 
-        if dashboard_filtered:
-            for idx, row in enumerate(dashboard_filtered):
-                symbol = str(row.get("심볼") or "")
-                market = str(row.get("시장") or "")
-                row_asset_type = str(row.get("자산유형") or asset_type)
-                current_price = float(row.get("현재가", float("nan")))
-                currency = str(row.get("통화", default_currency_from_symbol(symbol) if symbol else "USD"))
-                change_pct = float(row.get("전일대비(%)", float("nan")))
-                price_text = format_live_price(current_price, currency)
-                if np.isfinite(change_pct):
-                    change_color = "#ef4444" if change_pct > 0 else "#3b82f6" if change_pct < 0 else "#9ca3af"
-                    change_html = f"<span style='color:{change_color};font-weight:700;'>{change_pct:+.2f}%</span>"
+            with st.container(border=True):
+                if is_mobile_ui:
+                    st.markdown(f"**#{int(row['순위'])} {row['종목명']}**")
+                    st.caption(f"{market} · `{symbol or '-'}`")
+                    st.markdown(f"{price_text} · {change_html}", unsafe_allow_html=True)
+                    if st.button("분석", key=button_key, disabled=not bool(symbol), type="primary"):
+                        set_analysis_target(row_asset_type, symbol, row_market)
+                        switch_to_page("analysis")
                 else:
-                    change_html = "<span style='color:#9ca3af;'>N/A</span>"
-
-                row_market = "KOSDAQ" if symbol.endswith(".KQ") else "KOSPI"
-                button_key = f"dashboard_analyze_{idx}_{symbol or row.get('종목명', '')}"
-
-                with st.container(border=True):
-                    if is_mobile_ui:
+                    info_col, price_col, action_col = st.columns([4.0, 2.0, 1.0])
+                    with info_col:
                         st.markdown(f"**#{int(row['순위'])} {row['종목명']}**")
                         st.caption(f"{market} · `{symbol or '-'}`")
-                        st.markdown(f"{price_text} · {change_html}", unsafe_allow_html=True)
+                    with price_col:
+                        st.markdown(f"**{price_text}**")
+                        st.markdown(change_html, unsafe_allow_html=True)
+                    with action_col:
+                        st.write("")
                         if st.button("분석", key=button_key, disabled=not bool(symbol), type="primary"):
                             set_analysis_target(row_asset_type, symbol, row_market)
-                            st.rerun()
-                    else:
-                        info_col, price_col, action_col = st.columns([4.0, 2.0, 1.0])
-                        with info_col:
-                            st.markdown(f"**#{int(row['순위'])} {row['종목명']}**")
-                            st.caption(f"{market} · `{symbol or '-'}`")
-                        with price_col:
-                            st.markdown(f"**{price_text}**")
-                            st.markdown(change_html, unsafe_allow_html=True)
-                        with action_col:
-                            st.write("")
-                            if st.button("분석", key=button_key, disabled=not bool(symbol), type="primary"):
-                                set_analysis_target(row_asset_type, symbol, row_market)
-                                st.rerun()
-        else:
-            st.warning("검색 조건에 맞는 종목이 없습니다.")
+                            switch_to_page("analysis")
+    else:
+        st.warning("검색 조건에 맞는 종목이 없습니다.")
 
-        with st.expander("테이블로 보기", expanded=not is_mobile_ui):
-            st.dataframe(build_snapshot_view_df(dashboard_filtered), width="stretch", hide_index=True)
+    with st.expander("테이블로 보기", expanded=not is_mobile_ui):
+        st.dataframe(build_snapshot_view_df(dashboard_filtered), width="stretch", hide_index=True)
 
-        if unresolved_dashboard_names:
-            with st.expander("심볼 자동 해석 실패 종목"):
-                st.dataframe(pd.DataFrame({"종목명": unresolved_dashboard_names}), width="stretch", hide_index=True)
+    if unresolved_dashboard_names:
+        with st.expander("심볼 자동 해석 실패 종목"):
+            st.dataframe(pd.DataFrame({"종목명": unresolved_dashboard_names}), width="stretch", hide_index=True)
 
-        with st.expander("원격 접속(Tailscale) 안내"):
-            st.markdown(
-                """
-                1. 이 PC와 원격 기기에 Tailscale을 설치하고 같은 Tailnet에 로그인합니다.
-                2. 서버 PC에서 앱 실행: `python -m streamlit run app.py --server.address 0.0.0.0 --server.port 8501 --server.headless true`
-                3. 서버 PC Tailscale IP 확인: `tailscale ip -4`
-                4. 원격 기기 브라우저에서 접속: `http://<TAILSCALE_IP>:8501`
-                """
-            )
+    render_remote_access_help()
 
-elif st.session_state["active_view"] == "종목 분석":
+
+
+def render_analysis_page() -> None:
     st.subheader("종목 분석")
     st.caption("대시보드에서 종목을 고르면 여기로 넘어오고, 현재 사이드바 설정 기준으로 예측을 실행합니다.")
 
@@ -3228,10 +3099,14 @@ elif st.session_state["active_view"] == "종목 분석":
             korea_market=run_korea_market,
         )
 
-elif st.session_state["active_view"] == PAPER_VIEW_NAME:
+
+
+def render_paper_page() -> None:
     render_paper_trading_page(analysis_inputs=analysis_inputs, is_mobile_ui=is_mobile_ui)
 
-else:
+
+
+def render_scan_page() -> None:
     st.subheader("종목 스캔")
     st.caption("Top100 후보나 직접 입력한 심볼을 한 번에 돌려 유망도 순위를 확인합니다.")
 
@@ -3281,124 +3156,176 @@ else:
     )
     run_scan = st.button("유망 종목 스캔 실행", type="primary", key="scan_run")
 
-    if run_scan:
-        resolved_pairs: List[Tuple[str, str]] = []
-        unresolved_names: List[str] = []
-
-        if selected_entries:
-            name_pairs, unresolved_names = resolve_top100_entries(asset_type=asset_type, entries=selected_entries)
-            resolved_pairs.extend(name_pairs)
-
-        extra_symbols = parse_symbols(extra_symbols_raw)
-        resolved_pairs.extend((sym, sym) for sym in selected_symbols)
-        resolved_pairs.extend((sym, sym) for sym in extra_symbols)
-        resolved_pairs = dedupe_symbol_pairs(resolved_pairs)
-
-        if unresolved_names:
-            st.warning("일부 종목은 티커를 자동으로 찾지 못했습니다. 아래 목록을 직접 심볼 입력으로 보완해 주세요.")
-            st.dataframe(pd.DataFrame({"미해결 종목명": unresolved_names}), width="stretch", hide_index=True)
-
-        if not resolved_pairs:
-            st.error("스캔할 심볼이 없습니다. Top100 선택 또는 심볼 직접 입력을 확인해 주세요.")
-        else:
-            if validation_mode == "walk_forward" and len(resolved_pairs) >= 8:
-                st.warning("워크포워드 모드는 느릴 수 있습니다. 종목 수가 많으면 분석 시간이 길어집니다.")
-
-            rows: List[Dict[str, float | str]] = []
-            errors: List[Dict[str, str]] = []
-            progress = st.progress(0.0)
-            status = st.empty()
-
-            for idx, (display_name, scan_raw_symbol) in enumerate(resolved_pairs, start=1):
-                try:
-                    symbol = normalize_symbol(asset_type=asset_type, raw_symbol=scan_raw_symbol, korea_market=korea_market)
-                    status.write(f"{idx}/{len(resolved_pairs)} 분석 중: `{display_name}` -> `{symbol}`")
-                    scan_result = run_cached(
-                        symbol=symbol,
-                        years=years,
-                        test_days=test_days,
-                        forecast_days=forecast_days,
-                        validation_mode=validation_mode,
-                        retrain_every=retrain_every,
-                        round_trip_cost_bps=round_trip_cost_bps,
-                        min_signal_strength_pct=min_signal_strength_pct,
-                        final_holdout_days=final_holdout_days,
-                        purge_days=purge_days,
-                        embargo_days=embargo_days,
-                        target_mode=target_mode,
-                        validation_days=validation_days,
-                        allow_short=allow_short,
-                        trade_mode=trade_mode,
-                        target_daily_vol_pct=target_daily_vol_pct,
-                        max_position_size=max_position_size,
-                        stop_loss_atr_mult=stop_loss_atr_mult,
-                        take_profit_atr_mult=take_profit_atr_mult,
-                    )
-                    row = build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days)
-                    row["종목명"] = display_name
-                    rows.append(row)
-                except Exception as exc:
-                    errors.append({"입력": display_name, "심볼": scan_raw_symbol, "오류": str(exc)})
-                progress.progress(idx / len(resolved_pairs))
-
-            status.empty()
-            progress.empty()
-
-            if rows:
-                summary = (
-                    pd.DataFrame(rows)
-                    .sort_values(
-                        ["유망도점수", "최종홀드아웃_기대값(%)", "예상수익률(%)"],
-                        ascending=[False, False, False],
-                    )
-                    .reset_index(drop=True)
-                )
-                summary.insert(0, "순위", np.arange(1, len(summary) + 1))
-                top_df = summary.head(min(top_n, len(summary)))
-
-                st.subheader("유망 후보 카드")
-                card_cols = st.columns(min((1 if is_mobile_ui else 3), len(top_df)))
-                for i in range(len(top_df)):
-                    row = top_df.iloc[i]
-                    with card_cols[i % len(card_cols)]:
-                        st.metric(
-                            f"#{int(row['순위'])} {row['종목명']}",
-                            f"{row['유망도점수']:.1f}점",
-                            f"{row['예상수익률(%)']:+.2f}%",
-                        )
-                        st.caption(f"{row['심볼']} · 홀드아웃 기대값 {row['최종홀드아웃_기대값(%)']:+.3f}%")
-                        st.caption(
-                            f"방향정확도 {row['최종홀드아웃_방향정확도(%)']:.1f}% · 승률 {row['최종홀드아웃_승률(%)']:.1f}% · MDD {row['최종홀드아웃_MDD(%)']:.2f}%"
-                        )
-
-                score_fig = go.Figure(
-                    data=[
-                        go.Bar(
-                            x=top_df["종목명"],
-                            y=top_df["유망도점수"],
-                            text=[f"{value:.1f}" for value in top_df["유망도점수"]],
-                            textposition="outside",
-                        )
-                    ]
-                )
-                score_fig.update_layout(
-                    title="상위 후보 유망도 점수",
-                    height=300 if is_mobile_ui else 380,
-                    margin=dict(l=20, r=20, t=50, b=20),
-                    yaxis_title="점수",
-                    xaxis_title="종목",
-                )
-                st.plotly_chart(score_fig, width="stretch")
-
-                st.subheader("전체 스캔 결과")
-                st.dataframe(summary, width="stretch", hide_index=True)
-            else:
-                st.warning("정상 분석된 종목이 없습니다. 심볼 형식이나 티커 연결 상태를 확인해 주세요.")
-
-            if errors:
-                st.subheader("실패 항목")
-                st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
-    else:
+    if not run_scan:
         st.info("종목을 선택하고 스캔 실행을 누르세요.")
+        return
 
+    resolved_pairs: List[Tuple[str, str]] = []
+    unresolved_names: List[str] = []
+
+    if selected_entries:
+        name_pairs, unresolved_names = resolve_top100_entries(asset_type=asset_type, entries=selected_entries)
+        resolved_pairs.extend(name_pairs)
+
+    extra_symbols = parse_symbols(extra_symbols_raw)
+    resolved_pairs.extend((sym, sym) for sym in selected_symbols)
+    resolved_pairs.extend((sym, sym) for sym in extra_symbols)
+    resolved_pairs = dedupe_symbol_pairs(resolved_pairs)
+
+    if unresolved_names:
+        st.warning("일부 종목은 티커를 자동으로 찾지 못했습니다. 아래 목록을 직접 심볼 입력으로 보완해 주세요.")
+        st.dataframe(pd.DataFrame({"미해결 종목명": unresolved_names}), width="stretch", hide_index=True)
+
+    if not resolved_pairs:
+        st.error("스캔할 심볼이 없습니다. Top100 선택 또는 심볼 직접 입력을 확인해 주세요.")
+        return
+
+    if validation_mode == "walk_forward" and len(resolved_pairs) >= 8:
+        st.warning("워크포워드 모드는 느릴 수 있습니다. 종목 수가 많으면 분석 시간이 길어집니다.")
+
+    rows: List[Dict[str, float | str]] = []
+    errors: List[Dict[str, str]] = []
+    progress = st.progress(0.0)
+    status = st.empty()
+
+    for idx, (display_name, scan_raw_symbol) in enumerate(resolved_pairs, start=1):
+        try:
+            symbol = normalize_symbol(asset_type=asset_type, raw_symbol=scan_raw_symbol, korea_market=korea_market)
+            status.write(f"{idx}/{len(resolved_pairs)} 분석 중: `{display_name}` -> `{symbol}`")
+            scan_result = run_cached(
+                symbol=symbol,
+                years=years,
+                test_days=test_days,
+                forecast_days=forecast_days,
+                validation_mode=validation_mode,
+                retrain_every=retrain_every,
+                round_trip_cost_bps=round_trip_cost_bps,
+                min_signal_strength_pct=min_signal_strength_pct,
+                final_holdout_days=final_holdout_days,
+                purge_days=purge_days,
+                embargo_days=embargo_days,
+                target_mode=target_mode,
+                validation_days=validation_days,
+                allow_short=allow_short,
+                trade_mode=trade_mode,
+                target_daily_vol_pct=target_daily_vol_pct,
+                max_position_size=max_position_size,
+                stop_loss_atr_mult=stop_loss_atr_mult,
+                take_profit_atr_mult=take_profit_atr_mult,
+            )
+            row = build_scan_row(symbol=symbol, result=scan_result, forecast_days=forecast_days)
+            row["종목명"] = display_name
+            rows.append(row)
+        except Exception as exc:
+            errors.append({"입력": display_name, "심볼": scan_raw_symbol, "오류": str(exc)})
+        progress.progress(idx / len(resolved_pairs))
+
+    status.empty()
+    progress.empty()
+
+    if rows:
+        summary = (
+            pd.DataFrame(rows)
+            .sort_values(
+                ["유망도점수", "최종홀드아웃_기대값(%)", "예상수익률(%)"],
+                ascending=[False, False, False],
+            )
+            .reset_index(drop=True)
+        )
+        summary.insert(0, "순위", np.arange(1, len(summary) + 1))
+        top_df = summary.head(min(top_n, len(summary)))
+
+        st.subheader("유망 후보 카드")
+        card_cols = st.columns(min((1 if is_mobile_ui else 3), len(top_df)))
+        for i in range(len(top_df)):
+            row = top_df.iloc[i]
+            with card_cols[i % len(card_cols)]:
+                st.metric(
+                    f"#{int(row['순위'])} {row['종목명']}",
+                    f"{row['유망도점수']:.1f}점",
+                    f"{row['예상수익률(%)']:+.2f}%",
+                )
+                st.caption(f"{row['심볼']} · 홀드아웃 기대값 {row['최종홀드아웃_기대값(%)']:+.3f}%")
+                st.caption(
+                    f"방향정확도 {row['최종홀드아웃_방향정확도(%)']:.1f}% · 승률 {row['최종홀드아웃_승률(%)']:.1f}% · MDD {row['최종홀드아웃_MDD(%)']:.2f}%"
+                )
+
+        score_fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=top_df["종목명"],
+                    y=top_df["유망도점수"],
+                    text=[f"{value:.1f}" for value in top_df["유망도점수"]],
+                    textposition="outside",
+                )
+            ]
+        )
+        score_fig.update_layout(
+            title="상위 후보 유망도 점수",
+            height=300 if is_mobile_ui else 380,
+            margin=dict(l=20, r=20, t=50, b=20),
+            yaxis_title="점수",
+            xaxis_title="종목",
+        )
+        st.plotly_chart(score_fig, width="stretch")
+
+        st.subheader("전체 스캔 결과")
+        st.dataframe(summary, width="stretch", hide_index=True)
+    else:
+        st.warning("정상 분석된 종목이 없습니다. 심볼 형식이나 티커 연결 상태를 확인해 주세요.")
+
+    if errors:
+        st.subheader("실패 항목")
+        st.dataframe(pd.DataFrame(errors), width="stretch", hide_index=True)
+
+
+page_objects = {
+    "monitor": st.Page(render_monitor_page, title=VIEW_CODE_TO_LABEL["monitor"], url_path="monitor", default=True),
+    "dashboard": st.Page(render_dashboard_page, title=VIEW_CODE_TO_LABEL["dashboard"], url_path="dashboard"),
+    "analysis": st.Page(render_analysis_page, title=VIEW_CODE_TO_LABEL["analysis"], url_path="analysis"),
+    "paper": st.Page(render_paper_page, title=VIEW_CODE_TO_LABEL["paper"], url_path="paper"),
+    "scan": st.Page(render_scan_page, title=VIEW_CODE_TO_LABEL["scan"], url_path="scan"),
+}
+page_sequence = [
+    page_objects["monitor"],
+    page_objects["dashboard"],
+    page_objects["analysis"],
+    page_objects["paper"],
+    page_objects["scan"],
+]
+selected_page = st.navigation(page_sequence, position="hidden")
+current_page_key = resolve_current_page_key(page_objects, selected_page, default_key="monitor")
+
+render_page_header()
+
+nav_events: Dict[str, str | None] = {"selected_page": None, "theme_toggle_event": None}
+nav_error = None
+try:
+    nav_events = render_floating_nav(
+        current_page=current_page_key,
+        items=NAV_ITEMS,
+        status=dashboard_data.get("auto_trading_status", {}),
+        theme_mode=theme_mode,
+        hide_on_scroll=True,
+        scroll_threshold=88,
+    )
+except Exception as exc:
+    nav_error = str(exc)
+
+theme_toggle_event = nav_events.get("theme_toggle_event")
+if theme_toggle_event and theme_toggle_event != st.session_state.get("ui_theme_toggle_event", ""):
+    st.session_state["ui_theme_toggle_event"] = theme_toggle_event
+    next_theme_mode = "dark" if theme_mode == "light" else "light"
+    st.session_state["ui_theme_mode"] = next_theme_mode
+    st_config.set_option("theme.base", next_theme_mode)
+    st.rerun()
+
+nav_selection = nav_events.get("selected_page")
+if nav_selection and nav_selection != current_page_key:
+    switch_to_page(nav_selection)
+
+if nav_error:
+    st.caption("상단 커스텀 내비게이션을 로드하지 못해 기본 탐색 UI로 전환했습니다.")
+    render_navigation_fallback(current_page=current_page_key, items=NAV_ITEMS, page_map=page_objects)
+selected_page.run()
 render_global_footer()

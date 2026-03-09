@@ -103,6 +103,8 @@ class BrokerSettings:
     max_volume_participation: float = 0.05
     allow_partial_fills: bool = True
     default_order_type: str = "market"
+    websocket_reconnect_interval_seconds: int = 30
+    stale_submitted_order_timeout_minutes: int = 20
 
 
 @dataclass
@@ -110,6 +112,13 @@ class SchedulerSettings:
     loop_sleep_seconds: int = 30
     retry_backoff_seconds: int = 30
     max_retry_count: int = 3
+    job_lease_seconds: int = 180
+    exit_management_interval_minutes: int = 15
+    outcome_resolution_interval_minutes: int = 60
+    broker_market_status_interval_minutes: int = 5
+    broker_order_sync_interval_minutes: int = 5
+    broker_position_sync_interval_minutes: int = 5
+    broker_account_sync_interval_minutes: int = 15
     lock_owner: str = "paper-worker"
 
 
@@ -125,6 +134,8 @@ class RetrainingSettings:
 
 @dataclass
 class RuntimeSettings:
+    profile_name: str = "baseline"
+    profile_source: str = "embedded_defaults"
     storage: StorageSettings = field(default_factory=StorageSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     strategy: StrategySettings = field(default_factory=StrategySettings)
@@ -236,6 +247,9 @@ def load_settings(path: str | Path | None = None) -> RuntimeSettings:
     if source_path.exists():
         raw = json.loads(source_path.read_text(encoding="utf-8"))
         settings = _merge_dataclass(settings, raw)
+        settings.profile_source = source_path.as_posix()
+    else:
+        settings.profile_source = "embedded_defaults"
     return settings
 
 

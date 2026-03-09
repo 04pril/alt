@@ -7,20 +7,21 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from services.market_data_service import MarketDataService
-from services.paper_broker import PaperBroker
 from storage.models import PositionRecord
 from storage.repository import TradingRepository, utc_now_iso
 
 
 class PortfolioManager:
-    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker: PaperBroker):
+    def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker):
         self.settings = settings
         self.repository = repository
         self.broker = broker
 
-    def mark_to_market(self, market_data_service: MarketDataService) -> None:
+    def mark_to_market(self, market_data_service: MarketDataService, touch=None) -> None:
         positions = self.repository.open_positions()
         for _, position in positions.iterrows():
+            if callable(touch):
+                touch("position_mark", {"symbol": str(position["symbol"]), "position_id": str(position.get("position_id") or "")})
             try:
                 quote = market_data_service.latest_quote(
                     symbol=str(position["symbol"]),
@@ -45,29 +46,41 @@ class PortfolioManager:
                 low = min(float(position["lowest_price"]), mark)
                 candidate_trailing = low * (1.0 + self.settings.strategy.trailing_stop_atr_mult * max(float(position["expected_risk"]), 0.0))
                 trailing = min(float(position["trailing_stop"]), candidate_trailing) if np.isfinite(float(position["trailing_stop"])) else candidate_trailing
+            position_dict = {key: value for key, value in position.to_dict().items() if key != "rowid"}
             self.repository.upsert_position(
                 PositionRecord(
                     **{
-                        **position.to_dict(),
+                        **position_dict,
                         "updated_at": utc_now_iso(),
                         "mark_price": mark,
                         "highest_price": high,
                         "lowest_price": low,
                         "trailing_stop": trailing if np.isfinite(trailing) else float(position["trailing_stop"]),
                         "unrealized_pnl": unrealized,
-                        "exposure_value": abs(mark * qty),
+                        "exposure_value": mark * qty if side == "LONG" else -(mark * qty),
                         "notes": "mtm_update",
                     }
                 )
             )
         self.broker.snapshot_account()
 
-    def evaluate_exit_orders(self, market_data_service: MarketDataService) -> int:
+    def evaluate_exit_orders(self, market_data_service: MarketDataService, touch=None) -> int:
         exit_orders = 0
         positions = self.repository.open_positions()
+        active_exit_orders = self.repository.open_orders(statuses=("new", "submitted", "acknowledged", "pending_fill", "partially_filled"))
         latest_candidates = self.repository.latest_candidates(limit=500)
         latest_candidates = latest_candidates.sort_values("created_at").drop_duplicates(subset=["symbol", "timeframe"], keep="last")
         for _, position in positions.iterrows():
+            if callable(touch):
+                touch("exit_candidate", {"symbol": str(position["symbol"]), "position_id": str(position.get("position_id") or "")})
+            if not active_exit_orders.empty:
+                duplicated = active_exit_orders[
+                    (active_exit_orders["reason"].astype(str) != "entry")
+                    & (active_exit_orders["symbol"].astype(str) == str(position["symbol"]))
+                    & (active_exit_orders["timeframe"].astype(str) == str(position["timeframe"]))
+                ]
+                if not duplicated.empty:
+                    continue
             try:
                 quote = market_data_service.latest_quote(
                     symbol=str(position["symbol"]),
@@ -104,7 +117,7 @@ class PortfolioManager:
                     max_holding_until = max_holding_until.tz_localize("UTC")
                 else:
                     max_holding_until = max_holding_until.tz_convert("UTC")
-                if pd.Timestamp.utcnow().tz_localize("UTC") >= max_holding_until:
+                if pd.Timestamp.now(tz="UTC") >= max_holding_until:
                     reason = "time_stop"
 
             if not reason and not latest_candidates.empty:
@@ -124,6 +137,6 @@ class PortfolioManager:
                         reason = "score_decay"
 
             if reason:
-                self.broker.submit_exit_order(position=position, reason=reason)
+                self.broker.submit_exit_order_result(position=position, reason=reason, market_data_service=market_data_service)
                 exit_orders += 1
         return exit_orders

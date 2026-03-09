@@ -206,6 +206,14 @@ class JobRunRecord:
 
 
 @dataclass(frozen=True)
+class JobRunLease:
+    job_run_id: str
+    acquired: bool
+    status: str
+    retry_count: int = 0
+
+
+@dataclass(frozen=True)
 class SystemEventRecord:
     event_id: str
     created_at: str

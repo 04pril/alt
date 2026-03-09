@@ -35,10 +35,12 @@ class UniverseScanner:
                 seen.add(symbol)
         return ordered
 
-    def scan_asset(self, asset_type: str) -> List[CandidateScanRecord]:
+    def scan_asset(self, asset_type: str, touch=None) -> List[CandidateScanRecord]:
         schedule = self.settings.asset_schedules[asset_type]
         candidates: List[CandidateScanRecord] = []
         for symbol in self._universe(asset_type):
+            if callable(touch):
+                touch("scan_symbol", {"asset_type": asset_type, "symbol": symbol})
             scan_id = make_id("scan")
             created_at = utc_now_iso()
             try:
@@ -90,7 +92,11 @@ class UniverseScanner:
                     volatility=float(metrics.get("volatility", np.nan)),
                 )
                 latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe)
-                is_holding = int(not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
+                pending_entry = self.repository.active_entry_orders(symbol=symbol, timeframe=schedule.timeframe, asset_type=asset_type)
+                is_holding = int(
+                    (not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
+                    or not pending_entry.empty
+                )
                 cooldown_until = self.repository.latest_cooldown_until(symbol=symbol, timeframe=schedule.timeframe)
                 candidates.append(
                     CandidateScanRecord(

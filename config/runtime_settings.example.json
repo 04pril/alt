@@ -1,4 +1,5 @@
 {
+  "profile_name": "baseline",
   "storage": {
     "db_path": ".runtime/paper_trading.sqlite3"
   },

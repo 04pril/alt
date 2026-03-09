@@ -35,6 +35,7 @@ class KISPaperConfig:
     product_code: str
     base_url: str
     user_agent: str
+    hts_id: str = ""
 
     @property
     def is_paper(self) -> bool:
@@ -122,6 +123,7 @@ def load_kis_paper_config(config_path: str | Path = "kis_devlp.yaml") -> KISPape
         product_code=str(raw["my_prod"]).strip(),
         base_url=str(raw["prod"]).strip().rstrip("/"),
         user_agent=str(raw.get("my_agent") or "codex-paper-trader"),
+        hts_id=str(raw.get("my_htsid") or "").strip(),
     )
     if not cfg.is_paper:
         raise KISPaperError("kis_devlp.yaml이 모의투자 도메인(openapivts)을 가리키지 않습니다.")
@@ -337,6 +339,166 @@ class KISPaperClient:
             "raw": output,
         }
 
+    def get_orderbook(self, symbol_or_code: str) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-asking-price-exp-ccn",
+            "FHKST01010200",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+            },
+        )
+        output1 = payload.get("output1") or {}
+        output2 = payload.get("output2") or {}
+        return {
+            "symbol_code": code,
+            "expected_price": _pick_numeric(output2, ["exp_prc", "antc_cnpr"]),
+            "expected_volume": _pick_numeric(output2, ["exp_vol", "antc_cnqn"], default=0.0),
+            "best_ask": _pick_numeric(output1, ["askp1"]),
+            "best_bid": _pick_numeric(output1, ["bidp1"]),
+            "ask_size": _pick_numeric(output1, ["askp_rsqn1"], default=0.0),
+            "bid_size": _pick_numeric(output1, ["bidp_rsqn1"], default=0.0),
+            "raw_quote": output1,
+            "raw_expected": output2,
+        }
+
+    def get_market_status(self, symbol_or_code: str) -> Dict[str, Any]:
+        quote = self.get_quote(symbol_or_code)
+        orderbook = self.get_orderbook(symbol_or_code)
+        raw = quote.get("raw") or {}
+        return {
+            "symbol_code": quote["symbol_code"],
+            "market_name": quote.get("market_name", "KRX"),
+            "current_price": quote.get("current_price"),
+            "expected_price": orderbook.get("expected_price"),
+            "phase_code": str(raw.get("new_mkop_cls_code") or raw.get("new_mkop_cls_name") or ""),
+            "is_halted": str(raw.get("temp_stop_yn") or "").upper() == "Y",
+            "raw": {"quote": raw, "orderbook": orderbook},
+        }
+
+    def get_buying_power(
+        self,
+        symbol_or_code: str,
+        *,
+        order_price: float,
+        order_division: str = "01",
+        include_cma: str = "N",
+        include_overseas: str = "N",
+    ) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/trading/inquire-psbl-order",
+            "VTTC8908R" if self.config.is_paper else "TTTC8908R",
+            params={
+                "CANO": self.config.account_no,
+                "ACNT_PRDT_CD": self.config.product_code,
+                "PDNO": code,
+                "ORD_UNPR": str(int(round(float(order_price)))),
+                "ORD_DVSN": order_division,
+                "CMA_EVLU_AMT_ICLD_YN": include_cma,
+                "OVRS_ICLD_YN": include_overseas,
+            },
+        )
+        output = payload.get("output") or {}
+        return {
+            "symbol_code": code,
+            "max_buy_qty": int(_pick_numeric(output, ["max_buy_qty"], default=0.0)),
+            "cash_buy_qty": int(_pick_numeric(output, ["nrcvb_buy_qty"], default=0.0)),
+            "max_buy_amount": _pick_numeric(output, ["max_buy_amt"], default=0.0),
+            "cash_buy_amount": _pick_numeric(output, ["nrcvb_buy_amt"], default=0.0),
+            "order_price": float(order_price),
+            "order_division": order_division,
+            "raw": output,
+        }
+
+    def get_sellable_quantity(self, symbol_or_code: str) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/trading/inquire-psbl-sell",
+            "TTTC8408R",
+            params={
+                "CANO": self.config.account_no,
+                "ACNT_PRDT_CD": self.config.product_code,
+                "PDNO": code,
+            },
+        )
+        output = payload.get("output") or {}
+        if isinstance(output, list):
+            output = output[0] if output else {}
+        return {
+            "symbol_code": code,
+            "sellable_qty": int(_pick_numeric(output, ["ord_psbl_qty", "sell_psbl_qty", "max_sell_qty"], default=0.0)),
+            "held_qty": int(_pick_numeric(output, ["hldg_qty"], default=0.0)),
+            "raw": output,
+        }
+
+    def get_daily_order_fills(
+        self,
+        *,
+        start_date: str,
+        end_date: str,
+        side_code: str = "00",
+        fill_code: str = "00",
+        product_code: str = "",
+        order_no: str = "",
+        exchange_code: str = "KRX",
+    ) -> pd.DataFrame:
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            "VTTC0081R" if self.config.is_paper else "TTTC0081R",
+            params={
+                "CANO": self.config.account_no,
+                "ACNT_PRDT_CD": self.config.product_code,
+                "INQR_STRT_DT": start_date,
+                "INQR_END_DT": end_date,
+                "SLL_BUY_DVSN_CD": side_code,
+                "PDNO": product_code,
+                "CCLD_DVSN": fill_code,
+                "INQR_DVSN": "00",
+                "INQR_DVSN_3": "00",
+                "ORD_GNO_BRNO": "",
+                "ODNO": order_no,
+                "INQR_DVSN_1": "",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+                "EXCG_ID_DVSN_CD": exchange_code,
+            },
+        )
+        rows = payload.get("output1") or []
+        frame = pd.DataFrame(rows)
+        if frame.empty:
+            return frame
+        if "odno" in frame.columns:
+            frame["broker_order_id"] = frame["odno"].astype(str)
+        return frame
+
+    def get_websocket_approval_key(self) -> str:
+        headers = {
+            "content-type": "application/json; charset=utf-8",
+            "accept": "application/json",
+            "user-agent": self.config.user_agent,
+            "appkey": self.config.app_key,
+            "secretkey": self.config.app_secret,
+        }
+        response = requests.post(
+            f"{self.config.base_url}/oauth2/Approval",
+            headers=headers,
+            data=json.dumps({"grant_type": "client_credentials", "appkey": self.config.app_key, "secretkey": self.config.app_secret}),
+            timeout=20,
+        )
+        if response.status_code != 200:
+            raise KISPaperError(f"KIS websocket approval key 발급 실패: HTTP {response.status_code} {response.text}")
+        payload = response.json()
+        approval_key = str(payload.get("approval_key") or "").strip()
+        if not approval_key:
+            raise KISPaperError(f"KIS websocket approval key 응답이 비어 있습니다: {payload}")
+        return approval_key
+
     def get_daily_history(self, symbol_or_code: str, years: int = 5) -> pd.DataFrame:
         code = extract_kis_code(symbol_or_code)
         end_date = pd.Timestamp.now(tz="Asia/Seoul").normalize().tz_localize(None)
@@ -434,7 +596,25 @@ class KISPaperClient:
 
         holdings = pd.DataFrame(all_rows)
         if holdings.empty:
-            holdings = pd.DataFrame(columns=["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"])
+            holdings = pd.DataFrame(
+                columns=[
+                    "symbol_code",
+                    "종목명",
+                    "보유수량",
+                    "매입평균가",
+                    "현재가",
+                    "평가손익",
+                    "수익률(%)",
+                    "평가금액",
+                    "name",
+                    "quantity",
+                    "avg_price",
+                    "current_price",
+                    "unrealized_pnl",
+                    "return_pct",
+                    "market_value",
+                ]
+            )
         else:
             holdings["symbol_code"] = holdings.get("pdno", "")
             holdings["종목명"] = holdings.get("prdt_name", "")
@@ -444,8 +624,33 @@ class KISPaperClient:
             holdings["평가손익"] = pd.to_numeric(holdings.get("evlu_pfls_amt", 0), errors="coerce")
             holdings["수익률(%)"] = pd.to_numeric(holdings.get("evlu_pfls_rt", 0), errors="coerce")
             holdings["평가금액"] = pd.to_numeric(holdings.get("evlu_amt", 0), errors="coerce")
+            holdings["name"] = holdings["종목명"]
+            holdings["quantity"] = holdings["보유수량"]
+            holdings["avg_price"] = holdings["매입평균가"]
+            holdings["current_price"] = holdings["현재가"]
+            holdings["unrealized_pnl"] = holdings["평가손익"]
+            holdings["return_pct"] = holdings["수익률(%)"]
+            holdings["market_value"] = holdings["평가금액"]
             holdings = holdings.loc[holdings["보유수량"] > 0].reset_index(drop=True)
-            holdings = holdings[["symbol_code", "종목명", "보유수량", "매입평균가", "현재가", "평가손익", "수익률(%)", "평가금액"]]
+            holdings = holdings[
+                [
+                    "symbol_code",
+                    "종목명",
+                    "보유수량",
+                    "매입평균가",
+                    "현재가",
+                    "평가손익",
+                    "수익률(%)",
+                    "평가금액",
+                    "name",
+                    "quantity",
+                    "avg_price",
+                    "current_price",
+                    "unrealized_pnl",
+                    "return_pct",
+                    "market_value",
+                ]
+            ]
 
         cash = _pick_numeric(summary_raw, ["dnca_tot_amt"])
         stock_eval = _pick_numeric(summary_raw, ["scts_evlu_amt", "evlu_amt_smtl_amt"])
@@ -518,6 +723,38 @@ class KISPaperClient:
             "price": None if order_type == "market" else float(price or 0.0),
             "order_no": str(output.get("ODNO") or output.get("odno") or ""),
             "parent_order_no": str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or ""),
+            "message": str(payload.get("msg1") or ""),
+            "raw_output": output,
+        }
+
+    def cancel_order(self, order_no: str, *, parent_order_no: str = "", quantity: int = 0, symbol_or_code: str = "") -> Dict[str, Any]:
+        if not order_no:
+            raise KISPaperError("취소할 주문번호가 필요합니다.")
+        code = extract_kis_code(symbol_or_code) if symbol_or_code else ""
+        body = {
+            "CANO": self.config.account_no,
+            "ACNT_PRDT_CD": self.config.product_code,
+            "KRX_FWDG_ORD_ORGNO": str(parent_order_no or ""),
+            "ORGN_ODNO": str(order_no),
+            "ORD_DVSN": "00",
+            "RVSE_CNCL_DVSN_CD": "02",
+            "ORD_QTY": str(int(quantity)),
+            "ORD_UNPR": "0",
+            "QTY_ALL_ORD_YN": "Y" if int(quantity) <= 0 else "N",
+            "PDNO": code,
+        }
+        payload, _ = self._request(
+            "POST",
+            "/uapi/domestic-stock/v1/trading/order-rvsecncl",
+            "VTTC0803U" if self.config.is_paper else "TTTC0803U",
+            body=body,
+            include_hashkey=True,
+        )
+        output = payload.get("output") or {}
+        return {
+            "requested_at": datetime.now(SEOUL_TZ).isoformat(timespec="seconds"),
+            "order_no": str(output.get("ODNO") or output.get("odno") or order_no),
+            "parent_order_no": str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or parent_order_no),
             "message": str(payload.get("msg1") or ""),
             "raw_output": output,
         }

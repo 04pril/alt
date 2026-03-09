@@ -1,0 +1,21 @@
+{
+  "profile_name": "baseline",
+  "strategy": {
+    "min_signal_strength_pct": 0.4,
+    "min_expected_return_pct": 0.8,
+    "min_confidence": 0.55
+  },
+  "risk": {
+    "max_daily_new_entries": 4,
+    "cooldown_bars_after_exit": 2,
+    "max_same_direction_correlation": 0.82
+  },
+  "asset_schedules": {
+    "미국주식": {
+      "pre_close_buffer_minutes": 20
+    },
+    "한국주식": {
+      "pre_close_buffer_minutes": 20
+    }
+  }
+}
