@@ -599,7 +599,11 @@ def _beta_href(
 
 def _action_button(label: str, action: str, css_class: str, anchor: str, *, token: str, candidate_tab: str | None, jobs: str | None) -> str:
     href = _beta_href(anchor=anchor, action=action, token=token, candidate_tab=candidate_tab, jobs=jobs)
-    return f'<a class="{css_class}" href="{html.escape(href)}" target="_top" data-action="{html.escape(action)}" data-anchor="{html.escape(anchor)}">{html.escape(label)}</a>'
+    return (
+        f'<a class="{css_class}" href="{html.escape(href)}" target="_top" '
+        f'data-action="{html.escape(action)}" data-anchor="{html.escape(anchor)}" data-beta-link="preserve-candidate-tab">'
+        f"{html.escape(label)}</a>"
+    )
 
 
 def _nav_button(label: str, target: str, active: bool = False) -> str:
@@ -611,7 +615,11 @@ def _theme_button(theme_mode: str, anchor: str, *, token: str, candidate_tab: st
     next_icon = "☾" if theme_mode == "light" else "☀"
     next_label = "다크" if theme_mode == "light" else "라이트"
     href = _beta_href(anchor=anchor, action="toggle_theme", token=token, candidate_tab=candidate_tab, jobs=jobs)
-    return f'<a class="theme-toggle" href="{html.escape(href)}" target="_top" data-action="toggle_theme" data-anchor="{html.escape(anchor)}"><span id="theme-icon">{next_icon}</span><span id="theme-label">{next_label}</span></a>'
+    return (
+        f'<a class="theme-toggle" href="{html.escape(href)}" target="_top" '
+        f'data-action="toggle_theme" data-anchor="{html.escape(anchor)}" data-beta-link="preserve-candidate-tab">'
+        f'<span id="theme-icon">{next_icon}</span><span id="theme-label">{next_label}</span></a>'
+    )
 
 
 def _latest_scan_time(job_health: pd.DataFrame) -> str:
@@ -888,11 +896,10 @@ def _candidate_tabs_html(
     for key, label, empty_text in tab_specs:
         count = len(bucket_frames[key])
         active_class = " active" if key == active_key else ""
-        href = _beta_href(anchor="candidates", candidate_tab=key, jobs=jobs)
         tab_buttons.append(
-            f'<a class="cand-tab{active_class}" href="{html.escape(href)}" target="_top" data-cand-tab="{html.escape(key)}">'
+            f'<button type="button" class="cand-tab{active_class}" data-cand-tab="{html.escape(key)}">'
             + html.escape(label)
-            + f'<span class="cand-tab-count">{count}</span></a>'
+            + f'<span class="cand-tab-count">{count}</span></button>'
         )
         tab_panes.append(
             f'<div class="cand-pane{active_class}" data-cand-pane="{html.escape(key)}">'
@@ -1099,7 +1106,7 @@ def render_beta_overview_component(
     jobs_toggle_html = ""
     if len(all_job_rows) > 5:
         jobs_href = _beta_href(anchor="jobs", candidate_tab=current_candidate_tab or None, jobs=None if jobs_expanded else "all")
-        jobs_toggle_html = f'<a class="job-more" href="{html.escape(jobs_href)}" target="_top">{"접기" if jobs_expanded else "상세보기"}</a>'
+        jobs_toggle_html = f'<a class="job-more" href="{html.escape(jobs_href)}" target="_top" data-beta-link="preserve-candidate-tab">{"접기" if jobs_expanded else "상세보기"}</a>'
 
     error_preview = broker_sync_errors if not broker_sync_errors.empty else recent_errors
     error_rows = []
@@ -1134,7 +1141,18 @@ def render_beta_overview_component(
   const navButtons = Array.from(document.querySelectorAll("[data-nav-target]"));
   const candidateTabs = Array.from(document.querySelectorAll("[data-cand-tab]"));
   const candidatePanes = Array.from(document.querySelectorAll("[data-cand-pane]"));
+  const preservedLinks = Array.from(document.querySelectorAll("[data-beta-link]"));
   const navIds = navButtons.map((button) => button.dataset.navTarget).filter(Boolean);
+  const rewriteCandidateTabOnLinks = (targetKey) => {{
+    preservedLinks.forEach((link) => {{
+      const href = link.getAttribute("href");
+      if (!href) return;
+      const url = new URL(href, "http://beta.local");
+      if (targetKey) url.searchParams.set("beta_cand_tab", targetKey);
+      else url.searchParams.delete("beta_cand_tab");
+      link.setAttribute("href", url.pathname + url.search + url.hash);
+    }});
+  }};
   const notifyHeight = () => {{
     const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, document.body.offsetHeight, document.documentElement.offsetHeight);
     window.parent.postMessage({{ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height }}, "*");
@@ -1151,6 +1169,7 @@ def render_beta_overview_component(
   const activateCandidateTab = (targetKey) => {{
     candidateTabs.forEach((button) => button.classList.toggle("active", button.dataset.candTab === targetKey));
     candidatePanes.forEach((pane) => pane.classList.toggle("active", pane.dataset.candPane === targetKey));
+    rewriteCandidateTabOnLinks(targetKey);
     notifyHeight();
   }};
   const sectionForButton = (button) => button.dataset.anchor || button.closest("[data-section-anchor]")?.dataset.sectionAnchor || initialAnchor || "beta-overview";
@@ -1181,12 +1200,7 @@ def render_beta_overview_component(
   }});
   candidateTabs.forEach((button) => {{
     button.addEventListener("click", (event) => {{
-      const href = button.getAttribute("href");
-      if (href) {{
-        event.preventDefault();
-        window.open(href, "_top");
-        return;
-      }}
+      event.preventDefault();
       const targetKey = button.dataset.candTab || "";
       if (!targetKey) return;
       activateCandidateTab(targetKey);

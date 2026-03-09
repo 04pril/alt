@@ -131,8 +131,9 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("005930", markup)
         self.assertIn("NVDA", markup)
         self.assertIn("BTC-USD", markup)
-        self.assertIn("beta_cand_tab=us", markup)
-        self.assertIn('target="_top"', markup)
+        self.assertIn('type="button"', markup)
+        self.assertIn('data-cand-tab="us"', markup)
+        self.assertNotIn("beta_cand_tab=us", markup)
 
     def test_money_display_pair_converts_usd_to_krw_when_fx_available(self) -> None:
         primary, secondary = _money_display_pair(
