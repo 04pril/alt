@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 from services.broker_router import BrokerRouter, resolve_broker_mode
 
 
@@ -15,26 +16,32 @@ class _StubSimBroker:
         self.preflight_calls = 0
         self.entry_result_calls = 0
         self.exit_result_calls = 0
+        self.last_account_id = ""
 
-    def submit_entry_order(self, signal, quantity: int, scan_id: str | None = None) -> str:
+    def submit_entry_order(self, signal, quantity: int, scan_id: str | None = None, *, account_id: str | None = None) -> str:
         self.entry_calls += 1
+        self.last_account_id = str(account_id or "")
         return "sim-entry"
 
-    def submit_entry_order_result(self, signal, quantity: int, scan_id: str | None = None, *, market_data_service=None):
+    def submit_entry_order_result(self, signal, quantity: int, scan_id: str | None = None, *, market_data_service=None, account_id: str | None = None):
         self.entry_result_calls += 1
-        return {"broker": "sim", "order_id": "sim-entry"}
+        self.last_account_id = str(account_id or "")
+        return {"broker": "sim", "order_id": "sim-entry", "account_id": self.last_account_id}
 
-    def submit_exit_order(self, position: pd.Series, reason: str) -> str:
+    def submit_exit_order(self, position: pd.Series, reason: str, *, account_id: str | None = None) -> str:
         self.exit_calls += 1
+        self.last_account_id = str(account_id or "")
         return "sim-exit"
 
-    def submit_exit_order_result(self, position: pd.Series, reason: str, *, market_data_service=None):
+    def submit_exit_order_result(self, position: pd.Series, reason: str, *, market_data_service=None, account_id: str | None = None):
         self.exit_result_calls += 1
-        return {"broker": "sim", "order_id": "sim-exit"}
+        self.last_account_id = str(account_id or "")
+        return {"broker": "sim", "order_id": "sim-exit", "account_id": self.last_account_id}
 
-    def preflight_entry(self, signal, quantity: int, market_data_service=None):
+    def preflight_entry(self, signal, quantity: int, market_data_service=None, account_id: str | None = None):
         self.preflight_calls += 1
-        return {"allowed": True, "reason": "ok", "broker": "sim"}
+        self.last_account_id = str(account_id or "")
+        return {"allowed": True, "reason": "ok", "broker": "sim", "account_id": self.last_account_id}
 
 
 class _StubKISBroker:
@@ -45,29 +52,35 @@ class _StubKISBroker:
         self.preflight_calls = 0
         self.entry_result_calls = 0
         self.exit_result_calls = 0
+        self.last_account_id = ""
 
     def is_enabled(self) -> bool:
         return self.enabled
 
-    def submit_entry_order(self, signal, quantity: int, scan_id: str | None = None) -> str:
+    def submit_entry_order(self, signal, quantity: int, scan_id: str | None = None, *, account_id: str | None = None) -> str:
         self.entry_calls += 1
+        self.last_account_id = str(account_id or "")
         return "kis-entry"
 
-    def submit_entry_order_result(self, signal, quantity: int, scan_id: str | None = None, *, market_data_service=None):
+    def submit_entry_order_result(self, signal, quantity: int, scan_id: str | None = None, *, market_data_service=None, account_id: str | None = None):
         self.entry_result_calls += 1
-        return {"broker": "kis_mock", "order_id": "kis-entry"}
+        self.last_account_id = str(account_id or "")
+        return {"broker": "kis_mock", "order_id": "kis-entry", "account_id": self.last_account_id}
 
-    def submit_exit_order(self, position: pd.Series, reason: str) -> str:
+    def submit_exit_order(self, position: pd.Series, reason: str, *, account_id: str | None = None) -> str:
         self.exit_calls += 1
+        self.last_account_id = str(account_id or "")
         return "kis-exit"
 
-    def submit_exit_order_result(self, position: pd.Series, reason: str, *, market_data_service=None):
+    def submit_exit_order_result(self, position: pd.Series, reason: str, *, market_data_service=None, account_id: str | None = None):
         self.exit_result_calls += 1
-        return {"broker": "kis_mock", "order_id": "kis-exit"}
+        self.last_account_id = str(account_id or "")
+        return {"broker": "kis_mock", "order_id": "kis-exit", "account_id": self.last_account_id}
 
-    def preflight_entry(self, signal, quantity: int, market_data_service=None):
+    def preflight_entry(self, signal, quantity: int, market_data_service=None, account_id: str | None = None):
         self.preflight_calls += 1
-        return {"allowed": True, "reason": "ok", "broker": "kis_mock"}
+        self.last_account_id = str(account_id or "")
+        return {"allowed": True, "reason": "ok", "broker": "kis_mock", "account_id": self.last_account_id}
 
 
 class BrokerRouterTest(unittest.TestCase):
@@ -82,6 +95,7 @@ class BrokerRouterTest(unittest.TestCase):
         self.assertEqual(order_id, "kis-entry")
         self.assertEqual(self.kis.entry_calls, 1)
         self.assertEqual(self.sim.entry_calls, 0)
+        self.assertEqual(self.kis.last_account_id, ACCOUNT_KIS_KR_PAPER)
 
     def test_bare_kr_code_routes_to_kis(self) -> None:
         signal = SimpleNamespace(symbol="005930", asset_type="한국주식")
@@ -96,6 +110,7 @@ class BrokerRouterTest(unittest.TestCase):
         self.assertEqual(order_id, "sim-entry")
         self.assertEqual(self.sim.entry_calls, 1)
         self.assertEqual(self.kis.entry_calls, 0)
+        self.assertEqual(self.sim.last_account_id, ACCOUNT_SIM_US_EQUITY)
 
     def test_crypto_routes_to_sim(self) -> None:
         signal = SimpleNamespace(symbol="BTC-USD", asset_type="코인")
@@ -103,6 +118,12 @@ class BrokerRouterTest(unittest.TestCase):
         self.assertEqual(order_id, "sim-entry")
         self.assertEqual(self.sim.entry_calls, 1)
         self.assertEqual(self.kis.entry_calls, 0)
+        self.assertEqual(self.sim.last_account_id, ACCOUNT_SIM_CRYPTO)
+
+    def test_truth_table_resolves_execution_account_id(self) -> None:
+        self.assertEqual(self.router.resolve_execution_account_id("005930.KS", "한국주식"), ACCOUNT_KIS_KR_PAPER)
+        self.assertEqual(self.router.resolve_execution_account_id("AAPL", "미국주식"), ACCOUNT_SIM_US_EQUITY)
+        self.assertEqual(self.router.resolve_execution_account_id("BTC-USD", "코인"), ACCOUNT_SIM_CRYPTO)
 
     def test_kr_symbol_does_not_override_us_asset_type(self) -> None:
         self.assertEqual(
@@ -150,12 +171,14 @@ class BrokerRouterTest(unittest.TestCase):
         signal = SimpleNamespace(symbol="AAPL", asset_type="한국주식")
         preflight = self.router.preflight_entry(signal, quantity=1, market_data_service=object())
         self.assertEqual(preflight["broker"], "sim")
+        self.assertEqual(preflight["account_id"], ACCOUNT_SIM_US_EQUITY)
         self.assertEqual(self.sim.preflight_calls, 1)
         self.assertEqual(self.kis.preflight_calls, 0)
 
-        position = pd.Series({"symbol": "AAPL", "asset_type": "한국주식"})
+        position = pd.Series({"symbol": "AAPL", "asset_type": "한국주식", "account_id": ACCOUNT_SIM_US_EQUITY})
         result = self.router.submit_exit_order_result(position, "manual_exit", market_data_service=object())
         self.assertEqual(result["broker"], "sim")
+        self.assertEqual(result["account_id"], ACCOUNT_SIM_US_EQUITY)
         self.assertEqual(self.sim.exit_result_calls, 1)
         self.assertEqual(self.kis.exit_result_calls, 0)
 

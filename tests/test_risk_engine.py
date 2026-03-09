@@ -6,6 +6,12 @@ import unittest
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from runtime_accounts import (
+    ACCOUNT_KIS_KR_PAPER,
+    ACCOUNT_SIM_CRYPTO,
+    ACCOUNT_SIM_LEGACY_MIXED,
+    ACCOUNT_SIM_US_EQUITY,
+)
 from services.risk_engine import RiskEngine
 from services.signal_engine import SignalDecision
 from storage.models import AccountSnapshotRecord, OrderRecord, PositionRecord
@@ -204,6 +210,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="paper_broker",
                     raw_json="{}",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
                 )
             )
             repo.insert_account_snapshot(
@@ -223,6 +230,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="kis_account_sync",
                     raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
                 )
             )
             engine = RiskEngine(settings, repo)
@@ -254,6 +262,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="paper_broker",
                     raw_json="{}",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
                 )
             )
             repo.insert_account_snapshot(
@@ -273,6 +282,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="kis_account_sync",
                     raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
                 )
             )
             engine = RiskEngine(settings, repo)
@@ -281,7 +291,7 @@ class RiskEngineTest(unittest.TestCase):
             self.assertEqual(state["equity"], 27_500_000.0)
             self.assertEqual(state["drawdown_pct"], -0.5)
 
-    def test_kr_assets_fall_back_to_sim_snapshot_when_kis_snapshot_missing(self) -> None:
+    def test_kr_assets_fall_back_to_legacy_snapshot_when_kis_snapshot_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = RuntimeSettings()
             settings.storage.db_path = f"{tmp}/runtime.sqlite3"
@@ -289,7 +299,7 @@ class RiskEngineTest(unittest.TestCase):
             repo.initialize()
             repo.insert_account_snapshot(
                 AccountSnapshotRecord(
-                    snapshot_id="snap_sim_only",
+                    snapshot_id="snap_legacy_sim_only",
                     created_at="2026-03-08T09:00:00Z",
                     cash=19_000_000.0,
                     equity=19_200_000.0,
@@ -304,6 +314,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="paper_broker",
                     raw_json="{}",
+                    account_id=ACCOUNT_SIM_LEGACY_MIXED,
                 )
             )
             engine = RiskEngine(settings, repo)
@@ -337,6 +348,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="paper_broker",
                     raw_json="{}",
+                    account_id=ACCOUNT_SIM_CRYPTO,
                 )
             )
             repo.insert_account_snapshot(
@@ -356,6 +368,7 @@ class RiskEngineTest(unittest.TestCase):
                     paused=0,
                     source="kis_account_sync",
                     raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
                 )
             )
             engine = RiskEngine(settings, repo)
@@ -365,6 +378,114 @@ class RiskEngineTest(unittest.TestCase):
             self.assertEqual(state["cash"], 8_000_000.0)
             self.assertEqual(state["equity"], 8_300_000.0)
             self.assertEqual(state["drawdown_pct"], -1.5)
+
+    def test_kr_cash_shortage_does_not_block_us_equity_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis_low_cash",
+                    created_at="2026-03-08T09:01:00Z",
+                    cash=0.0,
+                    equity=500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=0.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-2.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_us_ok",
+                    created_at="2026-03-08T09:02:00Z",
+                    cash=2_000_000.0,
+                    equity=2_200_000.0,
+                    gross_exposure=0.0,
+                    net_exposure=0.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=0.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=-1.0,
+                    open_positions=0,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            decision = engine.evaluate_entry(
+                self._build_signal(symbol="AAPL", asset_type="미국주식", timeframe="1d"),
+                correlation_matrix=pd.DataFrame(),
+                market_is_open=True,
+            )
+
+            self.assertTrue(decision.allowed)
+
+    def test_us_drawdown_does_not_leak_into_kis_account_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_us_drawdown",
+                    created_at="2026-03-08T09:00:00Z",
+                    cash=12_000_000.0,
+                    equity=12_200_000.0,
+                    gross_exposure=300_000.0,
+                    net_exposure=300_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=-500_000.0,
+                    daily_pnl=-500_000.0,
+                    drawdown_pct=-12.5,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    raw_json="{}",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
+                )
+            )
+            repo.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis_safe",
+                    created_at="2026-03-08T09:01:00Z",
+                    cash=30_000_000.0,
+                    equity=30_500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=20_000.0,
+                    daily_pnl=20_000.0,
+                    drawdown_pct=-0.5,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            engine = RiskEngine(settings, repo)
+
+            state = engine._latest_account_state(asset_type="한국주식", symbol="005930.KS")
+
+            self.assertEqual(state["account_id"], ACCOUNT_KIS_KR_PAPER)
+            self.assertEqual(state["drawdown_pct"], -0.5)
 
 
 if __name__ == "__main__":

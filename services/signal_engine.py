@@ -9,6 +9,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from predictor import ForecastResult, run_forecast_on_price_data
+from runtime_accounts import resolve_execution_account
 from storage.models import PredictionRecord
 from storage.repository import TradingRepository, make_id, utc_now_iso
 
@@ -76,6 +77,7 @@ class SignalEngine:
         now_iso = utc_now_iso()
         run_id = make_id("run")
         rows: List[PredictionRecord] = []
+        execution_account_id = resolve_execution_account(symbol=result.symbol, asset_type=asset_type, kis_enabled=True).account_id
         for horizon, (target_at, row) in enumerate(result.future_frame.iterrows(), start=1):
             prediction_id = make_id("pred")
             predicted_return = float(row.get("ensemble_pred_return_pct", np.nan)) / 100.0
@@ -125,6 +127,7 @@ class SignalEngine:
                         },
                         ensure_ascii=False,
                     ),
+                    execution_account_id=execution_account_id,
                 )
             )
         self.repository.insert_predictions(rows)

@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 from storage.models import AccountSnapshotRecord, OrderRecord, PositionRecord
 from storage.repository import TradingRepository, make_id, utc_now_iso
 
@@ -272,6 +273,71 @@ class RepositoryRuntimeTest(unittest.TestCase):
         self.assertFalse(latest.empty)
         self.assertEqual(latest.iloc[0]["position_id"], "pos_open")
         self.assertEqual(self.repo.latest_cooldown_until("BTC-USD", "1h"), "2026-03-08T13:00:00Z")
+
+    def test_account_backfill_populates_blank_execution_and_account_ids(self) -> None:
+        self.repo.insert_order(
+            OrderRecord(
+                order_id="ord_backfill",
+                created_at="2026-03-08T09:00:00Z",
+                updated_at="2026-03-08T09:00:00Z",
+                prediction_id="pred_backfill",
+                scan_id="scan_backfill",
+                symbol="BTC-USD",
+                asset_type="코인",
+                timeframe="1h",
+                side="buy",
+                order_type="market",
+                requested_qty=1,
+                filled_qty=0,
+                remaining_qty=1,
+                requested_price=100.0,
+                limit_price=0.0,
+                status="new",
+                fees_estimate=0.0,
+                slippage_bps=0.0,
+                retry_count=0,
+                strategy_version="s1",
+                reason="entry",
+                raw_json="{}",
+            )
+        )
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_backfill",
+                created_at="2026-03-08T09:00:00Z",
+                cash=100.0,
+                equity=120.0,
+                gross_exposure=20.0,
+                net_exposure=20.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=1,
+                open_orders=1,
+                paused=0,
+                source="kis_account_sync",
+                raw_json="{}",
+            )
+        )
+        with self.repo.connect() as conn:
+            conn.execute("UPDATE predictions SET execution_account_id = ''")
+            conn.execute("UPDATE candidate_scans SET execution_account_id = ''")
+            conn.execute("UPDATE orders SET account_id = '', raw_json = '{}' WHERE order_id = 'ord_backfill'")
+            conn.execute("INSERT INTO fills(fill_id, created_at, order_id, symbol, side, quantity, fill_price, fees, slippage_bps, status, raw_json, account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("fill_backfill", "2026-03-08T09:01:00Z", "ord_backfill", "BTC-USD", "buy", 1, 100.0, 0.0, 0.0, "filled", "{}", ""))
+            conn.execute("INSERT INTO positions(position_id, created_at, updated_at, closed_at, prediction_id, symbol, asset_type, timeframe, side, status, quantity, entry_price, mark_price, stop_loss, take_profit, trailing_stop, highest_price, lowest_price, unrealized_pnl, realized_pnl, expected_risk, exposure_value, max_holding_until, strategy_version, cooldown_until, notes, account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("pos_backfill", "2026-03-08T09:00:00Z", "2026-03-08T09:00:00Z", None, "pred_backfill", "AAPL", "미국주식", "1d", "LONG", "open", 1, 100.0, 100.0, None, None, None, None, None, 0.0, 0.0, 0.01, 100.0, None, "s1", None, "", ""))
+            conn.execute("UPDATE account_snapshots SET account_id = '', raw_json = '{}' WHERE snapshot_id = 'snap_backfill'")
+            conn.execute("INSERT INTO predictions(prediction_id, created_at, run_id, symbol, asset_type, timeframe, market_timezone, data_cutoff_at, target_at, forecast_horizon_bars, target_type, current_price, predicted_price, predicted_return, signal, score, confidence, threshold, expected_return, expected_risk, position_size, model_name, model_version, feature_version, strategy_version, validation_mode, feature_hash, status, scan_id, notes, execution_account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("pred_backfill", "2026-03-08T09:00:00Z", "run1", "AAPL", "미국주식", "1d", "America/New_York", "2026-03-08T09:00:00Z", "2026-03-09T09:00:00Z", 1, "next_close_return", 100.0, 102.0, 0.02, "LONG", 1.0, 0.9, 0.003, 0.02, 0.01, 0.5, "demo", "v1", "f1", "s1", "holdout", "hash", "unresolved", "scan_backfill", "{}", ""))
+            conn.execute("INSERT INTO candidate_scans(scan_id, created_at, symbol, asset_type, timeframe, score, rank, status, reason, expected_return, expected_risk, confidence, threshold, volatility, liquidity_score, cost_bps, recent_performance, signal, model_version, feature_version, strategy_version, cooldown_until, is_holding, raw_json, execution_account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ("scan_backfill", "2026-03-08T09:00:00Z", "005930.KS", "한국주식", "1d", 1.0, 1, "candidate", "ok", 0.02, 0.01, 0.9, 0.003, 0.01, 1.0, 5.0, 0.0, "LONG", "v1", "f1", "s1", None, 0, "{}", ""))
+            conn.execute("INSERT INTO system_events(event_id, created_at, level, component, event_type, message, details_json, account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)", ("evt_backfill", "2026-03-08T09:02:00Z", "INFO", "execution_pipeline", "candidate", "candidate", '{\"order_id\":\"ord_backfill\",\"symbol\":\"BTC-USD\"}', ""))
+            self.repo._migrate_schema(conn)
+
+        self.assertEqual(self.repo.get_order("ord_backfill")["account_id"], ACCOUNT_SIM_CRYPTO)
+        self.assertEqual(self.repo.latest_position_by_symbol("AAPL", "1d").iloc[0]["account_id"], ACCOUNT_SIM_US_EQUITY)
+        self.assertEqual(self.repo.latest_account_snapshot(account_id=ACCOUNT_KIS_KR_PAPER)["snapshot_id"], "snap_backfill")
+        self.assertEqual(self.repo.prediction_by_scan("scan_backfill").iloc[0]["execution_account_id"], ACCOUNT_SIM_US_EQUITY)
+        self.assertEqual(self.repo.latest_candidates(limit=5).loc[0, "execution_account_id"], ACCOUNT_KIS_KR_PAPER)
+        self.assertEqual(self.repo.latest_system_event("candidate")["account_id"], ACCOUNT_SIM_CRYPTO)
 
     def test_begin_job_run_returns_canonical_id_under_concurrency(self) -> None:
         repo_a = TradingRepository(self.db_path)

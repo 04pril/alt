@@ -8,6 +8,7 @@ import numpy as np
 from config.settings import RuntimeSettings
 from services.market_data_service import MarketDataService
 from services.signal_engine import SignalDecision, SignalEngine
+from runtime_accounts import resolve_execution_account
 from storage.models import CandidateScanRecord
 from storage.repository import TradingRepository, make_id, utc_now_iso
 
@@ -39,6 +40,7 @@ class UniverseScanner:
         schedule = self.settings.asset_schedules[asset_type]
         candidates: List[CandidateScanRecord] = []
         for symbol in self._universe(asset_type):
+            execution_account_id = resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
             if callable(touch):
                 touch("scan_symbol", {"asset_type": asset_type, "symbol": symbol})
             scan_id = make_id("scan")
@@ -79,6 +81,7 @@ class UniverseScanner:
                             feature_version="",
                             strategy_version=self.settings.strategy.strategy_version,
                             raw_json=json.dumps(metrics, ensure_ascii=False),
+                            execution_account_id=execution_account_id,
                         )
                     )
                     continue
@@ -91,13 +94,18 @@ class UniverseScanner:
                     cost_bps=self.settings.strategy.round_trip_cost_bps,
                     volatility=float(metrics.get("volatility", np.nan)),
                 )
-                latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe)
-                pending_entry = self.repository.active_entry_orders(symbol=symbol, timeframe=schedule.timeframe, asset_type=asset_type)
+                latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe, account_id=execution_account_id)
+                pending_entry = self.repository.active_entry_orders(
+                    symbol=symbol,
+                    timeframe=schedule.timeframe,
+                    asset_type=asset_type,
+                    account_id=execution_account_id,
+                )
                 is_holding = int(
                     (not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
                     or not pending_entry.empty
                 )
-                cooldown_until = self.repository.latest_cooldown_until(symbol=symbol, timeframe=schedule.timeframe)
+                cooldown_until = self.repository.latest_cooldown_until(symbol=symbol, timeframe=schedule.timeframe, account_id=execution_account_id)
                 candidates.append(
                     CandidateScanRecord(
                         scan_id=scan_id,
@@ -131,6 +139,7 @@ class UniverseScanner:
                             },
                             ensure_ascii=False,
                         ),
+                        execution_account_id=execution_account_id,
                     )
                 )
             except Exception as exc:
@@ -158,6 +167,7 @@ class UniverseScanner:
                         feature_version="",
                         strategy_version=self.settings.strategy.strategy_version,
                         raw_json="{}",
+                        execution_account_id=execution_account_id,
                     )
                 )
 

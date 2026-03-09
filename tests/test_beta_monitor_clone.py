@@ -148,6 +148,28 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("현재 손익", markup)
         self.assertIn("-12만", markup)
 
+    def test_account_card_compact_converts_usd_account_to_krw_primary_display(self) -> None:
+        markup = _account_card_compact(
+            {
+                "equity": 1000.0,
+                "cash": 800.0,
+                "daily_pnl": 10.0,
+                "unrealized_pnl": 5.0,
+                "gross_exposure": 200.0,
+                "created_at": "2026-03-09T14:05:00Z",
+            },
+            {},
+            {"today_pnl": 0.0},
+            "SIM",
+            "미국주식 계좌",
+            "sim",
+            currency="USD",
+            quote_snapshots={"KRW=X": {"current_price": 1450.0}},
+        )
+
+        self.assertIn("145만", markup)
+        self.assertIn("1,000.00 USD", markup)
+
 
 if __name__ == "__main__":
     unittest.main()

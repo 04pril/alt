@@ -10,9 +10,19 @@ from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import streamlit.components.v1 as components
+from runtime_accounts import (
+    ACCOUNT_KIS_KR_PAPER,
+    ACCOUNT_SIM_CRYPTO,
+    ACCOUNT_SIM_US_EQUITY,
+)
 
 TEMPLATE_PATH = Path.home() / "Desktop" / "monitor_redesign_v2.html"
 BETA_PATH = "/beta"
+ACCOUNT_VIEW_SPECS: Sequence[Tuple[str, str, str, str, str]] = (
+    (ACCOUNT_KIS_KR_PAPER, "KIS", "한국주식 계좌", "kis", "KRW"),
+    (ACCOUNT_SIM_US_EQUITY, "SIM", "미국주식 계좌", "sim", "USD"),
+    (ACCOUNT_SIM_CRYPTO, "SIM", "코인 계좌", "sim", "USD"),
+)
 NAV_ITEMS: Sequence[Tuple[str, str]] = (
     ("운영 모니터", "beta-overview"),
     ("보유 현황", "positions"),
@@ -45,6 +55,8 @@ COLUMN_LABELS = {
     "run_key": "실행 키",
     "retry_count": "재시도",
     "error_message": "오류",
+    "account_id": "계좌",
+    "execution_account_id": "실행 계좌",
     "signal": "신호",
     "created_at": "생성 시각",
     "updated_at": "갱신 시각",
@@ -152,6 +164,14 @@ def _replace_block(source: str, marker: str, replacement: str) -> str:
     return source
 
 
+def _account_label(account_id: object) -> str:
+    text = str(account_id or "").strip()
+    for candidate_id, broker, scope, _, _ in ACCOUNT_VIEW_SPECS:
+        if candidate_id == text:
+            return f"{broker} {scope}"
+    return text or "-"
+
+
 def _f(value: object) -> float:
     number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return float(number) if pd.notna(number) else float("nan")
@@ -195,6 +215,35 @@ def _money_display_pair(value: object, currency: str, quote_snapshots: Dict[str,
     return _fmt_money(amount, normalized or None), ""
 
 
+def _money_value_display(value: object, currency: str, quote_snapshots: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    amount = _f(value)
+    normalized = str(currency or "").upper()
+    primary_value = amount
+    primary_currency = normalized or "KRW"
+    secondary_text = ""
+    if not np.isfinite(amount):
+        return {
+            "primary_value": float("nan"),
+            "primary_currency": primary_currency,
+            "primary_text": "N/A",
+            "secondary_text": "",
+            "compact_text": "N/A",
+        }
+    fx_rate = _fx_rate_to_krw(normalized, quote_snapshots)
+    if normalized not in {"", "KRW"} and np.isfinite(fx_rate):
+        primary_value = amount * fx_rate
+        primary_currency = "KRW"
+        secondary_text = _fmt_money(amount, normalized)
+    primary_text = _fmt_money(primary_value, primary_currency)
+    return {
+        "primary_value": float(primary_value),
+        "primary_currency": primary_currency,
+        "primary_text": primary_text,
+        "secondary_text": secondary_text,
+        "compact_text": _fmt_compact_money(primary_value),
+    }
+
+
 def _fmt_compact_money(value: object) -> str:
     number = _f(value)
     if not np.isfinite(number):
@@ -208,6 +257,16 @@ def _fmt_compact_money(value: object) -> str:
     else:
         compact = f"{amount:,.0f}"
     return sign + compact
+
+
+def _format_currency_mix(values: Dict[str, float]) -> str:
+    rows = []
+    for currency, amount in values.items():
+        numeric = _f(amount)
+        if not np.isfinite(numeric):
+            continue
+        rows.append(_fmt_money(numeric, currency))
+    return " / ".join(rows) if rows else "N/A"
 
 
 def _fmt_pct(value: object, *, ratio: bool = False) -> str:
@@ -456,6 +515,8 @@ def _format_cell(column: str, value: object) -> str:
         return "-"
     if column in {"job_name"}:
         return html.escape(_job_label(value))
+    if column in {"account_id", "execution_account_id"}:
+        return html.escape(_account_label(value))
     if column == "status":
         return _chip(_status_label(value), _tone(value))
     if column in {"side", "signal"}:
@@ -617,7 +678,19 @@ def _equity_svg(equity_curve: pd.DataFrame, theme_mode: str) -> str:
     return f'<div class="chart-box chart-box-live"><svg viewBox="0 0 {int(width)} {int(height)}" preserveAspectRatio="xMidYMid meet"><polygon points="{area}" fill="{fill_color}"></polygon><polyline points="{polyline}" fill="none" stroke="{line_color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline></svg><div class="chart-legend">최근 평가 자산 {html.escape(_fmt_money(values.iloc[-1]))}</div></div>'
 
 
-def _account_card(snapshot: Dict[str, Any], fallback_account: Dict[str, Any], trade_performance: Dict[str, Any], broker: str, scope: str, css_class: str) -> str:
+def _account_card(
+    snapshot: Dict[str, Any],
+    fallback_account: Dict[str, Any],
+    trade_performance: Dict[str, Any],
+    broker: str,
+    scope: str,
+    css_class: str,
+    *,
+    currency: str = "KRW",
+    quote_snapshots: Dict[str, Dict[str, Any]] | None = None,
+    footer_note: str = "",
+) -> str:
+    quote_snapshots = quote_snapshots or {}
     equity = _f(snapshot.get("equity"))
     cash = _f(snapshot.get("cash"))
     daily = _f(snapshot.get("daily_pnl"))
@@ -632,10 +705,37 @@ def _account_card(snapshot: Dict[str, Any], fallback_account: Dict[str, Any], tr
     daily_pct = daily / equity if np.isfinite(equity) and equity > 0 else float("nan")
     daily_class = " up" if np.isfinite(daily) and daily > 0 else " dn" if np.isfinite(daily) and daily < 0 else ""
     updated = _fmt_time(snapshot.get("created_at") or fallback_account.get("created_at"))
-    return f'<div class="acct-card {html.escape(css_class)}"><div class="acct-header"><span class="acct-broker-badge">{html.escape(broker)}</span><span class="acct-scope">{html.escape(scope)}</span></div><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">평가 자산</div><div class="acct-value">{html.escape(_fmt_money(equity))}<span class="unit">원</span></div><div class="acct-sub">전일 대비 {html.escape(_fmt_pct(daily_pct))}</div></div><div class="acct-metric"><div class="acct-label">오늘 손익</div><div class="acct-value sm{daily_class}">{html.escape(_fmt_money(daily))}<span class="unit">원</span></div><div class="acct-sub">실현 + 미실현 합산</div></div><div class="acct-metric"><div class="acct-label">예수금</div><div class="acct-value sm">{html.escape(_fmt_money(cash))}<span class="unit">원</span></div><div class="acct-sub">진입 가능 현금</div></div></div><hr class="acct-divider"><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">총 익스포저</div><div class="acct-value sm">{html.escape(_fmt_money(exposure))}<span class="unit">원</span></div></div><div class="acct-metric"><div class="acct-label">낙폭</div><div class="acct-value warn-c sm">{html.escape(_fmt_pct(drawdown))}</div></div><div class="acct-metric"><div class="acct-label">마지막 스냅샷</div><div class="acct-value sm" style="font-size:11px;font-weight:600;">{html.escape(updated)}</div></div></div></div>'
+    equity_display = _money_value_display(equity, currency, quote_snapshots)
+    daily_display = _money_value_display(daily, currency, quote_snapshots)
+    cash_display = _money_value_display(cash, currency, quote_snapshots)
+    exposure_display = _money_value_display(exposure, currency, quote_snapshots)
+    equity_sub = f"전일 대비 {_fmt_pct(daily_pct)}"
+    if equity_display["secondary_text"]:
+        equity_sub = f"{equity_sub} · {equity_display['secondary_text']}"
+    daily_sub = "실현 + 미실현 합산"
+    if daily_display["secondary_text"]:
+        daily_sub += f" · {daily_display['secondary_text']}"
+    cash_sub = "진입 가능 현금"
+    if cash_display["secondary_text"]:
+        cash_sub += f" · {cash_display['secondary_text']}"
+    exposure_sub = exposure_display["secondary_text"] or exposure_display["primary_text"]
+    footer_html = f'<div class="acct-mini" style="margin-top:6px;">{html.escape(footer_note)}</div>' if footer_note else ""
+    return f'<div class="acct-card {html.escape(css_class)}"><div class="acct-header"><span class="acct-broker-badge">{html.escape(broker)}</span><span class="acct-scope">{html.escape(scope)}</span></div><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">평가 자산</div><div class="acct-value">{html.escape(equity_display["primary_text"])}</div><div class="acct-sub">{html.escape(equity_sub)}</div></div><div class="acct-metric"><div class="acct-label">오늘 손익</div><div class="acct-value sm{daily_class}">{html.escape(daily_display["primary_text"])}</div><div class="acct-sub">{html.escape(daily_sub)}</div></div><div class="acct-metric"><div class="acct-label">예수금</div><div class="acct-value sm">{html.escape(cash_display["primary_text"])}</div><div class="acct-sub">{html.escape(cash_sub)}</div></div></div><hr class="acct-divider"><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">총 익스포저</div><div class="acct-value sm">{html.escape(exposure_display["primary_text"])}</div><div class="acct-mini">{html.escape(exposure_sub)}</div></div><div class="acct-metric"><div class="acct-label">낙폭</div><div class="acct-value warn-c sm">{html.escape(_fmt_pct(drawdown))}</div></div><div class="acct-metric"><div class="acct-label">마지막 스냅샷</div><div class="acct-value sm" style="font-size:11px;font-weight:600;">{html.escape(updated)}</div>{footer_html}</div></div></div>'
 
 
-def _account_card_compact(snapshot: Dict[str, Any], fallback_account: Dict[str, Any], trade_performance: Dict[str, Any], broker: str, scope: str, css_class: str) -> str:
+def _account_card_compact(
+    snapshot: Dict[str, Any],
+    fallback_account: Dict[str, Any],
+    trade_performance: Dict[str, Any],
+    broker: str,
+    scope: str,
+    css_class: str,
+    *,
+    currency: str = "KRW",
+    quote_snapshots: Dict[str, Dict[str, Any]] | None = None,
+    footer_note: str = "",
+) -> str:
+    quote_snapshots = quote_snapshots or {}
     equity = _f(snapshot.get("equity"))
     cash = _f(snapshot.get("cash"))
     realized_pnl = _f(snapshot.get("daily_pnl"))
@@ -654,11 +754,22 @@ def _account_card_compact(snapshot: Dict[str, Any], fallback_account: Dict[str, 
     pnl_pct = current_pnl / equity if np.isfinite(equity) and equity > 0 else float("nan")
     daily_class = " up" if np.isfinite(current_pnl) and current_pnl > 0 else " dn" if np.isfinite(current_pnl) and current_pnl < 0 else ""
     updated = _fmt_time(snapshot.get("created_at") or fallback_account.get("created_at"))
-    equity_note = _metric_note(_fmt_money(equity), f"현재 손익 {_fmt_pct(pnl_pct)}" if np.isfinite(pnl_pct) else None)
-    daily_note = _metric_note(_fmt_money(current_pnl), "실현 + 미실현 합산")
-    cash_note = _metric_note(_fmt_money(cash), "진입 가능한 현금")
-    exposure_note = _fmt_money(exposure)
-    return f'<div class="acct-card {html.escape(css_class)}"><div class="acct-header"><span class="acct-broker-badge">{html.escape(broker)}</span><span class="acct-scope">{html.escape(scope)}</span></div><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">평가 자산</div><div class="acct-value compact">{html.escape(_fmt_compact_money(equity))}</div><div class="acct-mini">{html.escape(equity_note)}</div></div><div class="acct-metric"><div class="acct-label">현재 손익</div><div class="acct-value compact{daily_class}">{html.escape(_fmt_compact_money(current_pnl))}</div><div class="acct-mini">{html.escape(daily_note)}</div></div><div class="acct-metric"><div class="acct-label">예수금</div><div class="acct-value compact">{html.escape(_fmt_compact_money(cash))}</div><div class="acct-mini">{html.escape(cash_note)}</div></div></div><hr class="acct-divider"><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">총 익스포저</div><div class="acct-value sm">{html.escape(_fmt_compact_money(exposure))}</div><div class="acct-mini">{html.escape(exposure_note)}</div></div><div class="acct-metric"><div class="acct-label">낙폭</div><div class="acct-value warn-c sm">{html.escape(_fmt_pct(drawdown))}</div></div><div class="acct-metric"><div class="acct-label">마지막 스냅샷</div><div class="acct-value sm" style="font-size:11px;font-weight:600;">{html.escape(updated)}</div></div></div></div>'
+    equity_display = _money_value_display(equity, currency, quote_snapshots)
+    pnl_display = _money_value_display(current_pnl, currency, quote_snapshots)
+    cash_display = _money_value_display(cash, currency, quote_snapshots)
+    exposure_display = _money_value_display(exposure, currency, quote_snapshots)
+    equity_note = _metric_note(equity_display["primary_text"], f"현재 손익 {_fmt_pct(pnl_pct)}" if np.isfinite(pnl_pct) else None)
+    if equity_display["secondary_text"]:
+        equity_note += f" · {equity_display['secondary_text']}"
+    daily_note = _metric_note(pnl_display["primary_text"], "실현 + 미실현 합산")
+    if pnl_display["secondary_text"]:
+        daily_note += f" · {pnl_display['secondary_text']}"
+    cash_note = _metric_note(cash_display["primary_text"], "진입 가능한 현금")
+    if cash_display["secondary_text"]:
+        cash_note += f" · {cash_display['secondary_text']}"
+    exposure_note = exposure_display["secondary_text"] or exposure_display["primary_text"]
+    footer_html = f'<div class="acct-mini" style="margin-top:6px;">{html.escape(footer_note)}</div>' if footer_note else ""
+    return f'<div class="acct-card {html.escape(css_class)}"><div class="acct-header"><span class="acct-broker-badge">{html.escape(broker)}</span><span class="acct-scope">{html.escape(scope)}</span></div><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">평가 자산</div><div class="acct-value compact">{html.escape(str(equity_display["compact_text"]))}</div><div class="acct-mini">{html.escape(equity_note)}</div></div><div class="acct-metric"><div class="acct-label">현재 손익</div><div class="acct-value compact{daily_class}">{html.escape(str(pnl_display["compact_text"]))}</div><div class="acct-mini">{html.escape(daily_note)}</div></div><div class="acct-metric"><div class="acct-label">예수금</div><div class="acct-value compact">{html.escape(str(cash_display["compact_text"]))}</div><div class="acct-mini">{html.escape(cash_note)}</div></div></div><hr class="acct-divider"><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">총 익스포저</div><div class="acct-value sm">{html.escape(str(exposure_display["compact_text"]))}</div><div class="acct-mini">{html.escape(exposure_note)}</div></div><div class="acct-metric"><div class="acct-label">낙폭</div><div class="acct-value warn-c sm">{html.escape(_fmt_pct(drawdown))}</div></div><div class="acct-metric"><div class="acct-label">마지막 스냅샷</div><div class="acct-value sm" style="font-size:11px;font-weight:600;">{html.escape(updated)}</div>{footer_html}</div></div></div>'
 
 
 def _positions_card(frame: pd.DataFrame, title: str, broker_label: str, broker_class: str, account_equity: float, quote_snapshots: Dict[str, Dict[str, Any]], kr_asset_types: set[str]) -> str:
@@ -786,14 +897,35 @@ def _candidate_tabs_html(
     return '<div class="cand-tabs">' + "".join(tab_buttons) + '</div><div class="cand-panes">' + "".join(tab_panes) + "</div>"
 
 
-def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, initial_anchor: str, feedback: Dict[str, Any] | None, kis_account_snapshot: Dict[str, Any], sim_account_snapshot: Dict[str, Any], quote_snapshots: Dict[str, Dict[str, Any]], kr_asset_types: set[str], recent_orders: pd.DataFrame, krx_name_map: Dict[str, Dict[str, str]] | None = None, current_candidate_tab: str = "", jobs_expanded: bool = False) -> None:
+def _frame_for_account(frame: pd.DataFrame, account_id: str, *, column: str = "account_id") -> pd.DataFrame:
+    if frame.empty or column not in frame.columns:
+        return pd.DataFrame(columns=list(frame.columns))
+    mask = frame[column].fillna("").astype(str) == str(account_id)
+    return frame.loc[mask].copy()
+
+
+def render_beta_overview_component(
+    *,
+    data: Dict[str, Any],
+    theme_mode: str,
+    initial_anchor: str,
+    feedback: Dict[str, Any] | None,
+    accounts_overview: Dict[str, Dict[str, Any]],
+    total_portfolio_overview: Dict[str, Any],
+    quote_snapshots: Dict[str, Dict[str, Any]],
+    kr_asset_types: set[str],
+    recent_orders: pd.DataFrame,
+    krx_name_map: Dict[str, Dict[str, str]] | None = None,
+    current_candidate_tab: str = "",
+    jobs_expanded: bool = False,
+) -> None:
     template = TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
     template = re.sub(r'<html[^>]*data-theme="[^"]+"', f'<html lang="ko" data-theme="{theme_mode}"', template, count=1)
     template = template.replace("</style>", _extra_styles() + "</style>", 1)
 
     summary = data["summary"]
     fallback_account = dict(summary.get("latest_account") or {})
-    trade_performance = data.get("trade_performance", {})
+    trade_performance = total_portfolio_overview.get("trade_performance", data.get("trade_performance", {}))
     auto_trading_status = data.get("auto_trading_status", {})
     execution_summary = data.get("execution_summary", {})
     broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
@@ -814,6 +946,12 @@ def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, ini
     kr_symbol_names = _build_kr_symbol_name_map(krx_name_map)
     jobs_query_value = "all" if jobs_expanded else None
     action_token = str(pd.Timestamp.utcnow().value)
+    kis_account = dict(accounts_overview.get(ACCOUNT_KIS_KR_PAPER) or {})
+    us_account = dict(accounts_overview.get(ACCOUNT_SIM_US_EQUITY) or {})
+    crypto_account = dict(accounts_overview.get(ACCOUNT_SIM_CRYPTO) or {})
+    kis_account_snapshot = dict(kis_account.get("latest_snapshot") or {})
+    us_account_snapshot = dict(us_account.get("latest_snapshot") or {})
+    crypto_account_snapshot = dict(crypto_account.get("latest_snapshot") or {})
 
     broker_sync_rows: Dict[str, Dict[str, Any]] = {}
     if not broker_sync_status.empty and "job_name" in broker_sync_status.columns:
@@ -833,24 +971,61 @@ def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, ini
     strip_html = '<div class="status-strip">' + f'<div class="strip-item"><span class="sdot {worker_dot}"></span><span>워커 {html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span></div>' + f'<div class="strip-item"><span class="sdot {kis_dot}"></span><span>KIS {"연결됨 · 모의" if kis_account_snapshot or kis_runtime.get("last_broker_account_sync") else "확인 필요"}</span></div>' + f'<div class="strip-item"><span class="sdot sdot-green"></span><span>시그널 스캔 {html.escape(scan_time)}</span></div>' + f'<div class="strip-item"><span class="sdot {error_dot}"></span><span>브로커 오류 {len(broker_sync_errors)}건</span></div>' + f'<div class="strip-item"><span class="sdot {entry_dot}"></span><span>진입 {entry_label}</span></div>' + f'<span class="strip-time">{html.escape(pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S"))}</span></div>'
     template = _replace_block(template, 'class="status-strip"', strip_html)
 
-    kis_equity = _f(kis_account_snapshot.get("equity"))
-    sim_equity = _f(sim_account_snapshot.get("equity"))
-    total_equity = max((kis_equity if np.isfinite(kis_equity) else 0.0) + (sim_equity if np.isfinite(sim_equity) else 0.0), _f(fallback_account.get("equity")))
-    kis_daily = _f(kis_account_snapshot.get("daily_pnl"))
-    sim_daily = _f(sim_account_snapshot.get("daily_pnl"))
-    total_daily = (kis_daily if np.isfinite(kis_daily) else 0.0) + (sim_daily if np.isfinite(sim_daily) else 0.0)
-    if total_daily == 0:
-        total_daily = _f(trade_performance.get("today_pnl"))
-    kis_unrealized = _f(kis_account_snapshot.get("unrealized_pnl"))
-    sim_unrealized = _f(sim_account_snapshot.get("unrealized_pnl"))
-    total_unrealized = (kis_unrealized if np.isfinite(kis_unrealized) else 0.0) + (sim_unrealized if np.isfinite(sim_unrealized) else 0.0)
-    total_current_pnl = total_daily + total_unrealized if np.isfinite(total_daily) else total_unrealized
-    total_exposure = abs(_f(kis_account_snapshot.get("gross_exposure"))) + abs(_f(sim_account_snapshot.get("gross_exposure")))
-    total_equity_note = _metric_note(_fmt_money(total_equity), f"프로파일 {runtime_profile.get('name') or '-'}")
-    total_daily_note = _metric_note(_fmt_money(total_current_pnl), "실현 + 미실현 합산")
-    total_exposure_note = _metric_note(_fmt_money(total_exposure), "포지션 기준")
+    total_equity = 0.0
+    total_current_pnl = 0.0
+    total_exposure = 0.0
+    account_cards: list[str] = []
+    for account_id, broker_label, scope_label, css_class, default_currency in ACCOUNT_VIEW_SPECS:
+        account_row = dict(accounts_overview.get(account_id) or {})
+        snapshot = dict(account_row.get("latest_snapshot") or {})
+        for key in ("equity", "cash", "gross_exposure", "net_exposure", "realized_pnl", "unrealized_pnl", "drawdown_pct"):
+            if key not in snapshot and key in account_row:
+                snapshot[key] = account_row.get(key)
+        if "daily_pnl" not in snapshot and "realized_pnl" in account_row:
+            snapshot["daily_pnl"] = account_row.get("realized_pnl")
+        currency = str(account_row.get("currency") or default_currency or "KRW")
+        total_equity += _money_value_display(snapshot.get("equity"), currency, quote_snapshots)["primary_value"] if np.isfinite(_f(snapshot.get("equity"))) else 0.0
+        total_current_pnl += _money_value_display(
+            float(_f(snapshot.get("daily_pnl")) if np.isfinite(_f(snapshot.get("daily_pnl"))) else 0.0)
+            + float(_f(snapshot.get("unrealized_pnl")) if np.isfinite(_f(snapshot.get("unrealized_pnl"))) else 0.0),
+            currency,
+            quote_snapshots,
+        )["primary_value"] if np.isfinite(_f(snapshot.get("daily_pnl"))) or np.isfinite(_f(snapshot.get("unrealized_pnl"))) else 0.0
+        total_exposure += _money_value_display(abs(snapshot.get("gross_exposure", 0.0)), currency, quote_snapshots)["primary_value"] if np.isfinite(_f(snapshot.get("gross_exposure"))) else 0.0
+        sync_status = _status_label(account_row.get("last_sync_status") or "never")
+        sync_time = _fmt_time(account_row.get("last_sync_time") or snapshot.get("created_at"))
+        footer_note = f"동기화 {sync_status} · {sync_time}"
+        account_cards.append(
+            _account_card_compact(
+                snapshot,
+                fallback_account,
+                account_row.get("trade_performance", {}),
+                broker_label,
+                scope_label,
+                css_class,
+                currency=currency,
+                quote_snapshots=quote_snapshots,
+                footer_note=footer_note,
+            )
+        )
+    total_equity_note = _metric_note(
+        _format_currency_mix(total_portfolio_overview.get("equity_by_currency", {})),
+        f"프로파일 {runtime_profile.get('name') or '-'}",
+    )
+    total_daily_note = _metric_note(
+        _format_currency_mix(
+            {
+                currency: float(total_portfolio_overview.get("realized_pnl_by_currency", {}).get(currency, 0.0))
+                + float(total_portfolio_overview.get("unrealized_pnl_by_currency", {}).get(currency, 0.0))
+                for currency in set(total_portfolio_overview.get("realized_pnl_by_currency", {})) | set(total_portfolio_overview.get("unrealized_pnl_by_currency", {}))
+            }
+        ),
+        "실현 + 미실현 합산",
+    )
+    total_exposure_note = _metric_note(_format_currency_mix(total_portfolio_overview.get("gross_exposure_by_currency", {})), "포지션 기준")
     total_daily_style = ' style="color:var(--up);"' if total_current_pnl > 0 else ' style="color:var(--warn);"' if total_current_pnl < 0 else ""
-    account_row_html = '<div class="account-row">' + _account_card_compact(kis_account_snapshot, fallback_account, trade_performance, "KIS", "한국주식 계좌", "kis") + _account_card_compact(sim_account_snapshot, fallback_account, trade_performance, "SIM", "미국주식 · 코인", "sim") + '<div class="acct-card total"><div class="acct-header"><span class="acct-broker-badge" style="background:var(--bg2);color:var(--text3);">합산</span><span class="acct-scope">전체 운영 계좌</span></div><div class="summary-grid">' + f'<div class="sum-item"><div class="sum-label">총 자산</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_equity))}</div><div class="sum-mini">{html.escape(total_equity_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">현재 손익</div><div class="sum-value compact"{total_daily_style}>{html.escape(_fmt_compact_money(total_current_pnl))}</div><div class="sum-mini">{html.escape(total_daily_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">총 익스포저</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_exposure))}</div><div class="sum-mini">{html.escape(total_exposure_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">브로커 오류</div><div class="sum-value warn-c">{len(broker_sync_errors)}</div><div class="sum-sub">오늘 기준</div></div>' + "</div></div></div>"
+    total_warning = str(total_portfolio_overview.get("warning") or "전체 합산은 참고용입니다.")
+    account_row_html = '<div class="account-row">' + "".join(account_cards) + '<div class="acct-card total"><div class="acct-header"><span class="acct-broker-badge" style="background:var(--bg2);color:var(--text3);">합산</span><span class="acct-scope">전체 운영 계좌 · 참고용</span></div><div class="summary-grid">' + f'<div class="sum-item"><div class="sum-label">총 자산</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_equity))}</div><div class="sum-mini">{html.escape(total_equity_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">현재 손익</div><div class="sum-value compact"{total_daily_style}>{html.escape(_fmt_compact_money(total_current_pnl))}</div><div class="sum-mini">{html.escape(total_daily_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">총 익스포저</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_exposure))}</div><div class="sum-mini">{html.escape(total_exposure_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">브로커 오류</div><div class="sum-value warn-c">{len(broker_sync_errors)}</div><div class="sum-sub">오늘 기준</div></div>' + "</div><div class=\"acct-mini\" style=\"margin-top:8px;\">" + html.escape(total_warning) + "</div></div></div>"
     template = _replace_block(template, 'class="account-row"', account_row_html)
 
     stat_items = [("보유 포지션", _i(summary.get("open_positions", 0))), ("대기 주문", _i(summary.get("open_orders", 0))), ("미해결", _i(summary.get("unresolved_predictions", 0))), ("오늘 후보", _i(execution_summary.get("today_candidate_count", 0))), ("진입 허용", _i(execution_summary.get("today_entry_allowed_count", 0))), ("진입 거절", _i(execution_summary.get("today_entry_rejected_count", 0))), ("주문 제출", _i(execution_summary.get("today_submitted_count", 0))), ("체결 완료", _i(execution_summary.get("today_filled_count", 0))), ("브로커 오류", len(broker_sync_errors)), ("프로파일", str(runtime_profile.get("name") or "-"))]
@@ -867,8 +1042,9 @@ def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, ini
         stat_html.append(f'<div class="{" ".join(classes)}">{stat_value_html}<div class="stat-lbl">{html.escape(label)}</div></div>')
     template = _replace_block(template, 'class="stat-bar"', '<div class="stat-bar">' + "".join(stat_html) + "</div>")
 
-    kis_positions = open_positions.loc[open_positions["asset_type"].astype(str).isin(kr_asset_types)].copy() if not open_positions.empty and "asset_type" in open_positions.columns else pd.DataFrame()
-    sim_positions = open_positions.loc[~open_positions["asset_type"].astype(str).isin(kr_asset_types)].copy() if not open_positions.empty and "asset_type" in open_positions.columns else pd.DataFrame()
+    kis_positions = _frame_for_account(open_positions, ACCOUNT_KIS_KR_PAPER)
+    us_positions = _frame_for_account(open_positions, ACCOUNT_SIM_US_EQUITY)
+    crypto_positions = _frame_for_account(open_positions, ACCOUNT_SIM_CRYPTO)
 
     signal_rows = _build_entry_result_rows(today_execution_events)
     signal_count = len(signal_rows)
@@ -888,7 +1064,7 @@ def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, ini
         level_class = "li" if level == "INFO" else "lw" if level == "WARNING" else "le"
         event_rows.append(f'<div><span class="lt">{html.escape(_fmt_time(row.get("created_at")))}</span> <span class="{level_class}">[{html.escape(level)}]</span> {html.escape(str(row.get("message") or ""))}</div>')
 
-    left_html = '<div id="beta-overview" data-section-anchor="beta-overview"></div>' + _positions_card(kis_positions, "한국주식 포지션", "KIS", "broker-kis", max(kis_equity if np.isfinite(kis_equity) else 0.0, total_equity), quote_snapshots, kr_asset_types) + _positions_card(sim_positions, "미국주식 · 코인 포지션", "SIM", "broker-sim", max(sim_equity if np.isfinite(sim_equity) else 0.0, total_equity), quote_snapshots, kr_asset_types) + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">진입 처리 결과</div><div class="card-meta">' + f'표시 {signal_count}건' + '</div></div><div class="signal-list">' + "".join(signal_rows) + '</div></div>' + '<div class="card" data-section-anchor="candidates"><div class="card-hd"><div class="card-title">오늘 후보 목록</div><div class="card-meta">' + f'{len(candidate_scans)}종목 · 허용 {_i(execution_summary.get("today_entry_allowed_count", 0))} / 거절 {_i(execution_summary.get("today_entry_rejected_count", 0))}' + '</div></div>' + candidate_tabs_html + '</div>' + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">실행 이벤트</div><div class="card-meta">최근 7건</div></div><div class="log-body">' + ("".join(event_rows) if event_rows else '<div class="empty-block">최근 이벤트가 없습니다.</div>') + "</div></div>"
+    left_html = '<div id="beta-overview" data-section-anchor="beta-overview"></div>' + _positions_card(kis_positions, "한국주식 포지션", "KIS", "broker-kis", max(_f(kis_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + _positions_card(us_positions, "미국주식 포지션", "SIM", "broker-sim", max(_f(us_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + _positions_card(crypto_positions, "코인 포지션", "SIM", "broker-sim", max(_f(crypto_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">진입 처리 결과</div><div class="card-meta">' + f'표시 {signal_count}건' + '</div></div><div class="signal-list">' + "".join(signal_rows) + '</div></div>' + '<div class="card" data-section-anchor="candidates"><div class="card-hd"><div class="card-title">오늘 후보 목록</div><div class="card-meta">' + f'{len(candidate_scans)}종목 · 허용 {_i(execution_summary.get("today_entry_allowed_count", 0))} / 거절 {_i(execution_summary.get("today_entry_rejected_count", 0))}' + '</div></div>' + candidate_tabs_html + '</div>' + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">실행 이벤트</div><div class="card-meta">최근 7건</div></div><div class="log-body">' + ("".join(event_rows) if event_rows else '<div class="empty-block">최근 이벤트가 없습니다.</div>') + "</div></div>"
 
     sync_rows = []
     for label, action, job_name in [("계좌", "sync_account", "broker_account_sync"), ("주문", "sync_order", "broker_order_sync"), ("포지션", "sync_position", "broker_position_sync"), ("시세", "sync_market", "broker_market_status")]:
@@ -922,9 +1098,9 @@ def render_beta_overview_component(*, data: Dict[str, Any], theme_mode: str, ini
     template = _replace_block(template, 'class="bottom-grid"', '<div class="bottom-grid"><div id="jobs" class="card" data-section-anchor="jobs"><div class="card-hd job-card-head"><div class="card-title">최근 작업 상태</div>' + jobs_toggle_html + '</div><div class="job-list">' + ("".join(visible_job_rows) if visible_job_rows else '<div class="empty-block">최근 작업 이력이 없습니다.</div>') + '</div></div><div class="card" data-section-anchor="errors"><div class="card-hd"><div class="card-title">최근 브로커 오류</div><div class="card-meta">' + _chip(f"{len(broker_sync_errors)}건", "bad" if len(broker_sync_errors) else "ok") + '</div></div><div class="err-list">' + ("".join(error_rows) if error_rows else '<div class="empty-block">최근 오류가 없습니다.</div>') + "</div></div></div>")
 
     detail_sections = [
-        _section_html("positions", "보유 현황", [_detail_card("최근 주문 활동", _table_html(recent_orders, ["updated_at", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "최근 주문 활동이 없습니다.", limit=12), note=f"최근 {min(len(recent_orders), 12)}건"), _detail_card("대기 주문", _table_html(open_orders, ["updated_at", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "대기 주문이 없습니다.", limit=12), note=f"현재 {_i(summary.get('open_orders', 0))}건")]),
-        _section_html("candidates", "후보 종목", [_detail_card("오늘 후보 상세", _table_html(candidate_scans, ["created_at", "symbol", "asset_type", "signal", "expected_return", "confidence", "score", "status", "reason"], "후보 종목이 없습니다.", limit=14), note=f"최근 {min(len(candidate_scans), 14)}건")]),
-        _section_html("events", "실행 이벤트", [_detail_card("실행 이벤트 상세", _table_html(today_execution_events, ["created_at", "event_type", "component", "level", "message"], "실행 이벤트가 없습니다.", limit=14), note=f"최근 {min(len(today_execution_events), 14)}건"), _detail_card("미진입 사유 요약", _table_html(noop_breakdown, ["reason", "count"], "미진입 집계가 없습니다.", limit=10), note=f"사유 {len(noop_breakdown)}건")]),
+        _section_html("positions", "보유 현황", [_detail_card("최근 주문 활동", _table_html(recent_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "최근 주문 활동이 없습니다.", limit=12), note=f"최근 {min(len(recent_orders), 12)}건"), _detail_card("대기 주문", _table_html(open_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "대기 주문이 없습니다.", limit=12), note=f"현재 {_i(summary.get('open_orders', 0))}건")]),
+        _section_html("candidates", "후보 종목", [_detail_card("오늘 후보 상세", _table_html(candidate_scans, ["created_at", "execution_account_id", "symbol", "asset_type", "signal", "expected_return", "confidence", "score", "status", "reason"], "후보 종목이 없습니다.", limit=14), note=f"최근 {min(len(candidate_scans), 14)}건")]),
+        _section_html("events", "실행 이벤트", [_detail_card("실행 이벤트 상세", _table_html(today_execution_events, ["created_at", "account_id", "event_type", "component", "level", "message"], "실행 이벤트가 없습니다.", limit=14), note=f"최근 {min(len(today_execution_events), 14)}건"), _detail_card("미진입 사유 요약", _table_html(noop_breakdown, ["reason", "count"], "미진입 집계가 없습니다.", limit=10), note=f"사유 {len(noop_breakdown)}건")]),
         _section_html("assets", "자산 설정", [_detail_card("운영 자산 설정", _table_html(asset_overview, [], "자산 설정 정보가 없습니다.", limit=10), note=f"자산 {len(asset_overview)}종")]),
         _section_html("errors", "최근 오류", [_detail_card("오류 이벤트", _table_html(recent_errors, ["created_at", "component", "event_type", "level", "message"], "최근 오류가 없습니다.", limit=14), note=f"최근 {min(len(recent_errors), 14)}건")]),
     ]

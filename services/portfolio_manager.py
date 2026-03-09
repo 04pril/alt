@@ -71,13 +71,18 @@ class PortfolioManager:
         latest_candidates = self.repository.latest_candidates(limit=500)
         latest_candidates = latest_candidates.sort_values("created_at").drop_duplicates(subset=["symbol", "timeframe"], keep="last")
         for _, position in positions.iterrows():
+            account_id = str(position.get("account_id") or "")
             if callable(touch):
-                touch("exit_candidate", {"symbol": str(position["symbol"]), "position_id": str(position.get("position_id") or "")})
+                touch("exit_candidate", {"symbol": str(position["symbol"]), "position_id": str(position.get("position_id") or ""), "account_id": account_id})
             if not active_exit_orders.empty:
                 duplicated = active_exit_orders[
                     (active_exit_orders["reason"].astype(str) != "entry")
                     & (active_exit_orders["symbol"].astype(str) == str(position["symbol"]))
                     & (active_exit_orders["timeframe"].astype(str) == str(position["timeframe"]))
+                    & (
+                        active_exit_orders.get("account_id", pd.Series([""] * len(active_exit_orders))).astype(str)
+                        == account_id
+                    )
                 ]
                 if not duplicated.empty:
                     continue
@@ -124,6 +129,10 @@ class PortfolioManager:
                 candidate = latest_candidates[
                     (latest_candidates["symbol"].astype(str) == str(position["symbol"]))
                     & (latest_candidates["timeframe"].astype(str) == str(position["timeframe"]))
+                    & (
+                        latest_candidates.get("execution_account_id", pd.Series([""] * len(latest_candidates))).astype(str)
+                        == account_id
+                    )
                 ]
                 if not candidate.empty:
                     row = candidate.iloc[0]

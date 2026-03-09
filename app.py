@@ -44,6 +44,7 @@ from prediction_store import (
     summarize_prediction_accuracy,
 )
 from predictor import extract_korean_stock_code, is_korean_stock_symbol, normalize_symbol, run_forecast
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 from storage.repository import TradingRepository
 from top100_universe import (
     KR_NAME_ALIASES,
@@ -2921,8 +2922,8 @@ def render_operations_monitor(
 
     data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
-    account_snapshot = dict(summary.get("latest_account") or {})
-    trade_performance = data["trade_performance"]
+    accounts_overview = data.get("accounts_overview", {})
+    total_portfolio_overview = data.get("total_portfolio_overview", {})
     auto_trading_status = data.get("auto_trading_status", {})
     execution_summary = data.get("execution_summary", {})
     broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
@@ -2932,13 +2933,15 @@ def render_operations_monitor(
     asset_overview = data.get("asset_overview", pd.DataFrame())
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
+    recent_events = data.get("recent_events", pd.DataFrame())
     open_positions = data["open_positions"]
     open_orders = data["open_orders"]
     candidate_scans = data["candidate_scans"]
     prediction_report = data["prediction_report"]
     equity_curve = data["equity_curve"]
+    equity_curves_by_account = data.get("equity_curves_by_account", {})
     today_execution_events = data.get("today_execution_events", pd.DataFrame())
-    noop_breakdown = execution_summary.get("today_noop_breakdown", pd.DataFrame())
+    recent_orders = load_monitor_recent_orders(settings, limit=30)
 
     sync_rows: Dict[str, Dict[str, Any]] = {}
     if not broker_sync_status.empty and "job_name" in broker_sync_status.columns:
@@ -3170,6 +3173,8 @@ def render_operations_monitor(
 
     data = dashboard_data or load_dashboard_data(settings)
     summary = data["summary"]
+    accounts_overview = data.get("accounts_overview", {})
+    total_portfolio_overview = data.get("total_portfolio_overview", {})
     account_snapshot = dict(summary.get("latest_account") or {})
     trade_performance = data["trade_performance"]
     auto_trading_status = data.get("auto_trading_status", {})
@@ -3181,12 +3186,15 @@ def render_operations_monitor(
     asset_overview = data.get("asset_overview", pd.DataFrame())
     job_health = data["job_health"]
     recent_errors = data["recent_errors"]
+    recent_events = data.get("recent_events", pd.DataFrame())
     open_positions = data["open_positions"]
     open_orders = data["open_orders"]
     candidate_scans = data["candidate_scans"]
     prediction_report = data["prediction_report"]
     equity_curve = data["equity_curve"]
+    equity_curves_by_account = data.get("equity_curves_by_account", {})
     today_execution_events = data.get("today_execution_events", pd.DataFrame())
+    recent_orders = load_monitor_recent_orders(settings, limit=30)
     noop_breakdown = execution_summary.get("today_noop_breakdown", pd.DataFrame())
 
     sync_rows: Dict[str, Dict[str, Any]] = {}
@@ -3204,29 +3212,251 @@ def render_operations_monitor(
         else:
             st.error(str(feedback["message"]))
 
+    scope_specs = [
+        ("한국주식(KIS)", ACCOUNT_KIS_KR_PAPER),
+        ("미국주식(SIM)", ACCOUNT_SIM_US_EQUITY),
+        ("코인(SIM)", ACCOUNT_SIM_CRYPTO),
+        ("전체(참고용)", "__total__"),
+    ]
+    scope_labels = [label for label, _ in scope_specs]
+    default_scope_value = ACCOUNT_KIS_KR_PAPER if ACCOUNT_KIS_KR_PAPER in accounts_overview else "__total__"
+    default_scope_label = next((label for label, value in scope_specs if value == default_scope_value), scope_labels[0])
+    selected_scope_label = st.radio(
+        "계좌 보기 기준",
+        scope_labels,
+        horizontal=True,
+        key="ops_account_scope_label",
+        index=scope_labels.index(default_scope_label),
+        label_visibility="collapsed",
+    )
+    selected_scope_value = dict(scope_specs)[selected_scope_label]
+
+    def _scoped_frame(frame: pd.DataFrame, *columns: str) -> pd.DataFrame:
+        if selected_scope_value == "__total__" or frame.empty:
+            return frame.copy()
+        for column in columns:
+            if column in frame.columns:
+                return frame.loc[frame[column].fillna("").astype(str) == str(selected_scope_value)].copy()
+        return frame.iloc[0:0].copy()
+
+    def _build_scope_summary(events_frame: pd.DataFrame) -> Dict[str, Any]:
+        if selected_scope_value == "__total__":
+            return execution_summary
+        counts = {
+            f"today_{key}_count": int((events_frame["event_type"].astype(str) == key).sum()) if not events_frame.empty else 0
+            for key in [
+                "candidate",
+                "entry_allowed",
+                "entry_rejected",
+                "submit_requested",
+                "submitted",
+                "acknowledged",
+                "filled",
+                "rejected",
+                "cancelled",
+                "noop",
+            ]
+        }
+        if events_frame.empty or "details" not in events_frame.columns:
+            counts["today_noop_breakdown"] = pd.DataFrame(columns=["reason", "count"])
+            return counts
+        noop_breakdown = (
+            events_frame.loc[events_frame["event_type"].astype(str) == "noop", "details"]
+            .map(lambda item: str((item or {}).get("reason") or "unknown"))
+            .value_counts()
+            .rename_axis("reason")
+            .reset_index(name="count")
+        )
+        counts["today_noop_breakdown"] = noop_breakdown
+        return counts
+
+    selected_account = dict(accounts_overview.get(selected_scope_value) or {}) if selected_scope_value != "__total__" else {}
+    selected_snapshot = (
+        dict(selected_account.get("latest_snapshot") or {})
+        if selected_account
+        else {
+            "created_at": total_portfolio_overview.get("last_sync_time") or summary.get("latest_job_at"),
+            "equity": total_portfolio_overview.get("equity"),
+            "cash": total_portfolio_overview.get("cash"),
+            "gross_exposure": np.nan,
+            "net_exposure": np.nan,
+            "drawdown_pct": total_portfolio_overview.get("drawdown_pct"),
+        }
+    )
+    selected_trade_performance = selected_account.get("trade_performance", total_portfolio_overview.get("trade_performance", data["trade_performance"]))
+    selected_open_positions = _scoped_frame(open_positions, "account_id")
+    selected_open_orders = _scoped_frame(open_orders, "account_id")
+    selected_recent_orders = _scoped_frame(recent_orders, "account_id")
+    selected_prediction_report = _scoped_frame(prediction_report, "execution_account_id")
+    selected_candidate_scans = _scoped_frame(candidate_scans, "execution_account_id")
+    selected_execution_events = _scoped_frame(today_execution_events, "account_id")
+    selected_recent_events = _scoped_frame(recent_events, "account_id")
+    selected_recent_errors = _scoped_frame(recent_errors, "account_id")
+    selected_broker_sync_errors = _scoped_frame(broker_sync_errors, "account_id")
+    selected_equity_curve = (
+        equity_curve
+        if selected_scope_value == "__total__"
+        else equity_curves_by_account.get(selected_scope_value, pd.DataFrame())
+    )
+    selected_execution_summary = _build_scope_summary(selected_execution_events)
+    noop_breakdown = selected_execution_summary.get("today_noop_breakdown", pd.DataFrame())
+    unresolved_predictions = (
+        int((selected_prediction_report["status"].astype(str) == "unresolved").sum())
+        if not selected_prediction_report.empty and "status" in selected_prediction_report.columns
+        else 0
+    )
+    selected_asset_overview = asset_overview.copy()
+    scope_asset_type = str(selected_account.get("asset_scope") or "")
+    if selected_scope_value != "__total__" and scope_asset_type and not asset_overview.empty and "자산유형" in asset_overview.columns:
+        selected_asset_overview = asset_overview.loc[asset_overview["자산유형"].astype(str) == scope_asset_type].copy()
+
+    def _format_currency_totals(values: Dict[str, Any]) -> str:
+        parts = []
+        for currency, amount in (values or {}).items():
+            try:
+                numeric = float(amount)
+            except Exception:
+                continue
+            if not np.isfinite(numeric):
+                continue
+            parts.append(f"{format_price_value(numeric)} {currency}")
+        return " / ".join(parts) if parts else "N/A"
+
+    def _render_scoped_live_panel() -> None:
+        with st.container(border=True):
+            panel_title = "실시간 보유 포지션" if selected_scope_value != "__total__" else "전체 보유 현황"
+            st.caption(panel_title)
+            view_mode = st.radio(
+                "실시간 보유 패널 보기",
+                ["보유 포지션", "매수·매도 내역"],
+                horizontal=True,
+                key=f"ops_live_positions_mode_{selected_scope_value}",
+                label_visibility="collapsed",
+            )
+            if view_mode == "보유 포지션":
+                if selected_open_positions.empty:
+                    st.caption("현재 보유 중인 포지션이 없습니다.")
+                    return
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                live_view = build_live_open_positions_view(selected_open_positions, refresh_token=refresh_token)
+                metric_cols = st.columns(3, gap="small")
+                metric_cols[0].metric("보유 종목 수", f"{len(selected_open_positions)}", border=True)
+                metric_cols[1].metric(
+                    "롱 포지션",
+                    f"{int((selected_open_positions['side'].astype(str) == 'LONG').sum())}",
+                    border=True,
+                )
+                metric_cols[2].metric(
+                    "숏 포지션",
+                    f"{int((selected_open_positions['side'].astype(str) == 'SHORT').sum())}",
+                    border=True,
+                )
+                st.dataframe(live_view, width="stretch", hide_index=True, height=260)
+                return
+            if selected_recent_orders.empty:
+                st.caption("최근 주문 기록이 없습니다.")
+                return
+            order_view = build_recent_order_activity_view(selected_recent_orders)
+            metric_cols = st.columns(3, gap="small")
+            metric_cols[0].metric("최근 주문 수", f"{len(selected_recent_orders)}", border=True)
+            metric_cols[1].metric(
+                "매수 주문",
+                f"{int((selected_recent_orders['side'].astype(str).str.lower() == 'buy').sum())}",
+                border=True,
+            )
+            metric_cols[2].metric(
+                "매도 주문",
+                f"{int((selected_recent_orders['side'].astype(str).str.lower() == 'sell').sum())}",
+                border=True,
+            )
+            st.dataframe(order_view, width="stretch", hide_index=True, height=260)
+
     if str(MONITOR_UI_VARIANT or "polished").lower() == "polished":
         st.markdown(
             _build_operations_overview_strip_html(
                 auto_trading_status=auto_trading_status,
                 runtime_profile=runtime_profile,
-                account_snapshot=account_snapshot,
+                account_snapshot=selected_snapshot,
             ),
             unsafe_allow_html=True,
         )
 
+    st.caption("계좌별 운영 현황")
+    overview_cols = st.columns(4, gap="small")
+    account_card_specs = [
+        ("한국주식(KIS)", accounts_overview.get(ACCOUNT_KIS_KR_PAPER, {}), False),
+        ("미국주식(SIM)", accounts_overview.get(ACCOUNT_SIM_US_EQUITY, {}), False),
+        ("코인(SIM)", accounts_overview.get(ACCOUNT_SIM_CRYPTO, {}), False),
+        ("전체(참고용)", total_portfolio_overview, True),
+    ]
+    for column, (label, payload, is_total) in zip(overview_cols, account_card_specs):
+        with column:
+            with st.container(border=True):
+                st.caption(label)
+                if is_total:
+                    st.metric("평가 자산", _format_currency_totals(payload.get("equity_by_currency", {})), border=True)
+                    st.caption("주문 가능 잔고 기준이 아닙니다.")
+                    st.caption(f"보유 포지션 {int(payload.get('open_positions', 0))} · 대기 주문 {int(payload.get('pending_orders', 0))}")
+                    st.caption(format_display_timestamp(payload.get("last_sync_time")) or "최근 동기화 기록 없음")
+                else:
+                    currency = str(payload.get("currency") or "KRW")
+                    st.metric("평가 자산", f"{format_price_value(float(payload.get('equity', 0.0) or 0.0))} {currency}", border=True)
+                    st.caption(f"예수금 {format_price_value(float(payload.get('cash', 0.0) or 0.0))} {currency}")
+                    st.caption(
+                        f"낙폭 {format_pct_value(float(payload.get('drawdown_pct', 0.0) or 0.0))} · 포지션 {int(payload.get('open_positions', 0))} · 주문 {int(payload.get('pending_orders', 0))}"
+                    )
+                    st.caption(
+                        f"마지막 동기화 {format_display_timestamp(payload.get('last_sync_time')) or '기록 없음'} · {_sync_status_label(str(payload.get('last_sync_status') or 'never'))}"
+                    )
+
+    if selected_scope_value == "__total__":
+        st.warning(str(total_portfolio_overview.get("warning") or "전체 합산 뷰는 참고용입니다."))
+    else:
+        st.info(
+            f"현재 보기 기준: {selected_scope_label} · 브로커 {selected_account.get('broker_mode', '-')}"
+            f" · 기준 통화 {selected_account.get('currency', '-')}"
+            " · RiskEngine과 주문 가능 잔고 판단은 이 계좌만 사용합니다."
+        )
+
     hero_cols = st.columns([1.15, 1.0], gap="large")
     with hero_cols[0]:
-        st.markdown(
-            _build_operations_balance_card_html(
-                account_snapshot=account_snapshot,
-                trade_performance=trade_performance,
-                runtime_profile=runtime_profile,
-            ),
-            unsafe_allow_html=True,
-        )
+        if selected_scope_value == "__total__":
+            with st.container(border=True):
+                st.caption("전체 포트폴리오 합산")
+                top_metrics = st.columns(3, gap="small")
+                top_metrics[0].metric("평가 자산", _format_currency_totals(total_portfolio_overview.get("equity_by_currency", {})), border=True)
+                total_current_pnl = {
+                    currency: float(total_portfolio_overview.get("realized_pnl_by_currency", {}).get(currency, 0.0))
+                    + float(total_portfolio_overview.get("unrealized_pnl_by_currency", {}).get(currency, 0.0))
+                    for currency in set(total_portfolio_overview.get("realized_pnl_by_currency", {}))
+                    | set(total_portfolio_overview.get("unrealized_pnl_by_currency", {}))
+                }
+                top_metrics[1].metric("현재 손익", _format_currency_totals(total_current_pnl), border=True)
+                top_metrics[2].metric("총 익스포저", _format_currency_totals(total_portfolio_overview.get("gross_exposure_by_currency", {})), border=True)
+                st.caption(f"열린 포지션 {int(total_portfolio_overview.get('open_positions', 0))} · 대기 주문 {int(total_portfolio_overview.get('pending_orders', 0))}")
+                st.caption(
+                    f"최근 동기화 {format_display_timestamp(total_portfolio_overview.get('last_sync_time')) or '기록 없음'}"
+                    f" · {str(runtime_profile.get('name') or settings.profile_name)}"
+                )
+        else:
+            st.markdown(
+                _build_operations_balance_card_html(
+                    account_snapshot=selected_snapshot,
+                    trade_performance=selected_trade_performance,
+                    runtime_profile=runtime_profile,
+                ),
+                unsafe_allow_html=True,
+            )
         st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
-        render_live_open_positions_panel(settings)
+        _render_scoped_live_panel()
     with hero_cols[1]:
+        if selected_scope_value != "__total__":
+            st.caption(
+                f"선택 계좌 마지막 동기화 {format_display_timestamp(selected_account.get('last_sync_time')) or '기록 없음'}"
+                f" · {_sync_status_label(str(selected_account.get('last_sync_status') or 'never'))}"
+            )
+        else:
+            st.caption("브로커 동기화 잡 상태는 계좌 공통 런타임 기준입니다.")
         st.markdown(
             _build_operations_runtime_card_html(
                 auto_trading_status=auto_trading_status,
@@ -3291,25 +3521,25 @@ def render_operations_monitor(
     st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
 
     primary_metrics = st.columns(3, gap="small")
-    primary_metrics[0].metric("미정산 예측", f"{int(summary.get('unresolved_predictions', 0))}", border=True)
-    primary_metrics[1].metric("보유 포지션", f"{int(summary.get('open_positions', 0))}", border=True)
-    primary_metrics[2].metric("대기 주문", f"{int(summary.get('open_orders', 0))}", border=True)
+    primary_metrics[0].metric("미정산 예측", f"{unresolved_predictions if selected_scope_value != '__total__' else int(summary.get('unresolved_predictions', 0))}", border=True)
+    primary_metrics[1].metric("보유 포지션", f"{len(selected_open_positions) if selected_scope_value != '__total__' else int(summary.get('open_positions', 0))}", border=True)
+    primary_metrics[2].metric("대기 주문", f"{len(selected_open_orders) if selected_scope_value != '__total__' else int(summary.get('open_orders', 0))}", border=True)
 
     execution_cols = st.columns(5, gap="small")
-    execution_cols[0].metric("오늘 후보", f"{int(execution_summary.get('today_candidate_count', 0))}", border=True)
-    execution_cols[1].metric("진입 허용", f"{int(execution_summary.get('today_entry_allowed_count', 0))}", border=True)
-    execution_cols[2].metric("진입 거절", f"{int(execution_summary.get('today_entry_rejected_count', 0))}", border=True)
-    execution_cols[3].metric("주문 제출", f"{int(execution_summary.get('today_submitted_count', 0))}", border=True)
-    execution_cols[4].metric("체결 완료", f"{int(execution_summary.get('today_filled_count', 0))}", border=True)
+    execution_cols[0].metric("오늘 후보", f"{len(selected_candidate_scans) if selected_scope_value != '__total__' else int(execution_summary.get('today_candidate_count', 0))}", border=True)
+    execution_cols[1].metric("진입 허용", f"{int(selected_execution_summary.get('today_entry_allowed_count', 0))}", border=True)
+    execution_cols[2].metric("진입 거절", f"{int(selected_execution_summary.get('today_entry_rejected_count', 0))}", border=True)
+    execution_cols[3].metric("주문 제출", f"{int(selected_execution_summary.get('today_submitted_count', 0))}", border=True)
+    execution_cols[4].metric("체결 완료", f"{int(selected_execution_summary.get('today_filled_count', 0))}", border=True)
 
     execution_cols_2 = st.columns(5, gap="small")
-    execution_cols_2[0].metric("제출 요청", f"{int(execution_summary.get('today_submit_requested_count', 0))}", border=True)
-    execution_cols_2[1].metric("접수 완료", f"{int(execution_summary.get('today_acknowledged_count', 0))}", border=True)
-    execution_cols_2[2].metric("취소", f"{int(execution_summary.get('today_cancelled_count', 0))}", border=True)
-    execution_cols_2[3].metric("미실행", f"{int(execution_summary.get('today_noop_count', 0))}", border=True)
+    execution_cols_2[0].metric("제출 요청", f"{int(selected_execution_summary.get('today_submit_requested_count', 0))}", border=True)
+    execution_cols_2[1].metric("접수 완료", f"{int(selected_execution_summary.get('today_acknowledged_count', 0))}", border=True)
+    execution_cols_2[2].metric("취소", f"{int(selected_execution_summary.get('today_cancelled_count', 0))}", border=True)
+    execution_cols_2[3].metric("미실행", f"{int(selected_execution_summary.get('today_noop_count', 0))}", border=True)
     execution_cols_2[4].metric(
         "브로커 거절",
-        f"{int(first_valid_float(kis_runtime.get('broker_rejects_today'), default=0.0))}",
+        f"{int(first_valid_float(kis_runtime.get('broker_rejects_today'), default=0.0)) if selected_scope_value in {'__total__', ACCOUNT_KIS_KR_PAPER} else 0}",
         border=True,
     )
 
@@ -3333,25 +3563,25 @@ def render_operations_monitor(
     with status_cols[1]:
         with st.container(border=True, height=360):
             st.caption("최근 브로커 오류")
-            if broker_sync_errors.empty:
+            if selected_broker_sync_errors.empty:
                 st.caption("최근 브로커 동기화 오류가 없습니다.")
             else:
                 st.dataframe(
-                    build_monitor_table_view(broker_sync_errors, limit=5),
+                    build_monitor_table_view(selected_broker_sync_errors, limit=5),
                     width="stretch",
                     hide_index=True,
                     height=250,
                 )
 
-    if not equity_curve.empty:
+    if not selected_equity_curve.empty:
         st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
         with st.container(border=True):
-            st.caption("계좌 자산 추이")
+            st.caption("계좌 자산 추이" if selected_scope_value != "__total__" else "전체 포트폴리오 추이(참고용)")
             fig = go.Figure(
                 data=[
                     go.Scatter(
-                        x=pd.to_datetime(equity_curve["created_at"], errors="coerce"),
-                        y=pd.to_numeric(equity_curve["equity"], errors="coerce"),
+                        x=pd.to_datetime(selected_equity_curve["created_at"], errors="coerce"),
+                        y=pd.to_numeric(selected_equity_curve["equity"], errors="coerce"),
                         mode="lines+markers",
                         name="자산",
                     )
@@ -3370,60 +3600,60 @@ def render_operations_monitor(
             st.dataframe(build_monitor_table_view(job_health), width="stretch", hide_index=True)
 
     with tab_positions:
-        if open_positions.empty and open_orders.empty:
+        if selected_open_positions.empty and selected_open_orders.empty:
             st.caption("보유 포지션이나 대기 주문이 없습니다.")
         else:
-            if not open_positions.empty:
+            if not selected_open_positions.empty:
                 st.caption("보유 포지션")
-                st.dataframe(build_monitor_table_view(open_positions), width="stretch", hide_index=True)
-            if not open_orders.empty:
+                st.dataframe(build_monitor_table_view(selected_open_positions), width="stretch", hide_index=True)
+            if not selected_open_orders.empty:
                 st.caption("대기 주문")
-                st.dataframe(build_monitor_table_view(open_orders), width="stretch", hide_index=True)
+                st.dataframe(build_monitor_table_view(selected_open_orders), width="stretch", hide_index=True)
 
     with tab_predictions:
-        if prediction_report.empty:
+        if selected_prediction_report.empty:
             st.caption("예측 기록이 없습니다.")
         else:
-            st.dataframe(build_monitor_table_view(prediction_report, limit=200), width="stretch", hide_index=True)
+            st.dataframe(build_monitor_table_view(selected_prediction_report, limit=200), width="stretch", hide_index=True)
 
     with tab_candidates:
-        if candidate_scans.empty:
+        if selected_candidate_scans.empty:
             st.caption("후보 종목 기록이 없습니다.")
         else:
-            st.dataframe(build_monitor_table_view(candidate_scans, limit=200), width="stretch", hide_index=True)
+            st.dataframe(build_monitor_table_view(selected_candidate_scans, limit=200), width="stretch", hide_index=True)
 
     with tab_execution:
         if not noop_breakdown.empty:
             noop_view = noop_breakdown.rename(columns={"reason": "사유", "count": "건수"})
             st.caption("미실행 사유 요약")
             st.dataframe(noop_view, width="stretch", hide_index=True)
-        if today_execution_events.empty:
+        if selected_execution_events.empty:
             st.caption("오늘 실행 이벤트가 없습니다.")
         else:
-            st.dataframe(build_monitor_table_view(today_execution_events, limit=200), width="stretch", hide_index=True)
+            st.dataframe(build_monitor_table_view(selected_execution_events, limit=200), width="stretch", hide_index=True)
 
     with tab_broker:
         if broker_sync_status.empty:
             st.caption("브로커 동기화 이력이 없습니다.")
         else:
             st.dataframe(build_monitor_table_view(broker_sync_status), width="stretch", hide_index=True)
-        if broker_sync_errors.empty:
+        if selected_broker_sync_errors.empty:
             st.caption("최근 브로커 동기화 오류가 없습니다.")
         else:
             st.caption("최근 브로커 동기화/실행 이벤트")
-            st.dataframe(build_monitor_table_view(broker_sync_errors, limit=100), width="stretch", hide_index=True)
+            st.dataframe(build_monitor_table_view(selected_broker_sync_errors, limit=100), width="stretch", hide_index=True)
 
     with tab_assets:
-        if asset_overview.empty:
+        if selected_asset_overview.empty:
             st.caption("설정된 자산 구성이 없습니다.")
         else:
-            st.dataframe(asset_overview, width="stretch", hide_index=True)
+            st.dataframe(selected_asset_overview, width="stretch", hide_index=True)
 
     with tab_errors:
-        if recent_errors.empty:
+        if selected_recent_errors.empty:
             st.caption("최근 오류 이벤트가 없습니다.")
         else:
-            st.dataframe(build_monitor_table_view(recent_errors), width="stretch", hide_index=True)
+            st.dataframe(build_monitor_table_view(selected_recent_errors), width="stretch", hide_index=True)
 
 
 def build_scan_row(symbol: str, result, forecast_days: int) -> Dict[str, float | str]:
@@ -5649,16 +5879,23 @@ def _render_beta_monitor_clone_page() -> None:
     data = load_dashboard_data(settings)
     recent_orders = load_monitor_recent_orders(settings, limit=40)
     open_positions = data.get("open_positions", pd.DataFrame())
+    accounts_overview = data.get("accounts_overview", {})
+    total_portfolio_overview = data.get("total_portfolio_overview", {})
     kr_asset_types = {
         asset_type
         for asset_type, schedule in settings.asset_schedules.items()
         if str(getattr(schedule, "timezone", "")) == "Asia/Seoul"
     }
     quote_snapshots: Dict[str, Dict[str, Any]] = {}
+    quote_symbols: List[str] = []
     if not open_positions.empty and "symbol" in open_positions.columns:
-        quote_symbols = open_positions["symbol"].dropna().astype(str).tolist()
-        if any(not is_korean_stock_symbol(symbol) for symbol in quote_symbols):
-            quote_symbols.append("KRW=X")
+        quote_symbols.extend(open_positions["symbol"].dropna().astype(str).tolist())
+    if any(
+        str((accounts_overview.get(account_id) or {}).get("currency") or "").upper() == "USD"
+        for account_id in (ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO)
+    ):
+        quote_symbols.append("KRW=X")
+    if quote_symbols:
         symbols = tuple(dict.fromkeys(quote_symbols))
         if symbols:
             refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
@@ -5669,8 +5906,8 @@ def _render_beta_monitor_clone_page() -> None:
         theme_mode=theme_mode,
         initial_anchor=_beta_query_value("beta_anchor", "beta-overview"),
         feedback=st.session_state.get("beta_action_feedback") if isinstance(st.session_state.get("beta_action_feedback"), dict) else None,
-        kis_account_snapshot=repository.latest_account_snapshot(source="kis_account_sync") or {},
-        sim_account_snapshot=repository.latest_account_snapshot(exclude_sources=("kis_account_sync",)) or {},
+        accounts_overview=accounts_overview,
+        total_portfolio_overview=total_portfolio_overview,
         quote_snapshots=quote_snapshots,
         kr_asset_types=kr_asset_types,
         recent_orders=recent_orders,

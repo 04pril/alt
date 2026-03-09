@@ -8,6 +8,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from runtime_accounts import (
+    ACCOUNT_KIS_KR_PAPER,
+    ACCOUNT_SIM_CRYPTO,
+    ACCOUNT_SIM_US_EQUITY,
+)
 from services.broker_router import resolve_broker_mode
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
@@ -81,6 +86,131 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
     return {
         "name": str(profile_name or "baseline"),
         "source": str(profile_source or "embedded_defaults"),
+    }
+
+
+def _account_display_order() -> list[str]:
+    return [ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO]
+
+
+def _sync_status_from_events(repository: TradingRepository, account_id: str, latest_snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    events = repository.recent_system_events(limit=200, account_id=account_id)
+    if not events.empty:
+        sync_events = events.loc[
+            events["event_type"].astype(str).isin({"broker_account_sync", "broker_order_sync", "broker_position_sync", "broker_market_status"})
+            | events["component"].astype(str).str.contains("kis_execution|execution_pipeline", na=False)
+        ]
+        if not sync_events.empty:
+            row = sync_events.iloc[0]
+            return {
+                "last_sync_time": row.get("created_at") or "",
+                "last_sync_status": "failed" if str(row.get("level") or "").upper() == "ERROR" else "completed",
+            }
+    if latest_snapshot:
+        return {
+            "last_sync_time": latest_snapshot.get("created_at") or "",
+            "last_sync_status": "completed",
+        }
+    return {"last_sync_time": "", "last_sync_status": "never"}
+
+
+def _build_accounts_overview(repository: TradingRepository) -> Dict[str, Dict[str, Any]]:
+    accounts = repository.load_broker_accounts(active_only=True)
+    if accounts.empty:
+        return {}
+    overviews: Dict[str, Dict[str, Any]] = {}
+    for account_id in _account_display_order():
+        matched = accounts.loc[accounts["account_id"].astype(str) == account_id]
+        if matched.empty:
+            continue
+        account_row = matched.iloc[0].to_dict()
+        latest_snapshot = repository.latest_account_snapshot(account_id=account_id) or {}
+        sync_state = _sync_status_from_events(repository, account_id, latest_snapshot)
+        open_positions = repository.open_positions(account_id=account_id)
+        open_orders = repository.open_orders(account_id=account_id)
+        pending_orders = int(
+            len(open_orders.loc[open_orders["status"].astype(str).isin({"new", "submitted", "acknowledged", "pending_fill", "partially_filled"})])
+        ) if not open_orders.empty else 0
+        overviews[account_id] = {
+            "account_id": account_id,
+            "display_name": str(account_row.get("display_name") or account_id),
+            "broker_mode": str(account_row.get("broker_mode") or ""),
+            "asset_scope": str(account_row.get("asset_scope") or ""),
+            "currency": str(account_row.get("currency") or ""),
+            "cash": float(latest_snapshot.get("cash", 0.0) or 0.0),
+            "equity": float(latest_snapshot.get("equity", 0.0) or 0.0),
+            "gross_exposure": float(latest_snapshot.get("gross_exposure", 0.0) or 0.0),
+            "net_exposure": float(latest_snapshot.get("net_exposure", 0.0) or 0.0),
+            "realized_pnl": float(latest_snapshot.get("daily_pnl", 0.0) or 0.0),
+            "unrealized_pnl": float(latest_snapshot.get("unrealized_pnl", 0.0) or 0.0),
+            "drawdown_pct": float(latest_snapshot.get("drawdown_pct", 0.0) or 0.0),
+            "open_positions": int(len(open_positions)),
+            "pending_orders": pending_orders,
+            "last_sync_time": sync_state["last_sync_time"],
+            "last_sync_status": sync_state["last_sync_status"],
+            "latest_snapshot": latest_snapshot,
+            "trade_performance": repository.trade_performance_report(account_id=account_id),
+        }
+    return overviews
+
+
+def _build_total_portfolio_overview(accounts_overview: Dict[str, Dict[str, Any]], repository: TradingRepository) -> Dict[str, Any]:
+    cash_by_currency: Dict[str, float] = {}
+    equity_by_currency: Dict[str, float] = {}
+    gross_exposure_by_currency: Dict[str, float] = {}
+    realized_pnl_by_currency: Dict[str, float] = {}
+    unrealized_pnl_by_currency: Dict[str, float] = {}
+    for item in accounts_overview.values():
+        currency = str((item or {}).get("currency") or "KRW").upper()
+        cash_by_currency[currency] = float(cash_by_currency.get(currency, 0.0) + float((item or {}).get("cash", 0.0) or 0.0))
+        equity_by_currency[currency] = float(equity_by_currency.get(currency, 0.0) + float((item or {}).get("equity", 0.0) or 0.0))
+        gross_exposure_by_currency[currency] = float(
+            gross_exposure_by_currency.get(currency, 0.0) + abs(float((item or {}).get("gross_exposure", 0.0) or 0.0))
+        )
+        realized_pnl_by_currency[currency] = float(
+            realized_pnl_by_currency.get(currency, 0.0) + float((item or {}).get("realized_pnl", 0.0) or 0.0)
+        )
+        unrealized_pnl_by_currency[currency] = float(
+            unrealized_pnl_by_currency.get(currency, 0.0) + float((item or {}).get("unrealized_pnl", 0.0) or 0.0)
+        )
+    currencies = [code for code, value in equity_by_currency.items() if abs(float(value)) > 1e-9]
+    single_currency = currencies[0] if len(currencies) == 1 else ""
+    cash = cash_by_currency.get(single_currency, float("nan")) if single_currency else float("nan")
+    equity = equity_by_currency.get(single_currency, float("nan")) if single_currency else float("nan")
+    open_positions = sum(int((item or {}).get("open_positions", 0) or 0) for item in accounts_overview.values())
+    pending_orders = sum(int((item or {}).get("pending_orders", 0) or 0) for item in accounts_overview.values())
+    drawdowns = [
+        float((item or {}).get("drawdown_pct", 0.0) or 0.0)
+        for item in accounts_overview.values()
+        if item is not None
+    ]
+    latest_sync_time = max((str((item or {}).get("last_sync_time") or "") for item in accounts_overview.values()), default="")
+    statuses = {str((item or {}).get("last_sync_status") or "never") for item in accounts_overview.values()}
+    if "failed" in statuses:
+        sync_status = "failed"
+    elif "completed" in statuses:
+        sync_status = "completed"
+    else:
+        sync_status = "never"
+    return {
+        "cash": float(cash),
+        "equity": float(equity),
+        "cash_by_currency": cash_by_currency,
+        "equity_by_currency": equity_by_currency,
+        "gross_exposure_by_currency": gross_exposure_by_currency,
+        "realized_pnl_by_currency": realized_pnl_by_currency,
+        "unrealized_pnl_by_currency": unrealized_pnl_by_currency,
+        "display_currency": single_currency,
+        "drawdown_pct": float(min(drawdowns) if drawdowns else 0.0),
+        "open_positions": int(open_positions),
+        "pending_orders": int(pending_orders),
+        "last_sync_time": latest_sync_time,
+        "last_sync_status": sync_status,
+        "trade_performance": repository.trade_performance_report(),
+        "warning": (
+            "\uc804\uccb4 \ud569\uc0b0 \ubdf0\ub294 \ucc38\uace0\uc6a9\uc774\uba70 \uc8fc\ubb38 \uac00\ub2a5 \uc794\uace0 \uae30\uc900\uc774 \uc544\ub2d9\ub2c8\ub2e4."
+            " \ub2ec\ub7ec/\uc6d0\ud654 \ud63c\uc6a9 \uacc4\uc88c\ub294 \ubd88\ub7ec\uc628 FX \uae30\uc900\uc73c\ub85c\ub9cc \ud45c\uc2dc\ud574\uc57c \ud569\ub2c8\ub2e4."
+        ),
     }
 
 
@@ -205,8 +335,14 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     repository.initialize()
     kis_enabled = _kis_enabled_for_monitor(settings, repository)
     runtime_profile = _runtime_profile_read_model(repository, settings)
+    accounts_overview = _build_accounts_overview(repository)
+    total_portfolio_overview = _build_total_portfolio_overview(accounts_overview, repository)
     summary = repository.dashboard_counts()
     equity_curve = _localize_timestamp_columns(repository.load_account_snapshots(limit=500))
+    equity_curves_by_account = {
+        account_id: _localize_timestamp_columns(repository.load_account_snapshots(limit=200, account_id=account_id)).sort_values("created_at")
+        for account_id in accounts_overview.keys()
+    }
     job_health = _localize_timestamp_columns(repository.recent_job_health(limit=200))
     recent_events = _localize_timestamp_columns(repository.recent_system_events(limit=200))
     today_events = _parse_details(repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=2000))
@@ -248,12 +384,15 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     }
     return {
         "summary": summary,
+        "accounts_overview": accounts_overview,
+        "total_portfolio_overview": total_portfolio_overview,
         "prediction_report": _localize_timestamp_columns(repository.prediction_report(limit=200)),
         "open_positions": _localize_timestamp_columns(repository.open_positions()),
         "open_orders": open_orders,
         "candidate_scans": _localize_timestamp_columns(repository.latest_candidates(limit=100)),
         "asset_overview": build_asset_overview(settings, kis_enabled=kis_enabled),
         "equity_curve": equity_curve.sort_values("created_at") if not equity_curve.empty else pd.DataFrame(),
+        "equity_curves_by_account": equity_curves_by_account,
         "job_health": job_health,
         "recent_errors": _localize_timestamp_columns(repository.recent_system_events(level="ERROR", limit=50)),
         "recent_events": recent_events,

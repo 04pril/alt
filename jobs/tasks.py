@@ -52,7 +52,7 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
     sim_broker = PaperBroker(settings, repository)
     kis_broker = KISPaperBroker(settings, repository, sim_broker)
     paper_broker = BrokerRouter(sim_broker=sim_broker, kis_broker=kis_broker)
-    risk_engine = RiskEngine(settings, repository)
+    risk_engine = RiskEngine(settings, repository, account_resolver=paper_broker.resolve_execution_context)
     portfolio_manager = PortfolioManager(settings, repository, paper_broker)
     universe_scanner = UniverseScanner(settings, repository, market_data_service, signal_engine)
     outcome_resolver = OutcomeResolver(repository, market_data_service)
@@ -81,7 +81,10 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
 
 
 def _rebuild_signal(context: TaskContext, candidate_row: pd.Series) -> SignalDecision | None:
-    predictions = context.repository.prediction_by_scan(str(candidate_row["scan_id"]))
+    predictions = context.repository.prediction_by_scan(
+        str(candidate_row["scan_id"]),
+        execution_account_id=str(candidate_row.get("execution_account_id") or ""),
+    )
     if predictions.empty:
         return None
     pred = predictions.iloc[0]
@@ -113,7 +116,14 @@ def _rebuild_signal(context: TaskContext, candidate_row: pd.Series) -> SignalDec
 
 
 def _execution_event(context: TaskContext, event_type: str, message: str, details: Dict[str, Any], *, level: str = "INFO") -> None:
-    context.repository.log_event(level, "execution_pipeline", event_type, message, details)
+    context.repository.log_event(
+        level,
+        "execution_pipeline",
+        event_type,
+        message,
+        details,
+        account_id=str(details.get("account_id") or details.get("execution_account_id") or ""),
+    )
 
 
 def _record_noop(context: TaskContext, asset_type: str, reason: str, details: Dict[str, Any] | None = None) -> None:
@@ -161,8 +171,6 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
 
         count = 0
         detailed_no_trade_reason_logged = False
-        open_positions = context.repository.open_positions()
-        corr_symbols = list(open_positions["symbol"].astype(str).tolist()) if not open_positions.empty else []
         for _, candidate in latest.iterrows():
             context.touch_runtime("entry_candidate", {"asset_type": asset_type, "symbol": str(candidate["symbol"])})
             _execution_event(
@@ -171,6 +179,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
                 "candidate considered for execution",
                 {
                     "asset_type": asset_type,
+                    "account_id": str(candidate.get("execution_account_id") or ""),
                     "symbol": str(candidate["symbol"]),
                     "scan_id": str(candidate["scan_id"]),
                     "rank": int(candidate["rank"]),
@@ -180,8 +189,21 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             signal = _rebuild_signal(context, candidate)
             if signal is None:
                 detailed_no_trade_reason_logged = True
-                _execution_event(context, "entry_rejected", "candidate missing prediction", {"symbol": str(candidate["symbol"]), "reason": "missing_prediction", "scan_id": str(candidate["scan_id"])})
+                _execution_event(
+                    context,
+                    "entry_rejected",
+                    "candidate missing prediction",
+                    {
+                        "symbol": str(candidate["symbol"]),
+                        "reason": "missing_prediction",
+                        "scan_id": str(candidate["scan_id"]),
+                        "account_id": str(candidate.get("execution_account_id") or ""),
+                    },
+                )
                 continue
+            account_id = context.paper_broker.resolve_execution_account_id(signal.symbol, signal.asset_type)
+            open_positions = context.repository.open_positions(account_id=account_id)
+            corr_symbols = list(open_positions["symbol"].astype(str).tolist()) if not open_positions.empty else []
             correlation_matrix = (
                 context.market_data_service.correlation_matrix(
                     symbols=list(set(corr_symbols + [signal.symbol])),
@@ -199,7 +221,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
                     context,
                     "entry_rejected",
                     "risk gate rejected candidate",
-                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": risk_decision.reason, "scan_id": signal.scan_id},
+                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": risk_decision.reason, "scan_id": signal.scan_id, "account_id": account_id},
                 )
                 continue
 
@@ -207,7 +229,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
                 context,
                 "entry_allowed",
                 "entry passed risk gate",
-                {"symbol": signal.symbol, "asset_type": asset_type, "quantity": int(risk_decision.quantity), "scan_id": signal.scan_id},
+                {"symbol": signal.symbol, "asset_type": asset_type, "quantity": int(risk_decision.quantity), "scan_id": signal.scan_id, "account_id": account_id},
             )
             submit = context.paper_broker.submit_entry_order_result(
                 signal=signal,
@@ -221,7 +243,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
                     context,
                     "entry_rejected",
                     "broker pre-submit rejected candidate",
-                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": str(submit.get("reason") or "broker_rejected"), "scan_id": signal.scan_id},
+                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": str(submit.get("reason") or "broker_rejected"), "scan_id": signal.scan_id, "account_id": account_id},
                 )
                 continue
             count += 1

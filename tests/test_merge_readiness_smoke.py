@@ -21,6 +21,7 @@ from jobs.tasks import (
 )
 from kis_paper import KISPaperSnapshot
 from monitoring.dashboard_hooks import build_asset_overview, load_dashboard_data
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 from services.broker_router import BrokerRouter
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
@@ -304,7 +305,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         )
 
         result = self._run_job("broker_account_sync", lambda: broker_account_sync_job(self.fixture.context))
-        latest_kis = self.fixture.repository.latest_account_snapshot(source="kis_account_sync")
+        latest_kis = self.fixture.repository.latest_account_snapshot(account_id=ACCOUNT_KIS_KR_PAPER)
         state = self.fixture.risk_engine._latest_account_state(asset_type=self.fixture.kr_asset_type, symbol="005930.KS")
 
         self.assertIsNotNone(result)
@@ -324,7 +325,10 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self._run_job("broker_account_sync", lambda: broker_account_sync_job(self.fixture.context))
 
         entered = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        orders = self.fixture.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled", "filled"))
+        orders = self.fixture.repository.open_orders(
+            statuses=("submitted", "acknowledged", "pending_fill", "partially_filled", "filled"),
+            account_id=ACCOUNT_KIS_KR_PAPER,
+        )
         self.assertEqual(entered[self.fixture.kr_asset_type], 1)
         self.assertEqual(len(orders), 1)
         order_id = str(orders.iloc[0]["order_id"])
@@ -354,15 +358,16 @@ class MergeReadinessSmokeTest(unittest.TestCase):
 
         with self.fixture.repository.connect() as conn:
             fill_count = int(conn.execute("SELECT COUNT(*) AS cnt FROM fills").fetchone()["cnt"])
-        latest_snapshot = self.fixture.repository.latest_account_snapshot(source="kis_account_sync")
+        latest_snapshot = self.fixture.repository.latest_account_snapshot(account_id=ACCOUNT_KIS_KR_PAPER)
         dashboard_data = self._load_dashboard_data_for_kis()
 
         self.assertGreaterEqual(filled["fills"], 1)
         self.assertEqual(fill_count, 1)
         self.assertEqual(self.fixture.repository.get_order(order_id)["status"], "filled")
-        self.assertFalse(self.fixture.repository.open_positions().empty)
+        self.assertFalse(self.fixture.repository.open_positions(account_id=ACCOUNT_KIS_KR_PAPER).empty)
         self.assertIsNotNone(latest_snapshot)
         self.assertEqual(str(latest_snapshot["source"]), "kis_account_sync")
+        self.assertEqual(str(self.fixture.repository.get_order(order_id)["account_id"]), ACCOUNT_KIS_KR_PAPER)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_submit_requested_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_submitted_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_acknowledged_count"], 1)
@@ -464,7 +469,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
     def test_us_crypto_isolation_smoke(self) -> None:
         self.fixture.repository.insert_account_snapshot(
             AccountSnapshotRecord(
-                snapshot_id="snap_sim",
+                snapshot_id="snap_us",
                 created_at="2099-03-09T05:00:00Z",
                 cash=12_000_000.0,
                 equity=12_500_000.0,
@@ -479,6 +484,27 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 paused=0,
                 source="paper_broker",
                 raw_json="{}",
+                account_id=ACCOUNT_SIM_US_EQUITY,
+            )
+        )
+        self.fixture.repository.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_crypto",
+                created_at="2099-03-09T05:00:30Z",
+                cash=8_000_000.0,
+                equity=8_300_000.0,
+                gross_exposure=300_000.0,
+                net_exposure=300_000.0,
+                realized_pnl=0.0,
+                unrealized_pnl=30_000.0,
+                daily_pnl=0.0,
+                drawdown_pct=-1.5,
+                open_positions=1,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+                raw_json="{}",
+                account_id=ACCOUNT_SIM_CRYPTO,
             )
         )
         self.fixture.repository.insert_account_snapshot(
@@ -498,6 +524,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 paused=0,
                 source="kis_account_sync",
                 raw_json="{}",
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
 
@@ -510,8 +537,10 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertEqual(self.fixture.router.broker_mode_for_asset(self.fixture.us_asset_type, symbol="005930.KS"), "sim")
         self.assertEqual(us_state["cash"], 12_000_000.0)
         self.assertEqual(us_state["equity"], 12_500_000.0)
-        self.assertEqual(crypto_state["cash"], 12_000_000.0)
-        self.assertEqual(crypto_state["equity"], 12_500_000.0)
+        self.assertEqual(us_state["account_id"], ACCOUNT_SIM_US_EQUITY)
+        self.assertEqual(crypto_state["cash"], 8_000_000.0)
+        self.assertEqual(crypto_state["equity"], 8_300_000.0)
+        self.assertEqual(crypto_state["account_id"], ACCOUNT_SIM_CRYPTO)
 
     def test_monitoring_smoke_exposes_sync_and_execution_summary(self) -> None:
         self._insert_candidate_prediction(symbol="005930.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-monitor")
@@ -529,12 +558,18 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertIn("execution_summary", data)
         self.assertIn("kis_runtime", data)
         self.assertIn("runtime_profile", data)
+        self.assertIn("accounts_overview", data)
+        self.assertIn("total_portfolio_overview", data)
         self.assertFalse(data["broker_sync_status"].empty)
         self.assertTrue(data["broker_sync_errors"].empty)
         self.assertEqual(set(data["broker_sync_status"]["job_name"]), {"broker_account_sync", "broker_order_sync", "broker_position_sync", "broker_market_status"})
         self.assertEqual(broker_modes[self.fixture.kr_asset_type], "kis_mock")
         self.assertEqual(broker_modes[self.fixture.us_asset_type], "sim")
         self.assertEqual(broker_modes[self.fixture.crypto_asset_type], "sim")
+        self.assertIn(ACCOUNT_KIS_KR_PAPER, data["accounts_overview"])
+        self.assertIn(ACCOUNT_SIM_US_EQUITY, data["accounts_overview"])
+        self.assertIn(ACCOUNT_SIM_CRYPTO, data["accounts_overview"])
+        self.assertIn("warning", data["total_portfolio_overview"])
         self.assertTrue({"last_broker_account_sync", "last_broker_order_sync", "last_websocket_execution_event", "pending_submitted_orders", "broker_rejects_today"} <= set(data["kis_runtime"].keys()))
         self.assertGreaterEqual(data["execution_summary"]["today_candidate_count"], 1)
 

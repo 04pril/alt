@@ -32,18 +32,32 @@ Candidate -> Risk Gate -> Broker Preflight -> Submit -> Ack/Pending/Fill/Reject
                                               +-> PaperBroker (sim)
                                               +-> KISPaperBroker (KR mock)
 
-Orders -> Fills -> Positions -> Account Snapshots
+Orders -> Fills -> Positions -> Account Snapshots(account_id scoped)
 Predictions -> Outcome Resolver -> Outcomes -> Evaluations
 Job Runs + System Events + Account Snapshots -> Monitoring
 ```
 
-`account_snapshots` in `storage/repository.py` remain the canonical account-state ledger.
+`account_snapshots` in `storage/repository.py` remain the canonical account-state ledger, but the canonical key is now the execution account, not the event source.
 
-- sim broker snapshots are written with sim-oriented sources such as `paper_broker`
-- KIS account sync writes `source=kis_account_sync` rows into the same table
-- `RiskEngine` reads `kis_account_sync` for KR execution paths and sim-only snapshots for US equities / crypto
-- KR drawdown peaks are computed from `kis_account_sync` rows only, while sim drawdown peaks exclude `kis_account_sync`
-- this keeps KIS buying power, persisted account state, and risk gating aligned
+Execution accounts:
+
+- `kis_kr_paper`
+- `sim_us_equity`
+- `sim_crypto`
+
+Account policy:
+
+- KR equities + KR symbols -> `broker_mode=kis_mock`, `account_id=kis_kr_paper`
+- US equities -> `broker_mode=sim`, `account_id=sim_us_equity`
+- crypto -> `broker_mode=sim`, `account_id=sim_crypto`
+
+Design rules:
+
+- `orders`, `fills`, `positions`, `account_snapshots`, and execution events are written with `account_id`
+- `predictions` and `candidate_scans` keep `execution_account_id`
+- `source` remains provenance metadata only
+- `RiskEngine` always reads account-scoped snapshots, pending orders, positions, cooldowns, and drawdown peaks
+- total portfolio aggregation is read-only reference data and is never used for buying power or risk gating
 
 ## Execution Assurance Pipeline
 
@@ -195,6 +209,23 @@ The worker writes the loaded runtime profile name/source into control flags, and
 
 It exposes:
 
+- `accounts_overview`
+  - `kis_kr_paper`
+  - `sim_us_equity`
+  - `sim_crypto`
+- per account:
+  - `cash`
+  - `equity`
+  - `drawdown_pct`
+  - `open_positions`
+  - `pending_orders`
+  - `broker_mode`
+  - `last_sync_time`
+  - `last_sync_status`
+- `total_portfolio_overview`
+  - read-only aggregate summary
+  - currency buckets stay separate unless the UI converts them explicitly
+  - must be labeled as "not orderable buying power"
 - today candidate / allowed / rejected / submit requested / submitted / acknowledged / filled / rejected / cancelled / noop counts
 - noop reason breakdown
 - latest broker sync statuses
@@ -213,6 +244,13 @@ Runtime accounting uses these definitions consistently:
 - `drawdown_pct`: drawdown versus peak account equity
 
 `unrealized_pnl` is not added on top of market value a second time.
+
+Account-level rules:
+
+- drawdown peaks are tracked per `account_id`
+- KR KIS cash/equity/positions never mix with US equity sim or crypto sim
+- USD accounts remain USD in the ledger
+- dashboards may convert USD to KRW for display only, and must keep the original currency visible
 
 ## Local Run
 
@@ -271,18 +309,24 @@ Execution assurance coverage includes:
 - Reservation orders are not wired into the worker yet.
 - KR daily pre-close gating is still schedule-based, not exchange-calendar-perfect.
 - US equities and crypto still use the sim broker path.
+- legacy rows without `account_id` are backfilled during migration, but very old mixed sim snapshots can only be mapped conservatively to `sim_legacy_mixed` when asset type is unavailable.
 
 ## Final Merge Note
 
 - Merge recommendation: `go`
 - Recommended default profile: `balanced`
-- Broker policy: `한국주식 + KR 심볼 -> kis_mock`, `미국주식/코인 -> sim`
+- Broker policy:
+  - `한국주식 + KR 심볼 -> kis_mock -> kis_kr_paper`
+  - `미국주식 -> sim -> sim_us_equity`
+  - `코인 -> sim -> sim_crypto`
 - Canonical ledger: `account_snapshots`
-  - KR risk path -> `kis_account_sync` first
-  - US/crypto risk path -> sim-only snapshots
+  - canonical scope is `account_id`
+  - `source` is metadata, not routing or risk identity
+  - total portfolio view is reference-only
 
 Manual pre-merge checks:
 
 1. Start the worker with the balanced profile and confirm `runtime_profile_name=balanced` and the same value in the monitoring read model.
-2. Verify one KR candidate flows through `broker_account_sync -> candidate -> entry_allowed -> submit_requested -> submitted/acknowledged -> filled` with matching order/fill/position rows.
-3. Confirm operations monitoring still shows `한국주식=kis_mock`, `미국주식=sim`, `코인=sim` and `broker_sync_errors=0` on a healthy path.
+2. Verify one KR candidate flows through `broker_account_sync -> candidate -> entry_allowed -> submit_requested -> submitted/acknowledged -> filled` with matching `account_id=kis_kr_paper` order/fill/position rows.
+3. Verify US equity rows land in `sim_us_equity` and crypto rows land in `sim_crypto` with independent cash/equity/drawdown.
+4. Confirm operations monitoring shows per-account cards first and labels the total portfolio view as reference-only.

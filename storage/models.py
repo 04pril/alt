@@ -36,6 +36,7 @@ class PredictionRecord:
     status: str = 'unresolved'
     scan_id: str | None = None
     notes: str = ''
+    execution_account_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -96,6 +97,7 @@ class CandidateScanRecord:
     cooldown_until: str | None = None
     is_holding: int = 0
     raw_json: str = '{}'
+    execution_account_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -124,6 +126,7 @@ class OrderRecord:
     broker_order_id: str = ''
     error_message: str = ''
     raw_json: str = '{}'
+    account_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -139,6 +142,7 @@ class FillRecord:
     slippage_bps: float
     status: str
     raw_json: str = '{}'
+    account_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -169,6 +173,7 @@ class PositionRecord:
     strategy_version: str
     cooldown_until: str | None = None
     notes: str = ''
+    account_id: str = ''
 
 
 @dataclass(frozen=True)
@@ -188,6 +193,18 @@ class AccountSnapshotRecord:
     paused: int
     source: str
     raw_json: str = '{}'
+    account_id: str = ''
+
+
+@dataclass(frozen=True)
+class BrokerAccountRecord:
+    account_id: str
+    broker_mode: str
+    asset_scope: str
+    currency: str
+    display_name: str
+    is_active: int
+    metadata_json: str = '{}'
 
 
 @dataclass(frozen=True)
@@ -222,6 +239,7 @@ class SystemEventRecord:
     event_type: str
     message: str
     details_json: str = '{}'
+    account_id: str = ''
 
 
 @dataclass(frozen=True)

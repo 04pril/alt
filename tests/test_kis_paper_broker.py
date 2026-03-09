@@ -8,6 +8,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from kis_paper import KISPaperSnapshot
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER
 from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 from services.risk_engine import RiskEngine
@@ -137,8 +138,10 @@ class KISPaperBrokerTest(unittest.TestCase):
         order = self.repo.get_order(result["order_id"])
         self.assertTrue(result["submitted"])
         self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(result["account_id"], ACCOUNT_KIS_KR_PAPER)
         self.assertEqual(self.client.place_calls, 1)
         self.assertEqual(order["status"], "acknowledged")
+        self.assertEqual(order["account_id"], ACCOUNT_KIS_KR_PAPER)
 
     def test_market_closed_does_not_submit(self) -> None:
         market = _FakeMarketDataService(market_open=False, pre_close=False)
@@ -203,7 +206,7 @@ class KISPaperBrokerTest(unittest.TestCase):
         second = self.broker.sync_orders(self.market)
         self.assertEqual(second["fills"], 1)
         self.assertEqual(self.repo.get_order(order_id)["status"], "filled")
-        self.assertEqual(int(self.repo.open_positions().iloc[0]["quantity"]), 2)
+        self.assertEqual(int(self.repo.open_positions(account_id=ACCOUNT_KIS_KR_PAPER).iloc[0]["quantity"]), 2)
 
         third = self.broker.sync_orders(self.market)
         self.assertEqual(third["fills"], 0)
@@ -254,12 +257,14 @@ class KISPaperBrokerTest(unittest.TestCase):
             ]
         )
         sync = self.broker.sync_account()
-        latest = self.repo.latest_account_snapshot()
+        latest = self.repo.latest_account_snapshot(account_id=ACCOUNT_KIS_KR_PAPER)
         engine = RiskEngine(self.settings, self.repo)
         state = engine._latest_account_state(asset_type="한국주식", symbol="005930.KS")
 
         self.assertTrue(sync["enabled"])
+        self.assertEqual(sync["account_id"], ACCOUNT_KIS_KR_PAPER)
         self.assertEqual(str(latest["source"]), "kis_account_sync")
+        self.assertEqual(str(latest["account_id"]), ACCOUNT_KIS_KR_PAPER)
         self.assertEqual(float(latest["cash"]), 30_000_000.0)
         self.assertEqual(float(latest["equity"]), 30_720_000.0)
         self.assertEqual(float(latest["gross_exposure"]), 720_000.0)

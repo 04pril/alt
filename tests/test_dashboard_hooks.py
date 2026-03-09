@@ -11,6 +11,8 @@ from monitoring.dashboard_hooks import (
     load_dashboard_data,
     load_monitor_open_positions,
 )
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
+from storage.models import AccountSnapshotRecord
 from storage.repository import TradingRepository
 
 
@@ -54,6 +56,8 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("broker_sync_errors", data)
             self.assertIn("runtime_profile", data)
             self.assertIn("kis_runtime", data)
+            self.assertIn("accounts_overview", data)
+            self.assertIn("total_portfolio_overview", data)
 
     def test_asset_overview_contains_expected_broker_modes(self) -> None:
         settings = RuntimeSettings()
@@ -206,6 +210,82 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(len(frame), 1)
             self.assertEqual(str(frame.iloc[0]["symbol"]), "005930.KS")
             self.assertEqual(frame.iloc[0]["updated_at"].strftime("%Y-%m-%d %H:%M:%S"), "2026-03-09 10:05:00")
+
+    def test_dashboard_reader_builds_account_cards_and_read_only_total(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            rows = [
+                AccountSnapshotRecord(
+                    snapshot_id="snap_kis",
+                    created_at="2026-03-09T09:00:00Z",
+                    cash=30_000_000.0,
+                    equity=30_500_000.0,
+                    gross_exposure=500_000.0,
+                    net_exposure=500_000.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=20_000.0,
+                    daily_pnl=20_000.0,
+                    drawdown_pct=-0.5,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="kis_account_sync",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                ),
+                AccountSnapshotRecord(
+                    snapshot_id="snap_us",
+                    created_at="2026-03-09T09:01:00Z",
+                    cash=10_000.0,
+                    equity=10_500.0,
+                    gross_exposure=500.0,
+                    net_exposure=500.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=100.0,
+                    daily_pnl=100.0,
+                    drawdown_pct=-1.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
+                ),
+                AccountSnapshotRecord(
+                    snapshot_id="snap_crypto",
+                    created_at="2026-03-09T09:02:00Z",
+                    cash=5_000.0,
+                    equity=5_250.0,
+                    gross_exposure=250.0,
+                    net_exposure=250.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=50.0,
+                    daily_pnl=50.0,
+                    drawdown_pct=-2.0,
+                    open_positions=1,
+                    open_orders=0,
+                    paused=0,
+                    source="paper_broker",
+                    account_id=ACCOUNT_SIM_CRYPTO,
+                ),
+            ]
+            for row in rows:
+                repo.insert_account_snapshot(row)
+
+            data = load_dashboard_data(settings)
+            accounts = data["accounts_overview"]
+            total = data["total_portfolio_overview"]
+
+            self.assertEqual(set(accounts.keys()), {ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO})
+            self.assertEqual(accounts[ACCOUNT_KIS_KR_PAPER]["currency"], "KRW")
+            self.assertEqual(accounts[ACCOUNT_SIM_US_EQUITY]["currency"], "USD")
+            self.assertEqual(accounts[ACCOUNT_SIM_CRYPTO]["currency"], "USD")
+            self.assertEqual(accounts[ACCOUNT_SIM_US_EQUITY]["open_positions"], 0)
+            self.assertTrue(str(total["warning"]).startswith("전체 합산 뷰"))
+            self.assertTrue(str(total["display_currency"]) in {"", "KRW", "USD"})
+            self.assertEqual(total["equity_by_currency"]["KRW"], 30_500_000.0)
+            self.assertEqual(total["equity_by_currency"]["USD"], 15_750.0)
 
 
 if __name__ == "__main__":

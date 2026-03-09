@@ -11,6 +11,15 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from runtime_accounts import (
+    ACCOUNT_KIS_KR_PAPER,
+    ACCOUNT_SIM_CRYPTO,
+    ACCOUNT_SIM_LEGACY_MIXED,
+    ACCOUNT_SIM_US_EQUITY,
+    BROKER_MODE_SIM,
+    get_account_metadata,
+    resolve_execution_account,
+)
 from services.market_data_service import MarketDataService
 from services.signal_engine import SignalDecision
 from storage.models import AccountSnapshotRecord, FillRecord, OrderRecord, PositionRecord
@@ -18,42 +27,78 @@ from storage.repository import TradingRepository, make_id, utc_now_iso
 
 
 class PaperBroker:
-    SIM_ONLY_EXCLUDED_SOURCES = ("kis_account_sync",)
-
     def __init__(self, settings: RuntimeSettings, repository: TradingRepository):
         self.settings = settings
         self.repository = repository
 
-    def ensure_account_initialized(self) -> None:
-        if self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) is not None:
-            return
-        self.repository.insert_account_snapshot(
-            AccountSnapshotRecord(
-                snapshot_id=make_id("snap"),
-                created_at=utc_now_iso(),
-                cash=self.settings.risk.starting_cash,
-                equity=self.settings.risk.starting_cash,
-                gross_exposure=0.0,
-                net_exposure=0.0,
-                realized_pnl=0.0,
-                unrealized_pnl=0.0,
-                daily_pnl=0.0,
-                drawdown_pct=0.0,
-                open_positions=0,
-                open_orders=0,
-                paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
-                source="bootstrap",
-                raw_json="{}",
-            )
-        )
+    def _sim_account_ids(self) -> list[str]:
+        accounts = self.repository.load_broker_accounts(active_only=True)
+        if accounts.empty:
+            return [ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO]
+        filtered = accounts.loc[
+            (accounts["broker_mode"].astype(str) == BROKER_MODE_SIM)
+            & (accounts["account_id"].astype(str) != ACCOUNT_SIM_LEGACY_MIXED)
+        ]
+        values = filtered["account_id"].astype(str).tolist()
+        return values or [ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO]
 
-    def _latest_account(self) -> Dict[str, Any]:
-        self.ensure_account_initialized()
-        return self.repository.latest_account_snapshot(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES) or {}
+    def _allocation_weight(self, account_id: str) -> float:
+        account = self.repository.get_broker_account(account_id) or {}
+        metadata = self.repository._parse_json_payload(account.get("metadata_json") or get_account_metadata(account_id))
+        weight = float(pd.to_numeric(pd.Series([metadata.get("bootstrap_cash_allocation")]), errors="coerce").iloc[0] or 0.0)
+        return weight if np.isfinite(weight) and weight > 0 else 0.0
+
+    def _bootstrap_account_cash(self, account_id: str) -> float:
+        legacy = self.repository.latest_account_snapshot(account_id=ACCOUNT_SIM_LEGACY_MIXED) or {}
+        pool_cash = float(legacy.get("cash", self.settings.risk.starting_cash))
+        account_ids = self._sim_account_ids()
+        weights = {item: self._allocation_weight(item) for item in account_ids}
+        total_weight = sum(value for value in weights.values() if value > 0)
+        if total_weight > 0 and account_id in weights:
+            return float(pool_cash * (weights[account_id] / total_weight))
+        divisor = max(len(account_ids), 1)
+        return float(pool_cash / divisor)
+
+    def _resolve_account_id(self, *, symbol: str = "", asset_type: str = "", account_id: str | None = None) -> str:
+        if account_id:
+            return str(account_id)
+        return resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=False).account_id
+
+    def ensure_account_initialized(self, account_id: str | None = None) -> None:
+        target_ids = [str(account_id)] if account_id else self._sim_account_ids()
+        for target_id in target_ids:
+            if self.repository.latest_account_snapshot(account_id=target_id) is not None:
+                continue
+            bootstrap_cash = self._bootstrap_account_cash(target_id)
+            self.repository.insert_account_snapshot(
+                AccountSnapshotRecord(
+                    snapshot_id=make_id("snap"),
+                    created_at=utc_now_iso(),
+                    cash=bootstrap_cash,
+                    equity=bootstrap_cash,
+                    gross_exposure=0.0,
+                    net_exposure=0.0,
+                    realized_pnl=0.0,
+                    unrealized_pnl=0.0,
+                    daily_pnl=0.0,
+                    drawdown_pct=0.0,
+                    open_positions=0,
+                    open_orders=0,
+                    paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
+                    source="bootstrap",
+                    raw_json=json.dumps({"account_id": target_id, "broker": BROKER_MODE_SIM}, ensure_ascii=False),
+                    account_id=target_id,
+                )
+            )
+
+    def _latest_account(self, account_id: str) -> Dict[str, Any]:
+        self.ensure_account_initialized(account_id)
+        return self.repository.latest_account_snapshot(account_id=account_id) or {}
 
     def _store_account_snapshot(
         self,
         *,
+        account_id: str,
         cash: float,
         equity: float,
         gross_exposure: float,
@@ -68,10 +113,13 @@ class PaperBroker:
         touch=None,
     ) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
-        if str(source) == "kis_account_sync":
-            peak_source = float(self.repository.max_account_equity(source="kis_account_sync"))
-        else:
-            peak_source = float(self.repository.max_account_equity(exclude_sources=self.SIM_ONLY_EXCLUDED_SOURCES))
+        payload = self.repository._parse_json_payload(raw_json)
+        payload.setdefault("account_id", account_id)
+        if str(payload.get("broker") or "").strip() == "":
+            payload["broker"] = BROKER_MODE_SIM
+        peak_source = float(self.repository.max_account_equity(account_id=account_id))
+        if peak_source <= 0.0 and account_id != ACCOUNT_SIM_LEGACY_MIXED:
+            peak_source = float(self.repository.max_account_equity(account_id=ACCOUNT_SIM_LEGACY_MIXED))
         peak = max(peak_source, float(equity))
         drawdown_pct = (equity / peak - 1.0) * 100.0 if peak > 0 else 0.0
         record = AccountSnapshotRecord(
@@ -89,12 +137,14 @@ class PaperBroker:
             open_orders=int(open_orders),
             paused=int(self.repository.get_control_flag("trading_paused", "0") == "1"),
             source=source,
-            raw_json=raw_json,
+            raw_json=json.dumps(payload, ensure_ascii=False),
+            account_id=account_id,
         )
         self.repository.insert_account_snapshot(record)
         touch(
             "account_snapshot_stored",
             {
+                "account_id": account_id,
                 "source": source,
                 "equity": float(equity),
                 "cash": float(cash),
@@ -116,11 +166,13 @@ class PaperBroker:
             "open_positions": record.open_positions,
             "open_orders": record.open_orders,
             "source": record.source,
+            "account_id": record.account_id,
         }
 
     def record_external_account_snapshot(
         self,
         *,
+        account_id: str = "",
         cash: float,
         equity: float,
         gross_exposure: float,
@@ -132,12 +184,14 @@ class PaperBroker:
         touch=None,
     ) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
-        touch("external_account_snapshot_start", {"source": source})
-        realized = self.repository.total_realized_pnl()
+        resolved_account_id = str(account_id or (ACCOUNT_KIS_KR_PAPER if str(source) == "kis_account_sync" else ACCOUNT_SIM_US_EQUITY))
+        touch("external_account_snapshot_start", {"source": source, "account_id": resolved_account_id})
+        realized = self.repository.total_realized_pnl(account_id=resolved_account_id)
         today = str(pd.Timestamp.utcnow().date())
-        daily_pnl = self.repository.recent_closed_realized_pnl(today)
-        open_order_count = int(len(self.repository.open_orders()))
+        daily_pnl = self.repository.recent_closed_realized_pnl(today, account_id=resolved_account_id)
+        open_order_count = int(len(self.repository.open_orders(account_id=resolved_account_id)))
         return self._store_account_snapshot(
+            account_id=resolved_account_id,
             cash=float(cash),
             equity=float(equity),
             gross_exposure=float(gross_exposure),
@@ -193,10 +247,37 @@ class PaperBroker:
             remaining -= 1
         return cursor.tz_convert("UTC").isoformat()
 
-    def submit_entry_order(self, signal: SignalDecision, quantity: int, scan_id: str | None = None) -> str:
+    def preflight_entry(
+        self,
+        signal: SignalDecision,
+        quantity: int,
+        market_data_service: MarketDataService | None = None,
+        *,
+        account_id: str | None = None,
+    ) -> Dict[str, Any]:
+        resolved_account_id = self._resolve_account_id(symbol=signal.symbol, asset_type=signal.asset_type, account_id=account_id)
+        account = self._latest_account(resolved_account_id)
+        return {
+            "allowed": True,
+            "reason": "ok",
+            "broker": BROKER_MODE_SIM,
+            "account_id": resolved_account_id,
+            "cash": float(account.get("cash", self._bootstrap_account_cash(resolved_account_id))),
+            "requested_qty": int(quantity),
+        }
+
+    def submit_entry_order(
+        self,
+        signal: SignalDecision,
+        quantity: int,
+        scan_id: str | None = None,
+        *,
+        account_id: str | None = None,
+    ) -> str:
         now_iso = utc_now_iso()
         order_id = make_id("ord")
         side = "buy" if signal.signal == "LONG" else "sell"
+        resolved_account_id = self._resolve_account_id(symbol=signal.symbol, asset_type=signal.asset_type, account_id=account_id)
         max_holding_until = (
             pd.Timestamp.now(tz="UTC") + self._timeframe_delta(signal.timeframe) * int(self.settings.strategy.max_holding_bars)
         ).isoformat()
@@ -224,7 +305,8 @@ class PaperBroker:
             reason="entry",
             raw_json=json.dumps(
                 {
-                    "broker": "sim",
+                    "broker": BROKER_MODE_SIM,
+                    "account_id": resolved_account_id,
                     "prediction_id": signal.prediction_id,
                     "stop_level": signal.stop_level,
                     "take_level": signal.take_level,
@@ -234,6 +316,7 @@ class PaperBroker:
                 },
                 ensure_ascii=False,
             ),
+            account_id=resolved_account_id,
         )
         self.repository.insert_order(record)
         return order_id
@@ -244,17 +327,45 @@ class PaperBroker:
         quantity: int,
         scan_id: str | None = None,
         *,
+        account_id: str | None = None,
         market_data_service: MarketDataService | None = None,
     ) -> Dict[str, Any]:
-        order_id = self.submit_entry_order(signal, quantity, scan_id)
-        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim entry submit requested", {"order_id": order_id, "symbol": signal.symbol})
-        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim entry submitted", {"order_id": order_id, "symbol": signal.symbol})
-        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
+        resolved_account_id = self._resolve_account_id(symbol=signal.symbol, asset_type=signal.asset_type, account_id=account_id)
+        order_id = self.submit_entry_order(signal, quantity, scan_id, account_id=resolved_account_id)
+        self.repository.log_event(
+            "INFO",
+            "execution_pipeline",
+            "submit_requested",
+            "sim entry submit requested",
+            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id},
+            account_id=resolved_account_id,
+        )
+        self.repository.log_event(
+            "INFO",
+            "execution_pipeline",
+            "submitted",
+            "sim entry submitted",
+            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id},
+            account_id=resolved_account_id,
+        )
+        return {
+            "submitted": True,
+            "status": "new",
+            "reason": "ok",
+            "broker": BROKER_MODE_SIM,
+            "order_id": order_id,
+            "account_id": resolved_account_id,
+        }
 
-    def submit_exit_order(self, position: pd.Series, reason: str) -> str:
+    def submit_exit_order(self, position: pd.Series, reason: str, *, account_id: str | None = None) -> str:
         now_iso = utc_now_iso()
         order_id = make_id("ord")
         side = "sell" if str(position["side"]) == "LONG" else "buy"
+        resolved_account_id = self._resolve_account_id(
+            symbol=str(position["symbol"]),
+            asset_type=str(position["asset_type"]),
+            account_id=account_id or str(position.get("account_id") or ""),
+        )
         record = OrderRecord(
             order_id=order_id,
             created_at=now_iso,
@@ -279,11 +390,13 @@ class PaperBroker:
             reason=reason,
             raw_json=json.dumps(
                 {
-                    "broker": "sim",
+                    "broker": BROKER_MODE_SIM,
+                    "account_id": resolved_account_id,
                     "position_id": str(position["position_id"]),
                 },
                 ensure_ascii=False,
             ),
+            account_id=resolved_account_id,
         )
         self.repository.insert_order(record)
         return order_id
@@ -293,12 +406,39 @@ class PaperBroker:
         position: pd.Series,
         reason: str,
         *,
+        account_id: str | None = None,
         market_data_service: MarketDataService | None = None,
     ) -> Dict[str, Any]:
-        order_id = self.submit_exit_order(position, reason)
-        self.repository.log_event("INFO", "execution_pipeline", "submit_requested", "sim exit submit requested", {"order_id": order_id, "symbol": str(position["symbol"])})
-        self.repository.log_event("INFO", "execution_pipeline", "submitted", "sim exit submitted", {"order_id": order_id, "symbol": str(position["symbol"])})
-        return {"submitted": True, "status": "new", "reason": "ok", "broker": "sim", "order_id": order_id}
+        resolved_account_id = self._resolve_account_id(
+            symbol=str(position["symbol"]),
+            asset_type=str(position["asset_type"]),
+            account_id=account_id or str(position.get("account_id") or ""),
+        )
+        order_id = self.submit_exit_order(position, reason, account_id=resolved_account_id)
+        self.repository.log_event(
+            "INFO",
+            "execution_pipeline",
+            "submit_requested",
+            "sim exit submit requested",
+            {"order_id": order_id, "symbol": str(position["symbol"]), "account_id": resolved_account_id},
+            account_id=resolved_account_id,
+        )
+        self.repository.log_event(
+            "INFO",
+            "execution_pipeline",
+            "submitted",
+            "sim exit submitted",
+            {"order_id": order_id, "symbol": str(position["symbol"]), "account_id": resolved_account_id},
+            account_id=resolved_account_id,
+        )
+        return {
+            "submitted": True,
+            "status": "new",
+            "reason": "ok",
+            "broker": BROKER_MODE_SIM,
+            "order_id": order_id,
+            "account_id": resolved_account_id,
+        }
 
     def _slippage_price(self, side: str, price: float, volatility: float) -> float:
         bps = self.settings.broker.base_slippage_bps + max(volatility, 0.0) * 10000.0 * self.settings.broker.volatility_slippage_mult
@@ -313,7 +453,12 @@ class PaperBroker:
         return min(requested_qty, max_qty)
 
     def _update_position_from_fill(self, order: pd.Series, fill_qty: int, fill_price: float, fees: float) -> None:
-        latest = self.repository.latest_position_by_symbol(symbol=str(order["symbol"]), timeframe=str(order["timeframe"]))
+        account_id = str(order.get("account_id") or self._resolve_account_id(symbol=str(order["symbol"]), asset_type=str(order["asset_type"])))
+        latest = self.repository.latest_position_by_symbol(
+            symbol=str(order["symbol"]),
+            timeframe=str(order["timeframe"]),
+            account_id=account_id,
+        )
         now_iso = utc_now_iso()
         side = self._position_side_from_order(str(order["side"]))
         order_meta = json.loads(str(order.get("raw_json") or "{}"))
@@ -346,6 +491,7 @@ class PaperBroker:
                     strategy_version=str(order_meta.get("strategy_version") or order["strategy_version"]),
                     cooldown_until=None,
                     notes="opened_by_fill",
+                    account_id=account_id,
                 )
             )
             return
@@ -375,6 +521,7 @@ class PaperBroker:
                         "unrealized_pnl": self._compute_unrealized(position_side, float(avg_price), float(fill_price), int(new_qty)),
                         "exposure_value": self._signed_market_value(position_side, int(new_qty), float(fill_price)),
                         "notes": "scaled_position",
+                        "account_id": account_id,
                     }
                 )
             )
@@ -405,6 +552,7 @@ class PaperBroker:
                             now_iso=now_iso,
                         ),
                         "notes": f"closed_by_{order['reason']}",
+                        "account_id": account_id,
                     }
                 )
             )
@@ -420,6 +568,7 @@ class PaperBroker:
                         "realized_pnl": float(position["realized_pnl"]) + realized,
                         "exposure_value": self._signed_market_value(position_side, int(remaining), float(fill_price)),
                         "notes": "partial_close",
+                        "account_id": account_id,
                     }
                 )
             )
@@ -438,6 +587,7 @@ class PaperBroker:
         if not order_record:
             return False
         order = pd.Series(order_record)
+        account_id = str(order.get("account_id") or self._resolve_account_id(symbol=str(order["symbol"]), asset_type=str(order["asset_type"])))
         remaining_qty = int(order["remaining_qty"])
         applied_qty = min(max(int(fill_qty), 0), remaining_qty)
         if applied_qty <= 0:
@@ -456,6 +606,7 @@ class PaperBroker:
                 slippage_bps=float(order["slippage_bps"]),
                 status="filled",
                 raw_json=json.dumps(raw_json or {}, default=str, ensure_ascii=False),
+                account_id=account_id,
             )
         )
         new_remaining = remaining_qty - applied_qty
@@ -467,14 +618,14 @@ class PaperBroker:
             remaining_qty=new_remaining,
             raw_json={"last_fill_price": float(fill_price), **(raw_json or {})},
         )
-        account = self._latest_account()
-        cash_value = float(account.get("cash", self.settings.risk.starting_cash))
+        account = self._latest_account(account_id)
+        cash_value = float(account.get("cash", self._bootstrap_account_cash(account_id)))
         if str(order["side"]) == "buy":
             cash_value -= applied_qty * fill_price + effective_fees
         else:
             cash_value += applied_qty * fill_price - effective_fees
         self._update_position_from_fill(order=order, fill_qty=applied_qty, fill_price=float(fill_price), fees=float(effective_fees))
-        self.snapshot_account(cash_override=cash_value)
+        self.snapshot_account(cash_override=cash_value, account_id=account_id)
         return True
 
     def process_open_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> int:
@@ -486,11 +637,13 @@ class PaperBroker:
             orders = orders.loc[broker_name.isin({"", "sim"})].copy()
 
         filled_count = 0
-        account = self._latest_account()
-        cash_value = float(account.get("cash", self.settings.risk.starting_cash))
+        cash_overrides: Dict[str, float] = {}
+        touched_accounts: set[str] = set()
         for _, order in orders.iterrows():
+            account_id = str(order.get("account_id") or self._resolve_account_id(symbol=str(order["symbol"]), asset_type=str(order["asset_type"])))
+            touched_accounts.add(account_id)
             if callable(touch):
-                touch("sim_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"])})
+                touch("sim_order_sync", {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "account_id": account_id})
             asset_type = str(order["asset_type"])
             if not market_data_service.is_market_open(asset_type):
                 continue
@@ -524,6 +677,7 @@ class PaperBroker:
                     slippage_bps=float(order["slippage_bps"]),
                     status="filled",
                     raw_json=json.dumps(asdict(quote), default=str, ensure_ascii=False),
+                    account_id=account_id,
                 )
             )
             remaining_qty = requested_qty - fill_qty
@@ -534,10 +688,14 @@ class PaperBroker:
                 remaining_qty=remaining_qty,
                 raw_json={"last_fill_price": fill_price},
             )
+            current_cash = cash_overrides.get(account_id)
+            if current_cash is None:
+                current_cash = float(self._latest_account(account_id).get("cash", self._bootstrap_account_cash(account_id)))
             if str(order["side"]) == "buy":
-                cash_value -= fill_qty * fill_price + fees
+                current_cash -= fill_qty * fill_price + fees
             else:
-                cash_value += fill_qty * fill_price - fees
+                current_cash += fill_qty * fill_price - fees
+            cash_overrides[account_id] = current_cash
             self._update_position_from_fill(order=order, fill_qty=fill_qty, fill_price=fill_price, fees=fees)
             filled_count += 1
             self.repository.log_event(
@@ -545,22 +703,24 @@ class PaperBroker:
                 "execution_pipeline",
                 "filled" if remaining_qty <= 0 else "partially_filled",
                 "sim order filled",
-                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty)},
+                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty), "account_id": account_id},
+                account_id=account_id,
             )
-        self.snapshot_account(cash_override=cash_value)
+        for account_id in touched_accounts:
+            self.snapshot_account(cash_override=cash_overrides.get(account_id), account_id=account_id)
         return filled_count
 
     def sync_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> Dict[str, int]:
         return {"fills": int(self.process_open_orders(market_data_service, touch=touch))}
 
-    def snapshot_account(self, cash_override: float | None = None, touch=None) -> Dict[str, Any]:
+    def _snapshot_single_account(self, account_id: str, cash_override: float | None = None, touch=None) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
-        touch("sim_account_snapshot_start", {"source": "paper_broker"})
-        account = self._latest_account()
-        open_positions = self.repository.open_positions()
-        open_orders = self.repository.open_orders()
-        cash = float(cash_override if cash_override is not None else account.get("cash", self.settings.risk.starting_cash))
-        realized = self.repository.total_realized_pnl()
+        touch("sim_account_snapshot_start", {"source": "paper_broker", "account_id": account_id})
+        account = self._latest_account(account_id)
+        open_positions = self.repository.open_positions(account_id=account_id)
+        open_orders = self.repository.open_orders(account_id=account_id)
+        cash = float(cash_override if cash_override is not None else account.get("cash", self._bootstrap_account_cash(account_id)))
+        realized = self.repository.total_realized_pnl(account_id=account_id)
         unrealized = (
             float(pd.to_numeric(open_positions.get("unrealized_pnl"), errors="coerce").fillna(0.0).sum())
             if not open_positions.empty
@@ -575,10 +735,11 @@ class PaperBroker:
         net_exposure = float(exposures.sum()) if not exposures.empty else 0.0
         equity = cash + net_exposure
         today = str(pd.Timestamp.utcnow().date())
-        daily_pnl = self.repository.recent_closed_realized_pnl(today)
+        daily_pnl = self.repository.recent_closed_realized_pnl(today, account_id=account_id)
         touch(
             "sim_account_snapshot_metrics",
             {
+                "account_id": account_id,
                 "equity": float(equity),
                 "cash": float(cash),
                 "gross_exposure": float(gross_exposure),
@@ -588,6 +749,7 @@ class PaperBroker:
             },
         )
         return self._store_account_snapshot(
+            account_id=account_id,
             cash=float(cash),
             equity=float(equity),
             gross_exposure=float(gross_exposure),
@@ -598,18 +760,47 @@ class PaperBroker:
             open_positions=int(len(open_positions)),
             open_orders=int(len(open_orders)),
             source="paper_broker",
-            raw_json="{}",
+            raw_json=json.dumps({"account_id": account_id, "broker": BROKER_MODE_SIM}, ensure_ascii=False),
             touch=touch,
         )
+
+    def snapshot_account(
+        self,
+        cash_override: float | Dict[str, float] | None = None,
+        *,
+        account_id: str | None = None,
+        touch=None,
+    ) -> Dict[str, Any]:
+        if account_id:
+            override = float(cash_override) if isinstance(cash_override, (int, float)) else None
+            return self._snapshot_single_account(account_id, cash_override=override, touch=touch)
+        if isinstance(cash_override, (int, float)):
+            candidate_ids = []
+            open_positions = self.repository.open_positions()
+            if not open_positions.empty and "account_id" in open_positions.columns:
+                candidate_ids.extend([str(value) for value in open_positions["account_id"].dropna().astype(str).unique().tolist() if str(value).strip()])
+            open_orders = self.repository.open_orders()
+            if not open_orders.empty and "account_id" in open_orders.columns:
+                candidate_ids.extend([str(value) for value in open_orders["account_id"].dropna().astype(str).unique().tolist() if str(value).strip()])
+            unique_ids = list(dict.fromkeys(candidate_ids))
+            if len(unique_ids) == 1:
+                return self._snapshot_single_account(unique_ids[0], cash_override=float(cash_override), touch=touch)
+        snapshots: Dict[str, Any] = {}
+        cash_map = cash_override if isinstance(cash_override, dict) else {}
+        for target_id in self._sim_account_ids():
+            override = cash_map.get(target_id) if isinstance(cash_map, dict) else None
+            snapshots[target_id] = self._snapshot_single_account(target_id, cash_override=override, touch=touch)
+        return snapshots
 
     def sync_account(self, touch=None) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
         touch("sim_account_sync_start", {"broker": "sim"})
-        latest = self._latest_account()
-        touch("sim_account_sync_complete", {"source": str(latest.get("source") or "paper_broker")})
+        snapshots = self.snapshot_account(touch=touch)
+        total_cash = sum(float((summary or {}).get("cash", 0.0) or 0.0) for summary in snapshots.values())
+        touch("sim_account_sync_complete", {"accounts": list(snapshots.keys())})
         return {
             "broker": "sim",
             "enabled": True,
-            "summary": latest,
-            "cash": float(latest.get("cash", self.settings.risk.starting_cash)),
+            "accounts": snapshots,
+            "cash": float(total_cash),
         }

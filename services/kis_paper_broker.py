@@ -9,6 +9,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from kis_paper import KISPaperClient, extract_kis_code
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, BROKER_MODE_KIS
 from services.market_data_service import MarketDataService
 from services.paper_broker import PaperBroker
 from services.signal_engine import SignalDecision
@@ -48,8 +49,18 @@ class KISPaperBroker:
         except Exception:
             return {}
 
-    def _log_state(self, event_type: str, message: str, details: Dict[str, Any], *, level: str = "INFO") -> None:
-        self.repository.log_event(level, "kis_execution", event_type, message, details)
+    def _log_state(
+        self,
+        event_type: str,
+        message: str,
+        details: Dict[str, Any],
+        *,
+        account_id: str = ACCOUNT_KIS_KR_PAPER,
+        level: str = "INFO",
+    ) -> None:
+        payload = dict(details)
+        payload.setdefault("account_id", account_id)
+        self.repository.log_event(level, "kis_execution", event_type, message, payload, account_id=account_id)
 
     def _holding_baseline(self, client: KISPaperClient, symbol_code: str) -> Dict[str, float]:
         snapshot = client.get_account_snapshot()
@@ -111,6 +122,7 @@ class KISPaperBroker:
     def _insert_submitted_order(
         self,
         *,
+        account_id: str,
         symbol: str,
         asset_type: str,
         timeframe: str,
@@ -149,46 +161,55 @@ class KISPaperBroker:
                 strategy_version=strategy_version,
                 reason=reason,
                 raw_json=json.dumps(payload, ensure_ascii=False),
+                account_id=account_id,
             )
         )
         return order_id
 
-    def preflight_entry(self, signal: SignalDecision, quantity: int, market_data_service: MarketDataService) -> Dict[str, Any]:
+    def preflight_entry(
+        self,
+        signal: SignalDecision,
+        quantity: int,
+        market_data_service: MarketDataService,
+        *,
+        account_id: str = ACCOUNT_KIS_KR_PAPER,
+    ) -> Dict[str, Any]:
         asset_type = str(signal.asset_type)
         if not self.is_enabled():
-            return {"allowed": False, "reason": "kis_disabled", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "kis_disabled", "broker": BROKER_MODE_KIS, "account_id": account_id}
         if not market_data_service.is_market_open(asset_type):
-            return {"allowed": False, "reason": "market_closed", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "market_closed", "broker": BROKER_MODE_KIS, "account_id": account_id}
         if self.settings.asset_schedules[asset_type].timeframe == "1d" and not market_data_service.is_pre_close_window(asset_type):
-            return {"allowed": False, "reason": "outside_preclose_window", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "outside_preclose_window", "broker": BROKER_MODE_KIS, "account_id": account_id}
 
         client = self._client()
         quote = client.get_quote(signal.symbol)
         orderbook = client.get_orderbook(signal.symbol)
         market_status = client.get_market_status(signal.symbol)
         if bool(market_status.get("is_halted")):
-            return {"allowed": False, "reason": "market_halted", "broker": "kis_mock", "market_status": market_status}
+            return {"allowed": False, "reason": "market_halted", "broker": BROKER_MODE_KIS, "market_status": market_status, "account_id": account_id}
 
         side = "buy" if signal.signal == "LONG" else "sell"
         exec_price = self._pick_execution_price(quote, orderbook, side)
         if not np.isfinite(exec_price) or exec_price <= 0:
-            return {"allowed": False, "reason": "no_quote", "broker": "kis_mock", "quote": quote, "orderbook": orderbook}
+            return {"allowed": False, "reason": "no_quote", "broker": BROKER_MODE_KIS, "quote": quote, "orderbook": orderbook, "account_id": account_id}
 
-        if not self.repository.active_entry_orders(symbol=signal.symbol, timeframe=signal.timeframe, asset_type=asset_type).empty:
-            return {"allowed": False, "reason": "duplicate_pending_entry", "broker": "kis_mock"}
-        latest_position = self.repository.latest_position_by_symbol(signal.symbol, signal.timeframe)
+        if not self.repository.active_entry_orders(symbol=signal.symbol, timeframe=signal.timeframe, asset_type=asset_type, account_id=account_id).empty:
+            return {"allowed": False, "reason": "duplicate_pending_entry", "broker": BROKER_MODE_KIS, "account_id": account_id}
+        latest_position = self.repository.latest_position_by_symbol(signal.symbol, signal.timeframe, account_id=account_id)
         if not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open":
-            return {"allowed": False, "reason": "already_holding_symbol", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "already_holding_symbol", "broker": BROKER_MODE_KIS, "account_id": account_id}
 
         buying_power = client.get_buying_power(signal.symbol, order_price=exec_price)
         max_buy_qty = int(buying_power.get("cash_buy_qty") or buying_power.get("max_buy_qty") or 0)
         if max_buy_qty < int(quantity):
-            return {"allowed": False, "reason": "insufficient_buying_power", "broker": "kis_mock", "buying_power": buying_power}
+            return {"allowed": False, "reason": "insufficient_buying_power", "broker": BROKER_MODE_KIS, "buying_power": buying_power, "account_id": account_id}
 
         return {
             "allowed": True,
             "reason": "ok",
-            "broker": "kis_mock",
+            "broker": BROKER_MODE_KIS,
+            "account_id": account_id,
             "symbol_code": extract_kis_code(signal.symbol),
             "execution_price": float(exec_price),
             "quote": quote,
@@ -198,22 +219,28 @@ class KISPaperBroker:
             "account_summary": client.get_account_snapshot().summary,
         }
 
-    def preflight_exit(self, position: pd.Series, market_data_service: MarketDataService) -> Dict[str, Any]:
+    def preflight_exit(
+        self,
+        position: pd.Series,
+        market_data_service: MarketDataService,
+        *,
+        account_id: str = ACCOUNT_KIS_KR_PAPER,
+    ) -> Dict[str, Any]:
         asset_type = str(position["asset_type"])
         if not self.is_enabled():
-            return {"allowed": False, "reason": "kis_disabled", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "kis_disabled", "broker": BROKER_MODE_KIS, "account_id": account_id}
         if not market_data_service.is_market_open(asset_type):
-            return {"allowed": False, "reason": "market_closed", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "market_closed", "broker": BROKER_MODE_KIS, "account_id": account_id}
         client = self._client()
         quote = client.get_quote(str(position["symbol"]))
         orderbook = client.get_orderbook(str(position["symbol"]))
         exec_price = self._pick_execution_price(quote, orderbook, "sell")
         if not np.isfinite(exec_price) or exec_price <= 0:
-            return {"allowed": False, "reason": "no_quote", "broker": "kis_mock"}
+            return {"allowed": False, "reason": "no_quote", "broker": BROKER_MODE_KIS, "account_id": account_id}
         sellable = client.get_sellable_quantity(str(position["symbol"]))
         if str(position["side"]) == "LONG" and int(sellable.get("sellable_qty", 0)) < int(position["quantity"]):
-            return {"allowed": False, "reason": "no_sellable_qty", "broker": "kis_mock", "sellable": sellable}
-        return {"allowed": True, "reason": "ok", "broker": "kis_mock", "execution_price": float(exec_price), "sellable": sellable}
+            return {"allowed": False, "reason": "no_sellable_qty", "broker": BROKER_MODE_KIS, "sellable": sellable, "account_id": account_id}
+        return {"allowed": True, "reason": "ok", "broker": BROKER_MODE_KIS, "execution_price": float(exec_price), "sellable": sellable, "account_id": account_id}
 
     def submit_entry_order_result(
         self,
@@ -221,16 +248,22 @@ class KISPaperBroker:
         quantity: int,
         scan_id: str | None = None,
         *,
+        account_id: str = ACCOUNT_KIS_KR_PAPER,
         market_data_service: MarketDataService | None = None,
     ) -> Dict[str, Any]:
-        preflight = self.preflight_entry(signal, quantity, market_data_service) if market_data_service is not None else {"allowed": True}
+        preflight = (
+            self.preflight_entry(signal, quantity, market_data_service, account_id=account_id)
+            if market_data_service is not None
+            else {"allowed": True, "account_id": account_id}
+        )
         if not preflight.get("allowed", False):
             return {
                 "submitted": False,
                 "status": "rejected",
                 "reason": str(preflight.get("reason") or "rejected"),
-                "broker": "kis_mock",
+                "broker": BROKER_MODE_KIS,
                 "order_id": "",
+                "account_id": account_id,
             }
 
         client = self._client()
@@ -238,6 +271,7 @@ class KISPaperBroker:
         baseline = self._holding_baseline(client, symbol_code)
         requested_price = float(preflight.get("execution_price") or signal.current_price)
         order_id = self._insert_submitted_order(
+            account_id=account_id,
             symbol=signal.symbol,
             asset_type=signal.asset_type,
             timeframe=signal.timeframe,
@@ -249,7 +283,8 @@ class KISPaperBroker:
             strategy_version=signal.strategy_version,
             reason="entry",
             payload={
-                "broker": "kis_mock",
+                "broker": BROKER_MODE_KIS,
+                "account_id": account_id,
                 "symbol_code": symbol_code,
                 "baseline_qty": baseline["quantity"],
                 "baseline_avg_price": baseline["avg_price"],
@@ -268,7 +303,12 @@ class KISPaperBroker:
                 "hts_id": client.config.hts_id,
             },
         )
-        self._log_state("submit_requested", "KIS entry submit requested", {"order_id": order_id, "symbol": signal.symbol, "quantity": int(quantity)})
+        self._log_state(
+            "submit_requested",
+            "KIS entry submit requested",
+            {"order_id": order_id, "symbol": signal.symbol, "quantity": int(quantity)},
+            account_id=account_id,
+        )
         try:
             result = client.place_cash_order(
                 symbol_or_code=signal.symbol,
@@ -282,10 +322,16 @@ class KISPaperBroker:
                 order_id,
                 status="rejected",
                 error_message=str(exc),
-                raw_json={"broker": "kis_mock", "broker_state": "rejected", "error_stage": "submit"},
+                raw_json={"broker": BROKER_MODE_KIS, "broker_state": "rejected", "error_stage": "submit", "account_id": account_id},
             )
-            self._log_state("rejected", "KIS broker rejected entry", {"order_id": order_id, "symbol": signal.symbol, "reason": "broker_rejected", "error": str(exc)}, level="ERROR")
-            return {"submitted": False, "status": "rejected", "reason": "broker_rejected", "broker": "kis_mock", "order_id": order_id}
+            self._log_state(
+                "rejected",
+                "KIS broker rejected entry",
+                {"order_id": order_id, "symbol": signal.symbol, "reason": "broker_rejected", "error": str(exc)},
+                account_id=account_id,
+                level="ERROR",
+            )
+            return {"submitted": False, "status": "rejected", "reason": "broker_rejected", "broker": BROKER_MODE_KIS, "order_id": order_id, "account_id": account_id}
 
         status = "acknowledged" if result.get("order_no") else "submitted"
         self.repository.update_order(
@@ -293,36 +339,43 @@ class KISPaperBroker:
             status=status,
             broker_order_id=str(result.get("order_no") or ""),
             raw_json={
-                "broker": "kis_mock",
+                "broker": BROKER_MODE_KIS,
+                "account_id": account_id,
                 "broker_state": status,
                 "broker_message": str(result.get("message") or ""),
                 "submitted_at": str(result.get("requested_at") or utc_now_iso()),
             },
         )
-        self._log_state("submitted", "KIS entry submitted", {"order_id": order_id, "symbol": signal.symbol, "broker_order_id": str(result.get("order_no") or "")})
+        self._log_state("submitted", "KIS entry submitted", {"order_id": order_id, "symbol": signal.symbol, "broker_order_id": str(result.get("order_no") or "")}, account_id=account_id)
         if status == "acknowledged":
-            self._log_state("acknowledged", "KIS entry acknowledged", {"order_id": order_id, "symbol": signal.symbol, "broker_order_id": str(result.get("order_no") or "")})
-        return {"submitted": True, "status": status, "reason": "ok", "broker": "kis_mock", "order_id": order_id, "broker_order_id": str(result.get("order_no") or "")}
+            self._log_state("acknowledged", "KIS entry acknowledged", {"order_id": order_id, "symbol": signal.symbol, "broker_order_id": str(result.get("order_no") or "")}, account_id=account_id)
+        return {"submitted": True, "status": status, "reason": "ok", "broker": BROKER_MODE_KIS, "order_id": order_id, "broker_order_id": str(result.get("order_no") or ""), "account_id": account_id}
 
-    def submit_entry_order(self, signal: SignalDecision, quantity: int, scan_id: str | None = None) -> str:
-        return str(self.submit_entry_order_result(signal, quantity, scan_id).get("order_id") or "")
+    def submit_entry_order(self, signal: SignalDecision, quantity: int, scan_id: str | None = None, *, account_id: str = ACCOUNT_KIS_KR_PAPER) -> str:
+        return str(self.submit_entry_order_result(signal, quantity, scan_id, account_id=account_id).get("order_id") or "")
 
     def submit_exit_order_result(
         self,
         position: pd.Series,
         reason: str,
         *,
+        account_id: str = ACCOUNT_KIS_KR_PAPER,
         market_data_service: MarketDataService | None = None,
     ) -> Dict[str, Any]:
-        preflight = self.preflight_exit(position, market_data_service) if market_data_service is not None else {"allowed": True}
+        preflight = (
+            self.preflight_exit(position, market_data_service, account_id=account_id)
+            if market_data_service is not None
+            else {"allowed": True, "account_id": account_id}
+        )
         if not preflight.get("allowed", False):
-            return {"submitted": False, "status": "rejected", "reason": str(preflight.get("reason") or "rejected"), "order_id": ""}
+            return {"submitted": False, "status": "rejected", "reason": str(preflight.get("reason") or "rejected"), "order_id": "", "account_id": account_id}
 
         client = self._client()
         symbol = str(position["symbol"])
         symbol_code = extract_kis_code(symbol)
         baseline = self._holding_baseline(client, symbol_code)
         order_id = self._insert_submitted_order(
+            account_id=account_id,
             symbol=symbol,
             asset_type=str(position["asset_type"]),
             timeframe=str(position["timeframe"]),
@@ -334,7 +387,8 @@ class KISPaperBroker:
             strategy_version=str(position["strategy_version"]),
             reason=reason,
             payload={
-                "broker": "kis_mock",
+                "broker": BROKER_MODE_KIS,
+                "account_id": account_id,
                 "symbol_code": symbol_code,
                 "baseline_qty": baseline["quantity"],
                 "baseline_avg_price": baseline["avg_price"],
@@ -346,7 +400,7 @@ class KISPaperBroker:
                 "hts_id": client.config.hts_id,
             },
         )
-        self._log_state("submit_requested", "KIS exit submit requested", {"order_id": order_id, "symbol": symbol, "quantity": int(position["quantity"])})
+        self._log_state("submit_requested", "KIS exit submit requested", {"order_id": order_id, "symbol": symbol, "quantity": int(position["quantity"])}, account_id=account_id)
         try:
             result = client.place_cash_order(
                 symbol_or_code=symbol,
@@ -360,10 +414,10 @@ class KISPaperBroker:
                 order_id,
                 status="rejected",
                 error_message=str(exc),
-                raw_json={"broker": "kis_mock", "broker_state": "rejected", "error_stage": "submit"},
+                raw_json={"broker": BROKER_MODE_KIS, "account_id": account_id, "broker_state": "rejected", "error_stage": "submit"},
             )
-            self._log_state("rejected", "KIS broker rejected exit", {"order_id": order_id, "symbol": symbol, "reason": "broker_rejected", "error": str(exc)}, level="ERROR")
-            return {"submitted": False, "status": "rejected", "reason": "broker_rejected", "order_id": order_id}
+            self._log_state("rejected", "KIS broker rejected exit", {"order_id": order_id, "symbol": symbol, "reason": "broker_rejected", "error": str(exc)}, account_id=account_id, level="ERROR")
+            return {"submitted": False, "status": "rejected", "reason": "broker_rejected", "order_id": order_id, "account_id": account_id}
 
         status = "acknowledged" if result.get("order_no") else "submitted"
         self.repository.update_order(
@@ -371,19 +425,20 @@ class KISPaperBroker:
             status=status,
             broker_order_id=str(result.get("order_no") or ""),
             raw_json={
-                "broker": "kis_mock",
+                "broker": BROKER_MODE_KIS,
+                "account_id": account_id,
                 "broker_state": status,
                 "broker_message": str(result.get("message") or ""),
                 "submitted_at": str(result.get("requested_at") or utc_now_iso()),
             },
         )
-        self._log_state("submitted", "KIS exit submitted", {"order_id": order_id, "symbol": symbol, "broker_order_id": str(result.get("order_no") or "")})
+        self._log_state("submitted", "KIS exit submitted", {"order_id": order_id, "symbol": symbol, "broker_order_id": str(result.get("order_no") or "")}, account_id=account_id)
         if status == "acknowledged":
-            self._log_state("acknowledged", "KIS exit acknowledged", {"order_id": order_id, "symbol": symbol, "broker_order_id": str(result.get("order_no") or "")})
-        return {"submitted": True, "status": status, "reason": "ok", "order_id": order_id, "broker_order_id": str(result.get("order_no") or "")}
+            self._log_state("acknowledged", "KIS exit acknowledged", {"order_id": order_id, "symbol": symbol, "broker_order_id": str(result.get("order_no") or "")}, account_id=account_id)
+        return {"submitted": True, "status": status, "reason": "ok", "order_id": order_id, "broker_order_id": str(result.get("order_no") or ""), "account_id": account_id}
 
-    def submit_exit_order(self, position: pd.Series, reason: str) -> str:
-        return str(self.submit_exit_order_result(position, reason).get("order_id") or "")
+    def submit_exit_order(self, position: pd.Series, reason: str, *, account_id: str = ACCOUNT_KIS_KR_PAPER) -> str:
+        return str(self.submit_exit_order_result(position, reason, account_id=account_id).get("order_id") or "")
 
     def sync_account(self, touch=None) -> Dict[str, Any]:
         touch = touch or (lambda *args, **kwargs: None)
@@ -408,6 +463,7 @@ class KISPaperBroker:
         touch("kis_account_sync_ws", {"approval_key_available": approval_key_available, "hts_id_configured": bool(client.config.hts_id)})
         canonical = self._canonical_account_values(snapshot)
         canonical_snapshot = self.sim_broker.record_external_account_snapshot(
+            account_id=ACCOUNT_KIS_KR_PAPER,
             cash=canonical["cash"],
             equity=canonical["equity"],
             gross_exposure=canonical["gross_exposure"],
@@ -417,7 +473,8 @@ class KISPaperBroker:
             source="kis_account_sync",
             raw_json=json.dumps(
                 {
-                    "broker": "kis_mock",
+                    "broker": BROKER_MODE_KIS,
+                    "account_id": ACCOUNT_KIS_KR_PAPER,
                     "summary": snapshot.summary,
                     "holding_count": canonical["open_positions"],
                 },
@@ -436,6 +493,7 @@ class KISPaperBroker:
                 "hts_id_configured": bool(client.config.hts_id),
                 "canonical_snapshot_source": str(canonical_snapshot.get("source") or "kis_account_sync"),
             },
+            account_id=ACCOUNT_KIS_KR_PAPER,
         )
         touch("kis_account_sync_complete", {"canonical_source": str(canonical_snapshot.get("source") or "kis_account_sync")})
         return {
@@ -446,6 +504,7 @@ class KISPaperBroker:
             "approval_key_available": approval_key_available,
             "hts_id_configured": bool(client.config.hts_id),
             "canonical_snapshot": canonical_snapshot,
+            "account_id": ACCOUNT_KIS_KR_PAPER,
         }
 
     def _today_order_frame(self, client: KISPaperClient, order: pd.Series) -> pd.DataFrame:
@@ -505,6 +564,7 @@ class KISPaperBroker:
         filled_total = min(int(sync_state.get("filled_total", existing_filled)), requested_qty)
         delta_fill = max(0, filled_total - existing_filled)
         status = str(sync_state.get("status") or order["status"])
+        account_id = str(order.get("account_id") or ACCOUNT_KIS_KR_PAPER)
         totals = {"fills": 0, "acknowledged": 0, "rejected": 0, "cancelled": 0, "expired": 0}
 
         if delta_fill > 0:
@@ -513,28 +573,28 @@ class KISPaperBroker:
                 str(order["order_id"]),
                 fill_qty=delta_fill,
                 fill_price=float(sync_state.get("fill_price") or order["requested_price"]),
-                raw_json={"broker": "kis_mock", "broker_state": final_status, "sync_source": sync_state.get("source"), "sync_details": sync_state.get("details", {})},
+                raw_json={"broker": BROKER_MODE_KIS, "account_id": account_id, "broker_state": final_status, "sync_source": sync_state.get("source"), "sync_details": sync_state.get("details", {})},
                 final_status=final_status,
             ):
                 totals["fills"] += 1
-                self._log_state(final_status, "KIS fill confirmed", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")})
+                self._log_state(final_status, "KIS fill confirmed", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, account_id=account_id)
 
-        payload = {"broker": "kis_mock", "broker_state": status, "sync_source": sync_state.get("source"), "sync_details": sync_state.get("details", {})}
+        payload = {"broker": BROKER_MODE_KIS, "account_id": account_id, "broker_state": status, "sync_source": sync_state.get("source"), "sync_details": sync_state.get("details", {})}
         if status == "acknowledged":
             totals["acknowledged"] += 1
             self.repository.update_order(str(order["order_id"]), status="acknowledged", raw_json=payload)
         elif status == "rejected":
             totals["rejected"] += 1
             self.repository.update_order(str(order["order_id"]), status="rejected", error_message="broker_rejected", raw_json=payload)
-            self._log_state("rejected", "KIS order rejected", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, level="ERROR")
+            self._log_state("rejected", "KIS order rejected", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, account_id=account_id, level="ERROR")
         elif status == "cancelled":
             totals["cancelled"] += 1
             self.repository.update_order(str(order["order_id"]), status="cancelled", raw_json=payload)
-            self._log_state("cancelled", "KIS order cancelled", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")})
+            self._log_state("cancelled", "KIS order cancelled", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, account_id=account_id)
         elif status in {"submitted", "pending_fill", "filled", "partially_filled"} and delta_fill <= 0:
             self.repository.update_order(str(order["order_id"]), status=status, raw_json=payload)
             if status == "pending_fill":
-                self._log_state("pending_fill", "KIS order pending fill", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")})
+                self._log_state("pending_fill", "KIS order pending fill", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, account_id=account_id)
 
         submitted_at = parse_utc_timestamp(str(self._parse_payload(order.get("raw_json")).get("submitted_at") or ""))
         if status in {"submitted", "acknowledged", "pending_fill"} and submitted_at is not None:
@@ -542,14 +602,14 @@ class KISPaperBroker:
             if datetime.now(timezone.utc) - submitted_at > timeout:
                 totals["expired"] += 1
                 self.repository.update_order(str(order["order_id"]), status="expired", raw_json={**payload, "broker_state": "expired"})
-                self._log_state("expired", "KIS order expired while waiting for fill", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, level="ERROR")
+                self._log_state("expired", "KIS order expired while waiting for fill", {"order_id": str(order["order_id"]), "broker_order_id": str(order.get("broker_order_id") or "")}, account_id=account_id, level="ERROR")
         return totals
 
     def handle_websocket_execution_event(self, event: Dict[str, Any]) -> bool:
         broker_order_id = str(event.get("broker_order_id") or event.get("order_no") or "").strip()
         if not broker_order_id:
             return False
-        orders = self.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled"))
+        orders = self.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled"), account_id=ACCOUNT_KIS_KR_PAPER)
         if orders.empty:
             return False
         matched = orders.loc[orders["broker_order_id"].astype(str) == broker_order_id]
@@ -568,7 +628,7 @@ class KISPaperBroker:
             "details": dict(event),
         }
         self._apply_state_transition(order, sync_state)
-        self._log_state(status, "KIS websocket execution event received", {"order_id": str(order["order_id"]), "broker_order_id": broker_order_id})
+        self._log_state(status, "KIS websocket execution event received", {"order_id": str(order["order_id"]), "broker_order_id": broker_order_id}, account_id=ACCOUNT_KIS_KR_PAPER)
         return True
 
     def sync_orders(
@@ -578,7 +638,7 @@ class KISPaperBroker:
     ) -> Dict[str, int]:
         if not self.is_enabled():
             return {"fills": 0, "acknowledged": 0, "rejected": 0, "cancelled": 0, "expired": 0}
-        active = self.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled"))
+        active = self.repository.open_orders(statuses=("submitted", "acknowledged", "pending_fill", "partially_filled"), account_id=ACCOUNT_KIS_KR_PAPER)
         if active.empty:
             return {"fills": 0, "acknowledged": 0, "rejected": 0, "cancelled": 0, "expired": 0}
         active = active.loc[
@@ -599,7 +659,7 @@ class KISPaperBroker:
             for key, value in applied.items():
                 totals[key] += int(value)
         self.repository.set_control_flag("kis_last_order_sync_at", utc_now_iso(), "broker_order_sync")
-        self._log_state("broker_order_sync", "KIS broker order sync complete", totals)
+        self._log_state("broker_order_sync", "KIS broker order sync complete", totals, account_id=ACCOUNT_KIS_KR_PAPER)
         return totals
 
     def process_open_orders(self, market_data_service: MarketDataService | None) -> int:

@@ -7,6 +7,7 @@ import unittest
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO
 from services.market_data_service import MarketQuote
 from services.paper_broker import PaperBroker
 from services.signal_engine import SignalDecision
@@ -99,7 +100,7 @@ class PaperBrokerTest(unittest.TestCase):
         )
 
         self.broker.snapshot_account(cash_override=90.0)
-        latest = self.repo.latest_account_snapshot()
+        latest = self.repo.latest_account_snapshot(account_id=ACCOUNT_SIM_CRYPTO)
 
         self.assertIsNotNone(latest)
         self.assertEqual(float(latest["equity"]), 200.0)
@@ -124,6 +125,7 @@ class PaperBrokerTest(unittest.TestCase):
                 open_orders=0,
                 paused=0,
                 source="test",
+                account_id=ACCOUNT_SIM_CRYPTO,
             )
         )
         self.repo.upsert_position(
@@ -152,17 +154,18 @@ class PaperBrokerTest(unittest.TestCase):
                 exposure_value=-90.0,
                 max_holding_until="2026-03-08T12:00:00Z",
                 strategy_version="s1",
+                account_id=ACCOUNT_SIM_CRYPTO,
             )
         )
 
         self.broker.snapshot_account(cash_override=210.0)
-        latest = self.repo.latest_account_snapshot()
+        latest = self.repo.latest_account_snapshot(account_id=ACCOUNT_SIM_CRYPTO)
 
         self.assertIsNotNone(latest)
         self.assertEqual(float(latest["gross_exposure"]), 90.0)
         self.assertEqual(float(latest["net_exposure"]), -90.0)
         self.assertEqual(float(latest["equity"]), 120.0)
-        self.assertAlmostEqual(float(latest["drawdown_pct"]), -40.0)
+        self.assertAlmostEqual(float(latest["drawdown_pct"]), -20.0)
 
     def test_sim_snapshot_drawdown_ignores_kis_peak(self) -> None:
         self.repo.insert_account_snapshot(
@@ -181,11 +184,32 @@ class PaperBrokerTest(unittest.TestCase):
                 open_orders=0,
                 paused=0,
                 source="kis_account_sync",
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
 
-        self.broker.snapshot_account(cash_override=150.0)
-        latest = self.repo.latest_account_snapshot(exclude_sources=("kis_account_sync",))
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_sim_crypto_peak",
+                created_at="2026-03-08T08:00:00Z",
+                cash=200.0,
+                equity=200.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+                account_id=ACCOUNT_SIM_CRYPTO,
+            )
+        )
+
+        self.broker.snapshot_account(cash_override=150.0, account_id=ACCOUNT_SIM_CRYPTO)
+        latest = self.repo.latest_account_snapshot(account_id=ACCOUNT_SIM_CRYPTO)
 
         self.assertIsNotNone(latest)
         self.assertEqual(str(latest["source"]), "paper_broker")
@@ -208,6 +232,7 @@ class PaperBrokerTest(unittest.TestCase):
                 open_orders=0,
                 paused=0,
                 source="paper_broker",
+                account_id=ACCOUNT_SIM_CRYPTO,
             )
         )
         self.repo.insert_account_snapshot(
@@ -226,6 +251,7 @@ class PaperBrokerTest(unittest.TestCase):
                 open_orders=0,
                 paused=0,
                 source="kis_account_sync",
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
 
@@ -241,6 +267,13 @@ class PaperBrokerTest(unittest.TestCase):
 
         self.assertEqual(str(snapshot["source"]), "kis_account_sync")
         self.assertAlmostEqual(float(snapshot["drawdown_pct"]), -20.0)
+
+    def test_submit_entry_order_records_crypto_account_id(self) -> None:
+        order_id = self.broker.submit_entry_order(self._signal(), quantity=1)
+        order = self.repo.get_order(order_id)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(str(order["account_id"]), ACCOUNT_SIM_CRYPTO)
 
     def test_allow_partial_fills_false_keeps_order_open(self) -> None:
         self.settings.broker.allow_partial_fills = False
