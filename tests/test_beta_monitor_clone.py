@@ -9,12 +9,21 @@ from beta_monitor_clone import (
     _build_entry_result_rows,
     _candidate_tabs_html,
     _equity_svg,
+    _ensure_template_base_href,
     _money_display_pair,
     _replace_template_script,
 )
 
 
 class BetaMonitorCloneTest(unittest.TestCase):
+    def test_ensure_template_base_href_inserts_root_base_tag(self) -> None:
+        template = "<html><head><title>beta</title></head><body></body></html>"
+
+        markup = _ensure_template_base_href(template, "/")
+
+        self.assertIn('<base href="/">', markup)
+        self.assertEqual(markup.count("<base "), 1)
+
     def test_replace_template_script_swaps_original_template_script(self) -> None:
         template = """<html><body><div>content</div><script>window.template = true;</script></body></html>"""
 

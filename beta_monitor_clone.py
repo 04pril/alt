@@ -174,6 +174,18 @@ def _replace_template_script(source: str, replacement: str) -> str:
     return source[: body_match.start()] + replacement + "\n" + source[body_match.start() :]
 
 
+def _ensure_template_base_href(source: str, href: str = "/") -> str:
+    base_pattern = re.compile(r"<base\b[^>]*href=['\"]([^'\"]+)['\"][^>]*>", re.IGNORECASE)
+    if base_pattern.search(source):
+        return base_pattern.sub(f'<base href="{href}">', source, count=1)
+    head_pattern = re.compile(r"<head[^>]*>", re.IGNORECASE)
+    head_match = head_pattern.search(source)
+    if not head_match:
+        return source
+    insert_at = head_match.end()
+    return source[:insert_at] + f'\n<base href="{href}">' + source[insert_at:]
+
+
 def _account_label(account_id: object) -> str:
     text = str(account_id or "").strip()
     for candidate_id, broker, scope, _, _ in ACCOUNT_VIEW_SPECS:
@@ -938,6 +950,7 @@ def render_beta_overview_component(
 ) -> None:
     template = TEMPLATE_PATH.read_text(encoding="utf-8", errors="ignore")
     template = re.sub(r'<html[^>]*data-theme="[^"]+"', f'<html lang="ko" data-theme="{theme_mode}"', template, count=1)
+    template = _ensure_template_base_href(template, "/")
     template = template.replace("</style>", _extra_styles() + "</style>", 1)
 
     summary = data["summary"]
@@ -1136,12 +1149,15 @@ def render_beta_overview_component(
 <script>
 (() => {{
   const initialAnchor = {json.dumps(initial_anchor or "beta-overview")};
+  let disposed = false;
   const actionButtons = Array.from(document.querySelectorAll("[data-action]"));
   const navButtons = Array.from(document.querySelectorAll("[data-nav-target]"));
   const candidateTabs = Array.from(document.querySelectorAll("[data-cand-tab]"));
   const candidatePanes = Array.from(document.querySelectorAll("[data-cand-pane]"));
   const preservedLinks = Array.from(document.querySelectorAll("[data-beta-link]"));
   const navIds = navButtons.map((button) => button.dataset.navTarget).filter(Boolean);
+  const pendingTimers = [];
+  let resizeObserver = null;
   const rewriteCandidateTabOnLinks = (targetKey) => {{
     preservedLinks.forEach((link) => {{
       const href = link.getAttribute("href");
@@ -1153,8 +1169,13 @@ def render_beta_overview_component(
     }});
   }};
   const notifyHeight = () => {{
+    if (disposed) return;
     const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight, document.body.offsetHeight, document.documentElement.offsetHeight);
-    window.parent.postMessage({{ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height }}, "*");
+    try {{
+      window.parent.postMessage({{ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height }}, "*");
+    }} catch (error) {{
+      disposed = true;
+    }}
   }};
   const normalizePath = (url) => {{
     const parts = url.pathname.split("/").filter(Boolean);
@@ -1177,6 +1198,9 @@ def render_beta_overview_component(
       const href = button.getAttribute("href");
       if (href) {{
         event.preventDefault();
+        disposed = true;
+        if (resizeObserver) resizeObserver.disconnect();
+        pendingTimers.forEach((timerId) => clearTimeout(timerId));
         window.open(href, "_top");
         return;
       }}
@@ -1186,6 +1210,9 @@ def render_beta_overview_component(
       parentUrl.searchParams.set("beta_action", button.dataset.action || "");
       parentUrl.searchParams.set("beta_token", String(Date.now()));
       parentUrl.searchParams.set("beta_anchor", sectionForButton(button));
+      disposed = true;
+      if (resizeObserver) resizeObserver.disconnect();
+      pendingTimers.forEach((timerId) => clearTimeout(timerId));
       window.open(parentUrl.toString(), "_top");
     }});
   }});
@@ -1215,7 +1242,17 @@ def render_beta_overview_component(
   }};
   window.addEventListener("scroll", updateActiveFromScroll, {{ passive: true }});
   window.addEventListener("resize", notifyHeight);
-  if (window.ResizeObserver) new ResizeObserver(notifyHeight).observe(document.body);
+  if (window.ResizeObserver) {{
+    resizeObserver = new ResizeObserver(() => {{
+      if (!disposed) notifyHeight();
+    }});
+    resizeObserver.observe(document.body);
+  }}
+  window.addEventListener("pagehide", () => {{
+    disposed = true;
+    if (resizeObserver) resizeObserver.disconnect();
+    pendingTimers.forEach((timerId) => clearTimeout(timerId));
+  }});
   requestAnimationFrame(() => {{
     const initialCandidateTab = candidateTabs.find((button) => button.classList.contains("active"))?.dataset.candTab || candidateTabs[0]?.dataset.candTab;
     if (initialCandidateTab) activateCandidateTab(initialCandidateTab);
@@ -1227,8 +1264,8 @@ def render_beta_overview_component(
     notifyHeight();
     updateActiveFromScroll();
   }});
-  setTimeout(notifyHeight, 120);
-  setTimeout(notifyHeight, 480);
+  pendingTimers.push(setTimeout(notifyHeight, 120));
+  pendingTimers.push(setTimeout(notifyHeight, 480));
 }})();
 </script>
 """
