@@ -1042,7 +1042,7 @@ def render_beta_overview_component(
     total_exposure_note = _metric_note(_format_currency_mix(total_portfolio_overview.get("gross_exposure_by_currency", {})), "포지션 기준")
     total_daily_style = ' style="color:var(--up);"' if total_current_pnl > 0 else ' style="color:var(--warn);"' if total_current_pnl < 0 else ""
     total_warning = str(total_portfolio_overview.get("warning") or "전체 합산은 참고용입니다.")
-    account_row_html = '<div class="account-row">' + "".join(account_cards) + '<div class="acct-card total"><div class="acct-header"><span class="acct-broker-badge" style="background:var(--bg2);color:var(--text3);">합산</span><span class="acct-scope">전체 운영 계좌 · 참고용</span></div><div class="summary-grid">' + f'<div class="sum-item"><div class="sum-label">총 자산</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_equity))}</div><div class="sum-mini">{html.escape(total_equity_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">현재 손익</div><div class="sum-value compact"{total_daily_style}>{html.escape(_fmt_compact_money(total_current_pnl))}</div><div class="sum-mini">{html.escape(total_daily_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">총 익스포저</div><div class="sum-value compact">{html.escape(_fmt_compact_money(total_exposure))}</div><div class="sum-mini">{html.escape(total_exposure_note)}</div></div>' + f'<div class="sum-item"><div class="sum-label">브로커 오류</div><div class="sum-value warn-c">{len(broker_sync_errors)}</div><div class="sum-sub">오늘 기준</div></div>' + "</div><div class=\"acct-mini\" style=\"margin-top:8px;\">" + html.escape(total_warning) + "</div></div></div>"
+    account_row_html = '<div class="account-row">' + "".join(account_cards) + "</div>"
     template = _replace_block(template, 'class="account-row"', account_row_html)
 
     stat_items = [("보유 포지션", _i(summary.get("open_positions", 0))), ("대기 주문", _i(summary.get("open_orders", 0))), ("미해결", _i(summary.get("unresolved_predictions", 0))), ("오늘 후보", _i(execution_summary.get("today_candidate_count", 0))), ("진입 허용", _i(execution_summary.get("today_entry_allowed_count", 0))), ("진입 거절", _i(execution_summary.get("today_entry_rejected_count", 0))), ("주문 제출", _i(execution_summary.get("today_submitted_count", 0))), ("체결 완료", _i(execution_summary.get("today_filled_count", 0))), ("브로커 오류", len(broker_sync_errors)), ("프로파일", str(runtime_profile.get("name") or "-"))]
@@ -1116,7 +1116,6 @@ def render_beta_overview_component(
 
     detail_sections = [
         _section_html("positions", "보유 현황", [_detail_card("최근 주문 활동", _table_html(recent_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "최근 주문 활동이 없습니다.", limit=12), note=f"최근 {min(len(recent_orders), 12)}건"), _detail_card("대기 주문", _table_html(open_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "대기 주문이 없습니다.", limit=12), note=f"현재 {_i(summary.get('open_orders', 0))}건")]),
-        _section_html("candidates", "후보 종목", [_detail_card("오늘 후보 상세", _table_html(candidate_scans, ["created_at", "execution_account_id", "symbol", "asset_type", "signal", "expected_return", "confidence", "score", "status", "reason"], "후보 종목이 없습니다.", limit=14), note=f"최근 {min(len(candidate_scans), 14)}건")]),
         _section_html("events", "실행 이벤트", [_detail_card("실행 이벤트 상세", _table_html(today_execution_events, ["created_at", "account_id", "event_type", "component", "level", "message"], "실행 이벤트가 없습니다.", limit=14), note=f"최근 {min(len(today_execution_events), 14)}건"), _detail_card("미진입 사유 요약", _table_html(noop_breakdown, ["reason", "count"], "미진입 집계가 없습니다.", limit=10), note=f"사유 {len(noop_breakdown)}건")]),
         _section_html("assets", "자산 설정", [_detail_card("운영 자산 설정", _table_html(asset_overview, [], "자산 설정 정보가 없습니다.", limit=10), note=f"자산 {len(asset_overview)}종")]),
         _section_html("errors", "최근 오류", [_detail_card("오류 이벤트", _table_html(recent_errors, ["created_at", "component", "event_type", "level", "message"], "최근 오류가 없습니다.", limit=14), note=f"최근 {min(len(recent_errors), 14)}건")]),
@@ -1129,7 +1128,7 @@ def render_beta_overview_component(
         feedback_html = f'<div class="feedback-banner {tone_class}">{html.escape(str(feedback.get("message")))}</div>'
     template = template.replace('<div class="main">', f'<div class="main">{feedback_html}', 1)
 
-    detail_frames = [recent_orders, open_orders, candidate_scans, today_execution_events, broker_sync_errors, asset_overview, recent_errors]
+    detail_frames = [recent_orders, open_orders, today_execution_events, broker_sync_errors, asset_overview, recent_errors]
     extra_rows = sum(min(len(frame), 16) for frame in detail_frames if isinstance(frame, pd.DataFrame))
     component_height = min(7200, max(3600, 3200 + extra_rows * 26))
 

@@ -5864,6 +5864,18 @@ def _render_beta_monitor_clone_page() -> None:
     st.markdown(
         """
         <style>
+        header[data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stToolHeader"],
+        .stAppToolbar {
+          display: none !important;
+          visibility: hidden !important;
+          height: 0 !important;
+        }
+        [data-testid="stAppViewContainer"] > .main {
+          padding-top: 0 !important;
+          margin-top: 0 !important;
+        }
         .block-container {
           max-width: none !important;
           padding-top: 0 !important;
