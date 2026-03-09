@@ -1550,6 +1550,7 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     broker_sync_status = data.get("broker_sync_status", pd.DataFrame())
     broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
     kis_runtime = data.get("kis_runtime", {})
+    runtime_profile = data.get("runtime_profile", {})
     asset_overview = data.get("asset_overview", pd.DataFrame())
 
     metrics = st.columns(6)
@@ -1562,6 +1563,10 @@ def render_operations_monitor(settings=None, dashboard_data: Dict[str, Any] | No
     st.caption(
         f"자동 모의매매 {auto_trading_status.get('label', 'Stopped')} · "
         f"{auto_trading_status_text(auto_trading_status)} · db={settings.storage.db_path}"
+    )
+    st.caption(
+        f"현재 프로파일 · {str(runtime_profile.get('name') or settings.profile_name)}"
+        f" · source={str(runtime_profile.get('source') or settings.profile_source)}"
     )
     if not asset_overview.empty and {"자산유형", "실행브로커"}.issubset(asset_overview.columns):
         broker_mode_text = " · ".join(

@@ -1,0 +1,21 @@
+{
+  "profile_name": "balanced",
+  "strategy": {
+    "min_signal_strength_pct": 0.3,
+    "min_expected_return_pct": 0.55,
+    "min_confidence": 0.48
+  },
+  "risk": {
+    "max_daily_new_entries": 6,
+    "cooldown_bars_after_exit": 1,
+    "max_same_direction_correlation": 0.88
+  },
+  "asset_schedules": {
+    "미국주식": {
+      "pre_close_buffer_minutes": 35
+    },
+    "한국주식": {
+      "pre_close_buffer_minutes": 35
+    }
+  }
+}

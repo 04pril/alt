@@ -134,6 +134,8 @@ class RetrainingSettings:
 
 @dataclass
 class RuntimeSettings:
+    profile_name: str = "baseline"
+    profile_source: str = "embedded_defaults"
     storage: StorageSettings = field(default_factory=StorageSettings)
     scheduler: SchedulerSettings = field(default_factory=SchedulerSettings)
     strategy: StrategySettings = field(default_factory=StrategySettings)
@@ -245,6 +247,9 @@ def load_settings(path: str | Path | None = None) -> RuntimeSettings:
     if source_path.exists():
         raw = json.loads(source_path.read_text(encoding="utf-8"))
         settings = _merge_dataclass(settings, raw)
+        settings.profile_source = source_path.as_posix()
+    else:
+        settings.profile_source = "embedded_defaults"
     return settings
 
 

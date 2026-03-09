@@ -59,6 +59,12 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
     evaluator = Evaluator(repository)
     retrainer = Retrainer(settings, repository)
     paper_broker.ensure_account_initialized()
+    repository.set_control_flag("runtime_profile_name", str(settings.profile_name or "baseline"), "task_context")
+    repository.set_control_flag(
+        "runtime_profile_source",
+        str(settings.profile_source or "embedded_defaults"),
+        "task_context",
+    )
     return TaskContext(
         settings=settings,
         repository=repository,
@@ -154,6 +160,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             continue
 
         count = 0
+        detailed_no_trade_reason_logged = False
         open_positions = context.repository.open_positions()
         corr_symbols = list(open_positions["symbol"].astype(str).tolist()) if not open_positions.empty else []
         for _, candidate in latest.iterrows():
@@ -172,6 +179,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             )
             signal = _rebuild_signal(context, candidate)
             if signal is None:
+                detailed_no_trade_reason_logged = True
                 _execution_event(context, "entry_rejected", "candidate missing prediction", {"symbol": str(candidate["symbol"]), "reason": "missing_prediction", "scan_id": str(candidate["scan_id"])})
                 continue
             correlation_matrix = (
@@ -186,6 +194,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             )
             risk_decision = context.risk_engine.evaluate_entry(signal, correlation_matrix=correlation_matrix, market_is_open=market_is_open)
             if not risk_decision.allowed:
+                detailed_no_trade_reason_logged = True
                 _execution_event(
                     context,
                     "entry_rejected",
@@ -207,6 +216,7 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
                 market_data_service=context.market_data_service,
             )
             if not submit.get("submitted", False):
+                detailed_no_trade_reason_logged = True
                 _execution_event(
                     context,
                     "entry_rejected",
@@ -217,7 +227,8 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             count += 1
         entered[asset_type] = count
         if count == 0:
-            _record_noop(context, asset_type, "no_submit")
+            if not detailed_no_trade_reason_logged:
+                _record_noop(context, asset_type, "no_submit")
         else:
             context.repository.log_event("INFO", "entry_job", "entry_orders_created", f"{asset_type} entries", {"count": count})
     return entered

@@ -1,0 +1,21 @@
+{
+  "profile_name": "active",
+  "strategy": {
+    "min_signal_strength_pct": 0.22,
+    "min_expected_return_pct": 0.4,
+    "min_confidence": 0.42
+  },
+  "risk": {
+    "max_daily_new_entries": 8,
+    "cooldown_bars_after_exit": 1,
+    "max_same_direction_correlation": 0.9
+  },
+  "asset_schedules": {
+    "미국주식": {
+      "pre_close_buffer_minutes": 45
+    },
+    "한국주식": {
+      "pre_close_buffer_minutes": 45
+    }
+  }
+}

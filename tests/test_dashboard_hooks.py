@@ -46,20 +46,15 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("asset_overview", data)
             self.assertIn("execution_summary", data)
             self.assertIn("broker_sync_status", data)
+            self.assertIn("broker_sync_errors", data)
+            self.assertIn("runtime_profile", data)
             self.assertIn("kis_runtime", data)
 
-    def test_asset_overview_contains_all_asset_types(self) -> None:
+    def test_asset_overview_contains_expected_broker_modes(self) -> None:
         settings = RuntimeSettings()
         overview = build_asset_overview(settings, kis_enabled=True)
         self.assertFalse(overview.empty)
         self.assertEqual(set(overview["자산유형"]), {"코인", "미국주식", "한국주식"})
-        self.assertIn("대표 종목", overview.columns)
-
-    def test_asset_overview_includes_broker_mode_column(self) -> None:
-        settings = RuntimeSettings()
-        overview = build_asset_overview(settings, kis_enabled=True)
-        self.assertFalse(overview.empty)
-        self.assertEqual(set(overview["자산유형"]), set(settings.asset_schedules.keys()))
         self.assertIn("대표 종목", overview.columns)
         self.assertIn("실행브로커", overview.columns)
         broker_modes = dict(zip(overview["자산유형"], overview["실행브로커"]))
@@ -114,12 +109,16 @@ class DashboardHooksTest(unittest.TestCase):
             status = compute_auto_trading_status(repo, loop_sleep_seconds=30, now=now)
             self.assertEqual(status["label"], "Stopped")
 
-    def test_dashboard_reader_exposes_execution_counts_and_broker_sync_status(self) -> None:
+    def test_dashboard_reader_exposes_execution_counts_sync_status_and_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = RuntimeSettings()
             settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            settings.profile_name = "balanced"
+            settings.profile_source = "config/runtime_settings.balanced.json"
             repo = TradingRepository(settings.storage.db_path)
             repo.initialize()
+            repo.set_control_flag("runtime_profile_name", settings.profile_name, "test")
+            repo.set_control_flag("runtime_profile_source", settings.profile_source, "test")
             repo.log_event("INFO", "execution_pipeline", "candidate", "candidate", {"symbol": "005930.KS"})
             repo.log_event("INFO", "execution_pipeline", "entry_allowed", "allowed", {"symbol": "005930.KS"})
             repo.log_event("INFO", "execution_pipeline", "submit_requested", "submit", {"symbol": "005930.KS"})
@@ -140,6 +139,19 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(data["execution_summary"]["today_noop_count"], 1)
             self.assertFalse(data["broker_sync_status"].empty)
             self.assertEqual(data["kis_runtime"]["last_broker_order_sync"], "2026-03-09T06:20:00Z")
+            self.assertEqual(data["runtime_profile"]["name"], "balanced")
+            self.assertEqual(data["runtime_profile"]["source"], "config/runtime_settings.balanced.json")
+
+    def test_broker_sync_errors_filters_out_healthy_info_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.log_event("INFO", "broker_sync_job", "broker_order_sync", "broker order sync completed", {"fills": 0})
+            repo.log_event("INFO", "kis_execution", "filled", "fill", {"symbol": "005930.KS"})
+            data = load_dashboard_data(settings)
+            self.assertTrue(data["broker_sync_errors"].empty)
 
 
 if __name__ == "__main__":

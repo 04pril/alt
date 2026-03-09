@@ -167,6 +167,28 @@ Relevant settings:
 - `broker.websocket_reconnect_interval_seconds`
 - `broker.stale_submitted_order_timeout_minutes`
 
+## Runtime Tuning Profiles
+
+Gate tuning is tracked as explicit runtime profiles instead of editing the embedded defaults in place.
+
+- `baseline`: current production-equivalent gate values
+- `balanced`: recommended default for live paper trading; relaxes stock entry gates enough to reduce `outside_preclose_window`, `expected_return_too_low`, and `confidence_too_low` pressure without changing the core loss-budget controls
+- `active`: higher-submission experimental profile; keeps the same drawdown and daily-loss ceilings but further lowers stock entry thresholds and expands daily entry capacity
+
+This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
+
+When trades are too sparse, inspect these breakdowns first:
+
+- `today_noop_reason_breakdown`
+- `today_entry_rejected_reason_breakdown`
+- `outside_preclose_window`
+- `expected_return_too_low`
+- `confidence_too_low`
+- `cooldown_active`
+- `max_daily_entries`
+
+The worker writes the loaded runtime profile name/source into control flags, and the operations monitor reads that value back so operators can verify which profile is active. The recommended default profile is `balanced`.
+
 ## Monitoring Read Model
 
 `monitoring/dashboard_hooks.py` builds the monitor view from repository data.

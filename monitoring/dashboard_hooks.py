@@ -72,6 +72,18 @@ def _kis_enabled_for_monitor(settings: RuntimeSettings, repository: TradingRepos
         return False
 
 
+def _runtime_profile_read_model(repository: TradingRepository, settings: RuntimeSettings) -> Dict[str, str]:
+    profile_name = repository.get_control_flag("runtime_profile_name", str(settings.profile_name or "baseline"))
+    profile_source = repository.get_control_flag(
+        "runtime_profile_source",
+        str(settings.profile_source or "embedded_defaults"),
+    )
+    return {
+        "name": str(profile_name or "baseline"),
+        "source": str(profile_source or "embedded_defaults"),
+    }
+
+
 def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for asset_type, schedule in settings.asset_schedules.items():
@@ -132,6 +144,7 @@ def _execution_summary(events: pd.DataFrame) -> Dict[str, Any]:
     summary = {f"today_{key}_count": 0 for key in EXECUTION_EVENT_KEYS}
     if events.empty:
         summary["today_noop_breakdown"] = pd.DataFrame(columns=["reason", "count"])
+        summary["today_entry_rejected_breakdown"] = pd.DataFrame(columns=["reason", "count"])
         return summary
     counts = events["event_type"].value_counts()
     for key in EXECUTION_EVENT_KEYS:
@@ -144,6 +157,14 @@ def _execution_summary(events: pd.DataFrame) -> Dict[str, Any]:
         .reset_index(name="count")
     )
     summary["today_noop_breakdown"] = noop_reasons
+    entry_rejected_reasons = (
+        events.loc[events["event_type"].astype(str) == "entry_rejected", "details"]
+        .map(lambda item: str((item or {}).get("reason") or "unknown"))
+        .value_counts()
+        .rename_axis("reason")
+        .reset_index(name="count")
+    )
+    summary["today_entry_rejected_breakdown"] = entry_rejected_reasons
     return summary
 
 
@@ -171,6 +192,7 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
     kis_enabled = _kis_enabled_for_monitor(settings, repository)
+    runtime_profile = _runtime_profile_read_model(repository, settings)
     summary = repository.dashboard_counts()
     equity_curve = _localize_timestamp_columns(repository.load_account_snapshots(limit=500))
     job_health = _localize_timestamp_columns(repository.recent_job_health(limit=200))
@@ -178,9 +200,14 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     today_events = _parse_details(repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=2000))
     execution_summary = _execution_summary(today_events)
     broker_sync_status = _localize_timestamp_columns(_broker_sync_status(job_health))
-    recent_broker_errors = _localize_timestamp_columns(
-        today_events.loc[(today_events["level"].astype(str) == "ERROR") | (today_events["component"].astype(str).str.contains("kis_|execution|broker", na=False))].head(100)
+    broker_error_mask = (
+        (today_events["level"].astype(str) == "ERROR")
+        & (
+            today_events["component"].astype(str).str.contains("broker|kis_", na=False)
+            | today_events["event_type"].astype(str).isin(BROKER_SYNC_JOBS)
+        )
     )
+    recent_broker_errors = _localize_timestamp_columns(today_events.loc[broker_error_mask].head(100))
     open_orders = _localize_timestamp_columns(repository.open_orders())
     kis_open_orders = open_orders.loc[
         open_orders["raw_json"].fillna("{}").astype(str).map(lambda value: json.loads(str(value or "{}")).get("broker") == "kis_mock")
@@ -225,4 +252,5 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "execution_summary": execution_summary,
         "today_execution_events": _localize_timestamp_columns(today_events),
         "kis_runtime": kis_runtime,
+        "runtime_profile": runtime_profile,
     }
