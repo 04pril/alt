@@ -5864,14 +5864,6 @@ def _render_beta_monitor_clone_page() -> None:
     st.markdown(
         """
         <style>
-        header[data-testid="stHeader"],
-        [data-testid="stToolbar"],
-        [data-testid="stToolHeader"],
-        .stAppToolbar {
-          display: none !important;
-          visibility: hidden !important;
-          height: 0 !important;
-        }
         [data-testid="stAppViewContainer"] > .main {
           padding-top: 0 !important;
           margin-top: 0 !important;
@@ -5882,6 +5874,13 @@ def _render_beta_monitor_clone_page() -> None:
           padding-right: 0 !important;
           padding-left: 0 !important;
           padding-bottom: 0.75rem !important;
+        }
+        .block-container > [data-testid="stVerticalBlock"] {
+          gap: 0 !important;
+        }
+        .block-container > [data-testid="stVerticalBlock"] > div {
+          margin-top: 0 !important;
+          margin-bottom: 0 !important;
         }
         </style>
         """,
