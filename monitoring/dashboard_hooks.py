@@ -78,6 +78,8 @@ def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.Dat
         universe = settings.universes.get(asset_type)
         watchlist = list(universe.watchlist) if universe else []
         top_universe = list(universe.top_universe) if universe else []
+        representative_symbols = watchlist or top_universe
+        representative_symbol = representative_symbols[0] if representative_symbols else ""
         rows.append(
             {
                 "자산유형": asset_type,
@@ -87,7 +89,7 @@ def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.Dat
                 "스캔주기(분)": schedule.scan_interval_minutes,
                 "진입주기(분)": schedule.entry_interval_minutes,
                 "청산주기(분)": schedule.exit_interval_minutes,
-                "실행브로커": resolve_broker_mode(asset_type=asset_type, kis_enabled=kis_enabled),
+                "실행브로커": resolve_broker_mode(symbol=representative_symbol, asset_type=asset_type, kis_enabled=kis_enabled),
                 "Watchlist 개수": len(watchlist),
                 "Top Universe 개수": len(top_universe),
                 "대표 종목": ", ".join((watchlist or top_universe)[:4]),

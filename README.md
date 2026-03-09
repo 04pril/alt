@@ -14,9 +14,10 @@ The current routing model stays the same:
 
 KR-only routing rule:
 
-- KIS routing is limited to KR symbols (`.KS` / `.KQ`) and bare 6-digit KR stock codes
-- asset-level monitoring may still label `한국주식` as `kis_mock`
-- US equities and crypto stay on the sim broker path even if a broad `...주식` label is passed through by mistake
+- `한국주식` + KR symbol (`.KS` / `.KQ`) or bare 6-digit KR stock code only: `kis_mock`
+- `미국주식` and `코인`: always `sim`
+- if `asset_type` is blank or ambiguous, KR suffix / bare 6-digit KR code is the fallback safety check
+- non-KR symbols never route to KIS, even if a wrong `한국주식` label is passed in
 
 ## Runtime Architecture
 

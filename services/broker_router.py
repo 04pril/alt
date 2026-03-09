@@ -8,15 +8,28 @@ from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 
 KR_EQUITY_ASSET_TYPE = "한국주식"
+US_EQUITY_ASSET_TYPE = "미국주식"
+CRYPTO_ASSET_TYPE = "코인"
 KR_SYMBOL_SUFFIXES = (".KS", ".KQ")
 
 
-def is_kis_routable_kr_equity(symbol: str = "", asset_type: str = "") -> bool:
+def _is_kr_symbol(symbol: str = "") -> bool:
     normalized_symbol = str(symbol).upper().strip()
+    return bool(
+        normalized_symbol
+        and (normalized_symbol.endswith(KR_SYMBOL_SUFFIXES) or (normalized_symbol.isdigit() and len(normalized_symbol) == 6))
+    )
+
+
+def is_kis_routable_kr_equity(symbol: str = "", asset_type: str = "") -> bool:
     normalized_asset_type = str(asset_type).strip()
-    if normalized_symbol:
-        return normalized_symbol.endswith(KR_SYMBOL_SUFFIXES) or (normalized_symbol.isdigit() and len(normalized_symbol) == 6)
-    return normalized_asset_type == KR_EQUITY_ASSET_TYPE
+    if normalized_asset_type == US_EQUITY_ASSET_TYPE:
+        return False
+    if normalized_asset_type == CRYPTO_ASSET_TYPE:
+        return False
+    if normalized_asset_type == KR_EQUITY_ASSET_TYPE:
+        return _is_kr_symbol(symbol)
+    return _is_kr_symbol(symbol)
 
 
 def resolve_broker_mode(symbol: str = "", asset_type: str = "", *, kis_enabled: bool) -> str:
@@ -84,6 +97,8 @@ class BrokerRouter:
     def preflight_entry(self, signal, quantity: int, *, market_data_service):
         if self._use_kis(signal.symbol, signal.asset_type):
             return self.kis_broker.preflight_entry(signal, quantity, market_data_service)
+        if hasattr(self.sim_broker, "preflight_entry"):
+            return self.sim_broker.preflight_entry(signal, quantity, market_data_service)
         return {"allowed": True, "reason": "ok", "broker": "sim"}
 
     def sync_account(self, touch=None) -> dict[str, Any]:
