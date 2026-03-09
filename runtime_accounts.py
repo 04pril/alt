@@ -116,6 +116,32 @@ def get_account_metadata(account_id: str) -> Dict[str, Any]:
 
 
 def resolve_execution_account(symbol: str = "", asset_type: str = "", *, kis_enabled: bool) -> ExecutionAccount:
+    normalized_asset_type = str(asset_type or "").strip()
+    if not _normalize_symbol(symbol):
+        if kis_enabled and normalized_asset_type == KR_EQUITY_ASSET_TYPE:
+            return ExecutionAccount(
+                account_id=ACCOUNT_KIS_KR_PAPER,
+                broker_mode=BROKER_MODE_KIS,
+                asset_scope=KR_EQUITY_ASSET_TYPE,
+                currency="KRW",
+                display_name="KIS \ud55c\uad6d\uc8fc\uc2dd \ubaa8\uc758\uacc4\uc88c",
+            )
+        if normalized_asset_type == CRYPTO_ASSET_TYPE:
+            return ExecutionAccount(
+                account_id=ACCOUNT_SIM_CRYPTO,
+                broker_mode=BROKER_MODE_SIM,
+                asset_scope=CRYPTO_ASSET_TYPE,
+                currency="USD",
+                display_name="SIM \ucf54\uc778 \uacc4\uc88c",
+            )
+        if normalized_asset_type == US_EQUITY_ASSET_TYPE:
+            return ExecutionAccount(
+                account_id=ACCOUNT_SIM_US_EQUITY,
+                broker_mode=BROKER_MODE_SIM,
+                asset_scope=US_EQUITY_ASSET_TYPE,
+                currency="USD",
+                display_name="SIM \ubbf8\uad6d\uc8fc\uc2dd \uacc4\uc88c",
+            )
     if kis_enabled and is_kis_routable_kr_equity(symbol=symbol, asset_type=asset_type):
         return ExecutionAccount(
             account_id=ACCOUNT_KIS_KR_PAPER,
@@ -124,7 +150,6 @@ def resolve_execution_account(symbol: str = "", asset_type: str = "", *, kis_ena
             currency="KRW",
             display_name="KIS \ud55c\uad6d\uc8fc\uc2dd \ubaa8\uc758\uacc4\uc88c",
         )
-    normalized_asset_type = str(asset_type or "").strip()
     if normalized_asset_type == CRYPTO_ASSET_TYPE or is_crypto_symbol(symbol):
         return ExecutionAccount(
             account_id=ACCOUNT_SIM_CRYPTO,

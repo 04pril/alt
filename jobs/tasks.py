@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Iterable
 import pandas as pd
 
 from config.settings import RuntimeSettings, load_settings
+from runtime_accounts import resolve_execution_account
 from services.broker_router import BrokerRouter
 from services.evaluator import Evaluator
 from services.kis_paper_broker import KISPaperBroker
@@ -116,13 +117,20 @@ def _rebuild_signal(context: TaskContext, candidate_row: pd.Series) -> SignalDec
 
 
 def _execution_event(context: TaskContext, event_type: str, message: str, details: Dict[str, Any], *, level: str = "INFO") -> None:
+    account_id = str(details.get("account_id") or details.get("execution_account_id") or "").strip()
+    if not account_id:
+        account_id = resolve_execution_account(
+            symbol=str(details.get("symbol") or ""),
+            asset_type=str(details.get("asset_type") or ""),
+            kis_enabled=True,
+        ).account_id
     context.repository.log_event(
         level,
         "execution_pipeline",
         event_type,
         message,
         details,
-        account_id=str(details.get("account_id") or details.get("execution_account_id") or ""),
+        account_id=account_id,
     )
 
 
@@ -130,14 +138,33 @@ def _record_noop(context: TaskContext, asset_type: str, reason: str, details: Di
     _execution_event(context, "noop", f"{asset_type} entry noop", {"asset_type": asset_type, "reason": reason, **(details or {})})
 
 
+def _account_scope_for_asset(asset_type: str, symbol: str = "") -> str:
+    return resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
+
+
+def _active_account_ids(context: TaskContext) -> list[str]:
+    accounts = context.repository.load_broker_accounts(active_only=True)
+    if accounts.empty or "account_id" not in accounts.columns:
+        return []
+    return [str(value) for value in accounts["account_id"].dropna().astype(str).tolist() if str(value).strip()]
+
+
 def scan_job(context: TaskContext, asset_types: Iterable[str] | None = None) -> Dict[str, int]:
     asset_list = list(asset_types or context.settings.asset_schedules.keys())
     results: Dict[str, int] = {}
     for asset_type in asset_list:
+        account_id = _account_scope_for_asset(asset_type)
         context.touch_runtime("scan_asset", {"asset_type": asset_type})
         rows = context.universe_scanner.scan_asset(asset_type, touch=context.touch_runtime)
         results[asset_type] = len(rows)
-        context.repository.log_event("INFO", "scan_job", "scan_complete", f"{asset_type} scanned", {"count": len(rows)})
+        context.repository.log_event(
+            "INFO",
+            "scan_job",
+            "scan_complete",
+            f"{asset_type} scanned",
+            {"count": len(rows), "asset_type": asset_type, "account_id": account_id},
+            account_id=account_id,
+        )
     return results
 
 
@@ -252,7 +279,15 @@ def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None =
             if not detailed_no_trade_reason_logged:
                 _record_noop(context, asset_type, "no_submit")
         else:
-            context.repository.log_event("INFO", "entry_job", "entry_orders_created", f"{asset_type} entries", {"count": count})
+            account_id = _account_scope_for_asset(asset_type)
+            context.repository.log_event(
+                "INFO",
+                "entry_job",
+                "entry_orders_created",
+                f"{asset_type} entries",
+                {"count": count, "asset_type": asset_type, "account_id": account_id},
+                account_id=account_id,
+            )
     return entered
 
 
@@ -271,13 +306,43 @@ def broker_market_status_job(context: TaskContext) -> Dict[str, Any]:
         phase = context.market_data_service.market_phase(asset_type)
         phases[asset_type] = phase
         context.repository.set_control_flag(f"market_phase:{asset_type}", phase, "broker_market_status")
-    context.repository.log_event("INFO", "broker_market_status_job", "broker_market_status", "market status snapshot recorded", phases)
+        account_id = _account_scope_for_asset(asset_type)
+        context.repository.log_event(
+            "INFO",
+            "broker_market_status_job",
+            "broker_market_status",
+            "market status snapshot recorded",
+            {"asset_type": asset_type, "phase": phase, "account_id": account_id},
+            account_id=account_id,
+        )
+    context.repository.log_event("INFO", "broker_market_status_job", "broker_market_status_summary", "market status snapshot recorded", phases)
     return phases
 
 
 def broker_order_sync_job(context: TaskContext) -> Dict[str, int]:
     result = context.paper_broker.sync_orders(context.market_data_service, touch=context.touch_runtime)
-    context.repository.log_event("INFO", "broker_order_sync_job", "broker_order_sync", "broker order sync completed", result)
+    for account_id in _active_account_ids(context):
+        open_orders = context.repository.open_orders(account_id=account_id)
+        pending_orders = (
+            int(
+                len(
+                    open_orders.loc[
+                        open_orders["status"].astype(str).isin({"new", "submitted", "acknowledged", "pending_fill", "partially_filled"})
+                    ]
+                )
+            )
+            if not open_orders.empty
+            else 0
+        )
+        context.repository.log_event(
+            "INFO",
+            "broker_order_sync_job",
+            "broker_order_sync",
+            "broker order sync completed",
+            {"account_id": account_id, "pending_orders": pending_orders},
+            account_id=account_id,
+        )
+    context.repository.log_event("INFO", "broker_order_sync_job", "broker_order_sync_summary", "broker order sync completed", result)
     return result
 
 
@@ -286,14 +351,54 @@ def broker_position_sync_job(context: TaskContext) -> Dict[str, int]:
     context.portfolio_manager.mark_to_market(context.market_data_service, touch=context.touch_runtime)
     positions = context.repository.open_positions()
     result = {"open_positions": int(len(positions))}
-    context.repository.log_event("INFO", "broker_position_sync_job", "broker_position_sync", "broker position sync completed", result)
+    for account_id in _active_account_ids(context):
+        account_positions = context.repository.open_positions(account_id=account_id)
+        context.repository.log_event(
+            "INFO",
+            "broker_position_sync_job",
+            "broker_position_sync",
+            "broker position sync completed",
+            {"account_id": account_id, "open_positions": int(len(account_positions))},
+            account_id=account_id,
+        )
+    context.repository.log_event("INFO", "broker_position_sync_job", "broker_position_sync_summary", "broker position sync completed", result)
     return result
 
 
 def broker_account_sync_job(context: TaskContext) -> Dict[str, Any]:
     context.touch_runtime("broker_account_sync", {})
     result = context.paper_broker.sync_account(touch=context.touch_runtime)
-    context.repository.log_event("INFO", "broker_account_sync_job", "broker_account_sync", "broker account sync completed", result)
+    sim_accounts = ((result.get("sim") or {}).get("accounts") or {}) if isinstance(result, dict) else {}
+    for account_id, summary in sim_accounts.items():
+        context.repository.log_event(
+            "INFO",
+            "broker_account_sync_job",
+            "broker_account_sync",
+            "broker account sync completed",
+            {
+                "account_id": str(account_id),
+                "cash": float((summary or {}).get("cash", 0.0) or 0.0),
+                "equity": float((summary or {}).get("equity", 0.0) or 0.0),
+                "source": str((summary or {}).get("source") or ""),
+            },
+            account_id=str(account_id),
+        )
+    kis_summary = (result.get("kis") or {}) if isinstance(result, dict) else {}
+    kis_account_id = str(kis_summary.get("account_id") or "").strip()
+    if kis_account_id:
+        context.repository.log_event(
+            "INFO",
+            "broker_account_sync_job",
+            "broker_account_sync",
+            "broker account sync completed",
+            {
+                "account_id": kis_account_id,
+                "enabled": bool(kis_summary.get("enabled", False)),
+                "holding_count": int(kis_summary.get("holding_count", 0) or 0),
+            },
+            account_id=kis_account_id,
+        )
+    context.repository.log_event("INFO", "broker_account_sync_job", "broker_account_sync_summary", "broker account sync completed", result)
     return result
 
 

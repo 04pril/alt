@@ -153,6 +153,10 @@ class BrokerRouterTest(unittest.TestCase):
         self.assertEqual(order_id, "kis-entry")
         self.assertEqual(self.kis.entry_calls, 1)
 
+    def test_blank_symbol_with_kr_asset_type_defaults_to_kis(self) -> None:
+        self.assertEqual(resolve_broker_mode(symbol="", asset_type="한국주식", kis_enabled=True), "kis_mock")
+        self.assertEqual(self.router.resolve_execution_account_id("", "한국주식"), ACCOUNT_KIS_KR_PAPER)
+
     def test_blank_asset_type_with_non_kr_symbol_stays_sim(self) -> None:
         self.assertEqual(resolve_broker_mode(symbol="AAPL", asset_type="", kis_enabled=True), "sim")
         signal = SimpleNamespace(symbol="AAPL", asset_type="")

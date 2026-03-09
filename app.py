@@ -5740,6 +5740,10 @@ def _beta_query_value(name: str, default: str = "") -> str:
 def _handle_beta_monitor_clone_action(settings) -> None:
     action = _beta_query_value("beta_action", "")
     token = _beta_query_value("beta_token", "")
+    requested_theme = str(_beta_query_value("beta_theme", "") or "").lower()
+    if requested_theme in {"light", "dark"} and requested_theme != str(st.session_state.get("ui_theme_mode", "") or "").lower():
+        st.session_state["ui_theme_mode"] = requested_theme
+        st_config.set_option("theme.base", requested_theme)
     if not action or not token:
         return
     if str(st.session_state.get("beta_last_action_token", "") or "") == token:
@@ -5753,7 +5757,7 @@ def _handle_beta_monitor_clone_action(settings) -> None:
     try:
         if action == "toggle_theme":
             current_mode = get_active_theme_mode()
-            next_theme_mode = "dark" if current_mode == "light" else "light"
+            next_theme_mode = requested_theme if requested_theme in {"light", "dark"} else ("dark" if current_mode == "light" else "light")
             st.session_state["beta_last_action_token"] = token
             st.session_state["beta_action_feedback"] = {
                 "ok": True,
@@ -5856,7 +5860,7 @@ def _replace_block(source: str, marker: str, replacement: str) -> str:
 def _render_beta_monitor_clone_page() -> None:
     settings = runtime_settings
     _handle_beta_monitor_clone_action(settings)
-    theme_mode = get_active_theme_mode()
+    theme_mode = get_active_theme_mode(_beta_query_value("beta_theme", ""))
     current_candidate_tab = _beta_query_value("beta_cand_tab", "")
     jobs_expanded = _beta_query_value("beta_jobs", "") == "all"
     repository = TradingRepository(settings.storage.db_path)
@@ -5864,6 +5868,14 @@ def _render_beta_monitor_clone_page() -> None:
     st.markdown(
         """
         <style>
+        header[data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stToolHeader"],
+        .stAppToolbar {
+          display: none !important;
+          visibility: hidden !important;
+          height: 0 !important;
+        }
         [data-testid="stAppViewContainer"] > .main {
           padding-top: 0 !important;
           margin-top: 0 !important;

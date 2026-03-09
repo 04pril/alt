@@ -230,11 +230,11 @@ class _FakeKISClient:
 def _asset_types(settings: RuntimeSettings) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for asset_type, schedule in settings.asset_schedules.items():
-        if schedule.timeframe == "1d" and schedule.timezone == "Asia/Seoul":
+        if schedule.session_mode == "market_hours" and schedule.timezone == "Asia/Seoul":
             result["kr"] = asset_type
-        elif schedule.timeframe == "1d" and schedule.timezone == "America/New_York":
+        elif schedule.session_mode == "market_hours" and schedule.timezone == "America/New_York":
             result["us"] = asset_type
-        elif schedule.timeframe == "1h":
+        elif schedule.session_mode == "always":
             result["crypto"] = asset_type
     return result
 

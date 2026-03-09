@@ -187,7 +187,7 @@ Gate tuning is tracked as explicit runtime profiles instead of editing the embed
 
 - `baseline`: current production-equivalent gate values
 - `balanced`: recommended default for live paper trading; relaxes stock entry gates enough to reduce `outside_preclose_window`, `expected_return_too_low`, and `confidence_too_low` pressure without changing the core loss-budget controls
-- `active`: higher-submission experimental profile; keeps the same drawdown and daily-loss ceilings but further lowers stock entry thresholds and expands daily entry capacity
+- `active`: higher-submission experimental profile; keeps the same drawdown and daily-loss ceilings but further lowers stock entry thresholds, expands daily entry capacity, and runs US equities on a `15m` model / `15분` scan cadence
 
 This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
 

@@ -580,9 +580,10 @@ def _table_html(frame: pd.DataFrame, columns: Sequence[str], empty_text: str, li
     return '<div class="detail-table-wrap"><table class="detail-table"><thead><tr>' + header_html + "</tr></thead><tbody>" + "".join(body_html) + "</tbody></table></div>"
 
 
-def _detail_card(title: str, body: str, note: str = "") -> str:
+def _detail_card(title: str, body: str, note: str = "", *, card_class: str = "detail-card") -> str:
     note_html = f'<div class="card-meta">{html.escape(note)}</div>' if note else ""
-    return '<div class="card detail-card"><div class="card-hd"><div class="card-title">' + html.escape(title) + "</div>" + note_html + "</div>" + body + "</div>"
+    classes = html.escape((card_class or "detail-card").strip())
+    return '<div class="card ' + classes + '"><div class="card-hd"><div class="card-title">' + html.escape(title) + "</div>" + note_html + "</div>" + body + "</div>"
 
 
 def _section_html(section_id: str, title: str, cards: Sequence[str]) -> str:
@@ -596,6 +597,7 @@ def _beta_href(
     token: str | None = None,
     candidate_tab: str | None = None,
     jobs: str | None = None,
+    theme: str | None = None,
 ) -> str:
     params: Dict[str, str] = {"beta_anchor": anchor}
     if action:
@@ -606,16 +608,52 @@ def _beta_href(
         params["beta_cand_tab"] = candidate_tab
     if jobs:
         params["beta_jobs"] = jobs
+    if theme:
+        params["beta_theme"] = theme
     return BETA_PATH + "?" + urlencode(params)
 
 
-def _action_button(label: str, action: str, css_class: str, anchor: str, *, token: str, candidate_tab: str | None, jobs: str | None) -> str:
-    href = _beta_href(anchor=anchor, action=action, token=token, candidate_tab=candidate_tab, jobs=jobs)
-    return (
-        f'<a class="{css_class}" href="{html.escape(href)}" target="_top" '
-        f'data-action="{html.escape(action)}" data-anchor="{html.escape(anchor)}" data-beta-link="preserve-candidate-tab">'
-        f"{html.escape(label)}</a>"
-    )
+def _beta_link_button(
+    *,
+    css_class: str,
+    href: str,
+    label: str | None = None,
+    body_html: str | None = None,
+    action: str | None = None,
+    anchor: str | None = None,
+    preserve_candidate_tab: bool = True,
+    theme_toggle: bool = False,
+) -> str:
+    attrs = [
+        'type="button"',
+        f'class="{html.escape(css_class)}"',
+        f'data-beta-href="{html.escape(href)}"',
+    ]
+    if action:
+        attrs.append(f'data-action="{html.escape(action)}"')
+    if anchor:
+        attrs.append(f'data-anchor="{html.escape(anchor)}"')
+    if preserve_candidate_tab:
+        attrs.append('data-beta-link="preserve-candidate-tab"')
+    if theme_toggle:
+        attrs.append('data-theme-toggle="1"')
+    inner = body_html if body_html is not None else html.escape(label or "")
+    return f"<button {' '.join(attrs)}>{inner}</button>"
+
+
+def _action_button(
+    label: str,
+    action: str,
+    css_class: str,
+    anchor: str,
+    *,
+    token: str,
+    candidate_tab: str | None,
+    jobs: str | None,
+    theme_mode: str,
+) -> str:
+    href = _beta_href(anchor=anchor, action=action, token=token, candidate_tab=candidate_tab, jobs=jobs, theme=theme_mode)
+    return _beta_link_button(css_class=css_class, href=href, label=label, action=action, anchor=anchor)
 
 
 def _nav_button(label: str, target: str, active: bool = False) -> str:
@@ -626,11 +664,15 @@ def _nav_button(label: str, target: str, active: bool = False) -> str:
 def _theme_button(theme_mode: str, anchor: str, *, token: str, candidate_tab: str | None, jobs: str | None) -> str:
     next_icon = "☾" if theme_mode == "light" else "☀"
     next_label = "다크" if theme_mode == "light" else "라이트"
-    href = _beta_href(anchor=anchor, action="toggle_theme", token=token, candidate_tab=candidate_tab, jobs=jobs)
-    return (
-        f'<a class="theme-toggle" href="{html.escape(href)}" target="_top" '
-        f'data-action="toggle_theme" data-anchor="{html.escape(anchor)}" data-beta-link="preserve-candidate-tab">'
-        f'<span id="theme-icon">{next_icon}</span><span id="theme-label">{next_label}</span></a>'
+    next_theme = "dark" if theme_mode == "light" else "light"
+    href = _beta_href(anchor=anchor, action="toggle_theme", token=token, candidate_tab=candidate_tab, jobs=jobs, theme=next_theme)
+    return _beta_link_button(
+        css_class="theme-toggle",
+        href=href,
+        body_html=f'<span id="theme-icon">{next_icon}</span><span id="theme-label">{next_label}</span>',
+        action="toggle_theme",
+        anchor=anchor,
+        theme_toggle=True,
     )
 
 
@@ -653,7 +695,7 @@ def _extra_styles() -> str:
 .chart-legend{margin-top:8px;font-size:11px;color:var(--text3);text-align:right}
 .acct-value.compact,.sum-value.compact{font-size:24px;letter-spacing:-0.03em}
 .acct-mini,.sum-mini{margin-top:4px;font-size:10px;color:var(--text3);line-height:1.35}
-.theme-toggle,.cand-tab,.btn,.btn-mini,.wp-restart,.job-more{text-decoration:none}
+.theme-toggle,.cand-tab,.btn,.btn-mini,.wp-restart,.job-more{text-decoration:none;appearance:none;-webkit-appearance:none;font:inherit;cursor:pointer}
 .cand-tab,.btn,.btn-mini,.wp-restart,.job-more{display:inline-flex;align-items:center;justify-content:center}
 .signal-item{align-items:flex-start}
 .sig-main{min-width:0;flex:1;display:flex;flex-direction:column;gap:4px}
@@ -675,15 +717,23 @@ def _extra_styles() -> str:
 .feedback-banner{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--surface);margin-bottom:12px;font-size:12px;font-weight:600}
 .feedback-banner.ok{border-color:rgba(16,185,129,.28);color:var(--ok)}
 .feedback-banner.bad{border-color:rgba(239,68,68,.28);color:var(--up)}
+.equity-area{fill:color-mix(in srgb,var(--accent) 18%,transparent)}
+.equity-line{stroke:var(--accent)}
 .detail-section{margin-top:14px}
 .detail-section-title{font-size:12px;font-weight:800;letter-spacing:.08em;color:var(--text3);text-transform:uppercase;margin:0 0 8px 2px}
 .detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.detail-events-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(300px,.85fr);gap:12px}
+.detail-events-main,.detail-events-side,.detail-anchor-card{min-width:0}
+.detail-events-side{display:grid;gap:12px;align-content:start}
+.detail-card.compact .detail-table-wrap{max-height:208px;overflow:auto}
+.detail-card.compact .detail-table th,.detail-card.compact .detail-table td{padding:8px 8px;font-size:10px}
+.detail-card.compact .empty-block{padding:16px 10px}
 .detail-table-wrap{overflow:auto}
 .detail-table{width:100%;border-collapse:collapse;font-size:11px}
 .detail-table th{padding:10px 8px;border-bottom:1px solid var(--border);color:var(--text3);font-size:10px;font-weight:700;text-align:left;white-space:nowrap}
 .detail-table td{padding:10px 8px;border-bottom:1px solid var(--border2);vertical-align:top;color:var(--text);line-height:1.45}
 .detail-table tr:last-child td{border-bottom:none}
-@media (max-width: 1180px){.account-row{grid-template-columns:1fr}.content-grid{grid-template-columns:1fr}.detail-grid{grid-template-columns:1fr}.signal-item{flex-direction:column}.sig-time{min-width:auto;margin-left:0;align-self:flex-start}}
+@media (max-width: 1180px){.account-row{grid-template-columns:1fr}.content-grid{grid-template-columns:1fr}.detail-grid,.detail-events-grid{grid-template-columns:1fr}.signal-item{flex-direction:column}.sig-time{min-width:auto;margin-left:0;align-self:flex-start}}
 """
 
 
@@ -701,11 +751,9 @@ def _equity_svg(equity_curve: pd.DataFrame, theme_mode: str) -> str:
         x = padding + (index / max(len(values) - 1, 1)) * (width - padding * 2)
         y = height - padding - ((float(value) - minimum) / spread) * (height - padding * 2)
         points.append(f"{x:.2f},{y:.2f}")
-    line_color = "#818cf8" if theme_mode == "dark" else "#6366f1"
-    fill_color = "rgba(129, 140, 248, 0.18)" if theme_mode == "dark" else "rgba(99, 102, 241, 0.14)"
     area = " ".join(points + [f"{width - padding:.2f},{height - padding:.2f}", f"{padding:.2f},{height - padding:.2f}"])
     polyline = " ".join(points)
-    return f'<div class="chart-box chart-box-live"><svg viewBox="0 0 {int(width)} {int(height)}" preserveAspectRatio="xMidYMid meet"><polygon points="{area}" fill="{fill_color}"></polygon><polyline points="{polyline}" fill="none" stroke="{line_color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline></svg><div class="chart-legend">최근 평가 자산 {html.escape(_fmt_money(values.iloc[-1]))}</div></div>'
+    return f'<div class="chart-box chart-box-live"><svg viewBox="0 0 {int(width)} {int(height)}" preserveAspectRatio="xMidYMid meet"><polygon class="equity-area" points="{area}"></polygon><polyline class="equity-line" points="{polyline}" fill="none" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline></svg><div class="chart-legend">최근 평가 자산 {html.escape(_fmt_money(values.iloc[-1]))}</div></div>'
 
 
 def _account_card(
@@ -1102,10 +1150,10 @@ def render_beta_overview_component(
         status = str(row.get("status") or "never").lower()
         dot_class = "s-g" if status in {"completed", "running"} else "s-y" if status in {"queued", "retry", "paused"} else "s-r"
         button_label = "장 상태 확인" if job_name == "broker_market_status" else "재동기화"
-        sync_rows.append('<div class="sync-row"><div class="sync-left"><span class="s-dot ' + dot_class + '"></span><span class="sync-lbl">' + html.escape(label) + '</span></div><span class="sync-time">' + html.escape(_fmt_time(row.get("heartbeat_at") or row.get("finished_at") or row.get("started_at"))) + '</span>' + _action_button(button_label, action, "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + '</div>')
+        sync_rows.append('<div class="sync-row"><div class="sync-left"><span class="s-dot ' + dot_class + '"></span><span class="sync-lbl">' + html.escape(label) + '</span></div><span class="sync-time">' + html.escape(_fmt_time(row.get("heartbeat_at") or row.get("finished_at") or row.get("started_at"))) + '</span>' + _action_button(button_label, action, "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + '</div>')
 
     worker_tone = "s-g" if worker_state == "running" else "s-y" if worker_state == "paused" else "s-r"
-    right_html = '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">트레이딩 제어</div></div>' + f'<div class="worker-pill"><span class="s-dot {worker_tone}"></span><span class="wp-label">워커</span><span class="wp-val">{html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span>{_action_button("재시작", "restart_worker", "wp-restart", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value)}</div>' + '<div class="ctrl-sect"><div class="ctrl-lbl">진입</div><div class="ctrl-btns">' + _action_button("일시정지", "pause_entries", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + _action_button("재개", "resume_entries", "btn btn-go", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + '</div></div><div class="ctrl-sect"><div class="ctrl-lbl">전체 매매</div><div class="ctrl-btns">' + _action_button("전체 정지", "halt_all", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + '</div></div></div>' + '<div id="sync" class="card" data-section-anchor="sync"><div class="card-hd"><div class="card-title">런타임 상태</div></div><div class="sync-section"><div class="sync-title">동기화</div>' + "".join(sync_rows) + '<div class="sync-row"><div class="sync-left"><span class="s-dot s-g"></span><span class="sync-lbl">시그널 스캔</span></div><span class="sync-time">' + html.escape(scan_time) + '</span>' + _action_button("즉시 스캔", "scan_now", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + '</div></div><div class="sync-section"><div class="sync-title">KIS 브로커</div><div class="sync-row"><div class="sync-left"><span class="sync-lbl">대기 주문</span></div><span style="color:var(--warn);font-weight:700;font-size:12px;margin-right:6px;">' + str(_i(kis_runtime.get("pending_submitted_orders"))) + '건</span>' + _action_button("주문 확인", "order_check", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value) + '</div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">웹소켓</span></div><span class="badge {"b-ok" if kis_runtime.get("last_websocket_execution_event") else "b-warn"}">{"수신중" if kis_runtime.get("last_websocket_execution_event") else "대기"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">API 토큰</span></div><span class="badge {"b-ok" if kis_account_snapshot else "b-warn"}">{"유효" if kis_account_snapshot else "확인 필요"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">거래 모드</span></div><span class="badge {"b-mod" if kis_account_snapshot else "b-warn"}">{"모의" if kis_account_snapshot else "비활성"}</span></div></div></div>' + '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">자산 추이</div><div class="card-meta">최근 24개 스냅샷</div></div>' + _equity_svg(equity_curve, theme_mode) + "</div>"
+    right_html = '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">트레이딩 제어</div></div>' + f'<div class="worker-pill"><span class="s-dot {worker_tone}"></span><span class="wp-label">워커</span><span class="wp-val">{html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span>{_action_button("재시작", "restart_worker", "wp-restart", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode)}</div>' + '<div class="ctrl-sect"><div class="ctrl-lbl">진입</div><div class="ctrl-btns">' + _action_button("일시정지", "pause_entries", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + _action_button("재개", "resume_entries", "btn btn-go", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + '</div></div><div class="ctrl-sect"><div class="ctrl-lbl">전체 매매</div><div class="ctrl-btns">' + _action_button("전체 정지", "halt_all", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + '</div></div></div>' + '<div id="sync" class="card" data-section-anchor="sync"><div class="card-hd"><div class="card-title">런타임 상태</div></div><div class="sync-section"><div class="sync-title">동기화</div>' + "".join(sync_rows) + '<div class="sync-row"><div class="sync-left"><span class="s-dot s-g"></span><span class="sync-lbl">시그널 스캔</span></div><span class="sync-time">' + html.escape(scan_time) + '</span>' + _action_button("즉시 스캔", "scan_now", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + '</div></div><div class="sync-section"><div class="sync-title">KIS 브로커</div><div class="sync-row"><div class="sync-left"><span class="sync-lbl">대기 주문</span></div><span style="color:var(--warn);font-weight:700;font-size:12px;margin-right:6px;">' + str(_i(kis_runtime.get("pending_submitted_orders"))) + '건</span>' + _action_button("주문 확인", "order_check", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, theme_mode=theme_mode) + '</div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">웹소켓</span></div><span class="badge {"b-ok" if kis_runtime.get("last_websocket_execution_event") else "b-warn"}">{"수신중" if kis_runtime.get("last_websocket_execution_event") else "대기"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">API 토큰</span></div><span class="badge {"b-ok" if kis_account_snapshot else "b-warn"}">{"유효" if kis_account_snapshot else "확인 필요"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">거래 모드</span></div><span class="badge {"b-mod" if kis_account_snapshot else "b-warn"}">{"모의" if kis_account_snapshot else "비활성"}</span></div></div></div>' + '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">자산 추이</div><div class="card-meta">최근 24개 스냅샷</div></div>' + _equity_svg(equity_curve, theme_mode) + "</div>"
     template = _replace_block(template, 'class="content-grid"', '<div class="content-grid"><div class="left-col">' + left_html + '</div><div class="right-col">' + right_html + "</div></div>")
 
     all_job_rows = []
@@ -1118,8 +1166,12 @@ def render_beta_overview_component(
     visible_job_rows = all_job_rows if jobs_expanded else all_job_rows[:5]
     jobs_toggle_html = ""
     if len(all_job_rows) > 5:
-        jobs_href = _beta_href(anchor="jobs", candidate_tab=current_candidate_tab or None, jobs=None if jobs_expanded else "all")
-        jobs_toggle_html = f'<a class="job-more" href="{html.escape(jobs_href)}" target="_top" data-beta-link="preserve-candidate-tab">{"접기" if jobs_expanded else "상세보기"}</a>'
+        jobs_href = _beta_href(anchor="jobs", candidate_tab=current_candidate_tab or None, jobs=None if jobs_expanded else "all", theme=theme_mode)
+        jobs_toggle_html = _beta_link_button(
+            css_class="job-more",
+            href=jobs_href,
+            label="접기" if jobs_expanded else "상세보기",
+        )
 
     error_preview = broker_sync_errors if not broker_sync_errors.empty else recent_errors
     error_rows = []
@@ -1127,11 +1179,50 @@ def render_beta_overview_component(
         error_rows.append('<div class="err-row"><div class="err-head">' + f'<span class="err-sym">{html.escape(str(row.get("component") or "runtime"))}</span>' + f'<span class="err-type">{html.escape(str(row.get("event_type") or "error"))}</span>' + f'<span class="err-time">{html.escape(_fmt_time(row.get("created_at")))}</span>' + '</div><div class="err-msg">' + html.escape(str(row.get("message") or "")) + "</div></div>")
     template = _replace_block(template, 'class="bottom-grid"', '<div class="bottom-grid"><div id="jobs" class="card" data-section-anchor="jobs"><div class="card-hd job-card-head"><div class="card-title">최근 작업 상태</div>' + jobs_toggle_html + '</div><div class="job-list">' + ("".join(visible_job_rows) if visible_job_rows else '<div class="empty-block">최근 작업 이력이 없습니다.</div>') + '</div></div><div class="card" data-section-anchor="errors"><div class="card-hd"><div class="card-title">최근 브로커 오류</div><div class="card-meta">' + _chip(f"{len(broker_sync_errors)}건", "bad" if len(broker_sync_errors) else "ok") + '</div></div><div class="err-list">' + ("".join(error_rows) if error_rows else '<div class="empty-block">최근 오류가 없습니다.</div>') + "</div></div></div>")
 
+    events_section = (
+        '<section class="detail-section" id="events" data-section-anchor="events">'
+        '<div class="detail-section-title">실행 이벤트</div>'
+        '<div class="detail-events-grid">'
+        '<div class="detail-events-main">'
+        + _detail_card(
+            "실행 이벤트 상세",
+            _table_html(
+                today_execution_events,
+                ["created_at", "account_id", "event_type", "component", "level", "message"],
+                "실행 이벤트가 없습니다.",
+                limit=14,
+            ),
+            note=f"최근 {min(len(today_execution_events), 14)}건",
+        )
+        + '</div><div class="detail-events-side">'
+        + '<div class="detail-anchor-card">'
+        + _detail_card(
+            "미진입 사유 요약",
+            _table_html(noop_breakdown, ["reason", "count"], "미진입 집계가 없습니다.", limit=6),
+            note=f"사유 {len(noop_breakdown)}건",
+            card_class="detail-card compact",
+        )
+        + "</div>"
+        + '<div id="assets" class="detail-anchor-card" data-section-anchor="assets">'
+        + _detail_card(
+            "운영 자산 설정",
+            _table_html(asset_overview, [], "자산 설정 정보가 없습니다.", limit=8),
+            note=f"자산 {len(asset_overview)}종",
+            card_class="detail-card compact",
+        )
+        + "</div>"
+        + '<div id="errors" class="detail-anchor-card" data-section-anchor="errors">'
+        + _detail_card(
+            "최근 오류",
+            _table_html(recent_errors, ["created_at", "component", "event_type", "level", "message"], "최근 오류가 없습니다.", limit=8),
+            note=f"최근 {min(len(recent_errors), 8)}건",
+            card_class="detail-card compact",
+        )
+        + "</div></div></div></section>"
+    )
     detail_sections = [
         _section_html("positions", "보유 현황", [_detail_card("최근 주문 활동", _table_html(recent_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "최근 주문 활동이 없습니다.", limit=12), note=f"최근 {min(len(recent_orders), 12)}건"), _detail_card("대기 주문", _table_html(open_orders, ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"], "대기 주문이 없습니다.", limit=12), note=f"현재 {_i(summary.get('open_orders', 0))}건")]),
-        _section_html("events", "실행 이벤트", [_detail_card("실행 이벤트 상세", _table_html(today_execution_events, ["created_at", "account_id", "event_type", "component", "level", "message"], "실행 이벤트가 없습니다.", limit=14), note=f"최근 {min(len(today_execution_events), 14)}건"), _detail_card("미진입 사유 요약", _table_html(noop_breakdown, ["reason", "count"], "미진입 집계가 없습니다.", limit=10), note=f"사유 {len(noop_breakdown)}건")]),
-        _section_html("assets", "자산 설정", [_detail_card("운영 자산 설정", _table_html(asset_overview, [], "자산 설정 정보가 없습니다.", limit=10), note=f"자산 {len(asset_overview)}종")]),
-        _section_html("errors", "최근 오류", [_detail_card("오류 이벤트", _table_html(recent_errors, ["created_at", "component", "event_type", "level", "message"], "최근 오류가 없습니다.", limit=14), note=f"최근 {min(len(recent_errors), 14)}건")]),
+        events_section,
     ]
     template = template.replace("</div><!-- /main -->", '<div class="detail-stack">' + "".join(detail_sections) + "</div></div><!-- /main -->", 1)
 
@@ -1141,7 +1232,7 @@ def render_beta_overview_component(
         feedback_html = f'<div class="feedback-banner {tone_class}">{html.escape(str(feedback.get("message")))}</div>'
     template = template.replace('<div class="main">', f'<div class="main">{feedback_html}', 1)
 
-    detail_frames = [recent_orders, open_orders, today_execution_events, broker_sync_errors, asset_overview, recent_errors]
+    detail_frames = [recent_orders, open_orders, today_execution_events, noop_breakdown, asset_overview, recent_errors]
     extra_rows = sum(min(len(frame), 16) for frame in detail_frames if isinstance(frame, pd.DataFrame))
     component_height = min(7200, max(3600, 3200 + extra_rows * 26))
 
@@ -1149,24 +1240,67 @@ def render_beta_overview_component(
 <script>
 (() => {{
   const initialAnchor = {json.dumps(initial_anchor or "beta-overview")};
+  const serverThemeMode = {json.dumps(theme_mode if theme_mode in {"light", "dark"} else "light")};
+  const themeStorageKey = "alt-beta-theme";
   let disposed = false;
-  const actionButtons = Array.from(document.querySelectorAll("[data-action]"));
+  const root = document.documentElement;
+  const actionButtons = Array.from(document.querySelectorAll("[data-beta-href]"));
   const navButtons = Array.from(document.querySelectorAll("[data-nav-target]"));
   const candidateTabs = Array.from(document.querySelectorAll("[data-cand-tab]"));
   const candidatePanes = Array.from(document.querySelectorAll("[data-cand-pane]"));
-  const preservedLinks = Array.from(document.querySelectorAll("[data-beta-link]"));
+  const themeToggleButton = document.querySelector("[data-theme-toggle='1']");
+  const themeIcon = document.getElementById("theme-icon");
+  const themeLabel = document.getElementById("theme-label");
   const navIds = navButtons.map((button) => button.dataset.navTarget).filter(Boolean);
   const pendingTimers = [];
   let resizeObserver = null;
+  const readStoredTheme = () => {{
+    try {{
+      const storedTheme = window.localStorage.getItem(themeStorageKey);
+      if (storedTheme === "light" || storedTheme === "dark") return storedTheme;
+    }} catch (error) {{
+    }}
+    return serverThemeMode;
+  }};
   const rewriteCandidateTabOnLinks = (targetKey) => {{
-    preservedLinks.forEach((link) => {{
-      const href = link.getAttribute("href");
+    actionButtons.forEach((link) => {{
+      if (link.dataset.betaLink !== "preserve-candidate-tab") return;
+      const href = link.getAttribute("data-beta-href");
       if (!href) return;
       const url = new URL(href, "http://beta.local");
       if (targetKey) url.searchParams.set("beta_cand_tab", targetKey);
       else url.searchParams.delete("beta_cand_tab");
-      link.setAttribute("href", url.pathname + url.search + url.hash);
+      link.setAttribute("data-beta-href", url.pathname + url.search + url.hash);
     }});
+  }};
+  const rewriteThemeOnLinks = (themeMode) => {{
+    actionButtons.forEach((link) => {{
+      const href = link.getAttribute("data-beta-href");
+      if (!href) return;
+      const url = new URL(href, "http://beta.local");
+      if (themeMode === "light" || themeMode === "dark") url.searchParams.set("beta_theme", themeMode);
+      else url.searchParams.delete("beta_theme");
+      link.setAttribute("data-beta-href", url.pathname + url.search + url.hash);
+    }});
+  }};
+  const updateThemeToggle = (themeMode) => {{
+    if (!themeToggleButton) return;
+    const nextTheme = themeMode === "dark" ? "light" : "dark";
+    if (themeIcon) themeIcon.textContent = themeMode === "dark" ? "☀" : "☾";
+    if (themeLabel) themeLabel.textContent = themeMode === "dark" ? "라이트" : "다크";
+    themeToggleButton.dataset.themeMode = nextTheme;
+  }};
+  const applyTheme = (themeMode) => {{
+    const normalizedTheme = themeMode === "dark" ? "dark" : "light";
+    root.setAttribute("data-theme", normalizedTheme);
+    document.body.style.colorScheme = normalizedTheme;
+    rewriteThemeOnLinks(normalizedTheme);
+    updateThemeToggle(normalizedTheme);
+  }};
+  const cleanupNavigation = () => {{
+    disposed = true;
+    if (resizeObserver) resizeObserver.disconnect();
+    pendingTimers.forEach((timerId) => clearTimeout(timerId));
   }};
   const notifyHeight = () => {{
     if (disposed) return;
@@ -1177,11 +1311,29 @@ def render_beta_overview_component(
       disposed = true;
     }}
   }};
-  const normalizePath = (url) => {{
-    const parts = url.pathname.split("/").filter(Boolean);
-    if (!parts.length) {{ url.pathname = "/beta"; return; }}
-    parts[parts.length - 1] = "beta";
-    url.pathname = "/" + parts.join("/");
+  const navigateParent = (href) => {{
+    if (!href) return;
+    cleanupNavigation();
+    let absoluteUrl = href;
+    try {{
+      absoluteUrl = new URL(href, window.parent.location.href).toString();
+    }} catch (error) {{
+    }}
+    try {{
+      if (window.parent && window.parent.location) {{
+        window.parent.location.assign(absoluteUrl);
+        return;
+      }}
+    }} catch (error) {{
+    }}
+    try {{
+      if (window.top && window.top.location) {{
+        window.top.location.href = absoluteUrl;
+        return;
+      }}
+    }} catch (error) {{
+    }}
+    window.location.assign(absoluteUrl);
   }};
   const activateTab = (targetId) => {{
     navButtons.forEach((button) => button.classList.toggle("active", button.dataset.navTarget === targetId));
@@ -1192,28 +1344,21 @@ def render_beta_overview_component(
     rewriteCandidateTabOnLinks(targetKey);
     notifyHeight();
   }};
-  const sectionForButton = (button) => button.dataset.anchor || button.closest("[data-section-anchor]")?.dataset.sectionAnchor || initialAnchor || "beta-overview";
   actionButtons.forEach((button) => {{
     button.addEventListener("click", (event) => {{
-      const href = button.getAttribute("href");
-      if (href) {{
+      if (button.dataset.themeToggle === "1") {{
         event.preventDefault();
-        disposed = true;
-        if (resizeObserver) resizeObserver.disconnect();
-        pendingTimers.forEach((timerId) => clearTimeout(timerId));
-        window.open(href, "_top");
+        const nextTheme = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+        try {{
+          window.localStorage.setItem(themeStorageKey, nextTheme);
+        }} catch (error) {{
+        }}
+        applyTheme(nextTheme);
+        notifyHeight();
         return;
       }}
       event.preventDefault();
-      const parentUrl = new URL(window.parent.location.href);
-      normalizePath(parentUrl);
-      parentUrl.searchParams.set("beta_action", button.dataset.action || "");
-      parentUrl.searchParams.set("beta_token", String(Date.now()));
-      parentUrl.searchParams.set("beta_anchor", sectionForButton(button));
-      disposed = true;
-      if (resizeObserver) resizeObserver.disconnect();
-      pendingTimers.forEach((timerId) => clearTimeout(timerId));
-      window.open(parentUrl.toString(), "_top");
+      navigateParent(button.getAttribute("data-beta-href") || "");
     }});
   }});
   navButtons.forEach((button) => {{
@@ -1249,10 +1394,9 @@ def render_beta_overview_component(
     resizeObserver.observe(document.body);
   }}
   window.addEventListener("pagehide", () => {{
-    disposed = true;
-    if (resizeObserver) resizeObserver.disconnect();
-    pendingTimers.forEach((timerId) => clearTimeout(timerId));
+    cleanupNavigation();
   }});
+  applyTheme(readStoredTheme());
   requestAnimationFrame(() => {{
     const initialCandidateTab = candidateTabs.find((button) => button.classList.contains("active"))?.dataset.candTab || candidateTabs[0]?.dataset.candTab;
     if (initialCandidateTab) activateCandidateTab(initialCandidateTab);

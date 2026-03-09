@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
+import beta_monitor_clone as clone
 from beta_monitor_clone import (
     _account_card_compact,
+    _action_button,
     _build_entry_result_rows,
     _candidate_tabs_html,
     _equity_svg,
     _ensure_template_base_href,
     _money_display_pair,
     _replace_template_script,
+    _theme_button,
 )
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 
 
 class BetaMonitorCloneTest(unittest.TestCase):
@@ -90,6 +96,8 @@ class BetaMonitorCloneTest(unittest.TestCase):
         markup = _equity_svg(curve, theme_mode="dark")
 
         self.assertIn('preserveAspectRatio="xMidYMid meet"', markup)
+        self.assertIn('class="equity-area"', markup)
+        self.assertIn('class="equity-line"', markup)
         self.assertIn("최근 평가 자산", markup)
 
     def test_candidate_tabs_split_markets_and_show_kr_name(self) -> None:
@@ -144,6 +152,38 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('data-cand-tab="us"', markup)
         self.assertNotIn("beta_cand_tab=us", markup)
 
+    def test_action_button_uses_button_markup_with_beta_href(self) -> None:
+        markup = _action_button(
+            "계좌 동기화",
+            "sync_account",
+            "btn-mini",
+            "sync",
+            token="token1",
+            candidate_tab="crypto",
+            jobs="all",
+            theme_mode="dark",
+        )
+
+        self.assertIn('type="button"', markup)
+        self.assertIn('data-beta-href="/beta?beta_anchor=sync&amp;beta_action=sync_account&amp;beta_token=token1&amp;beta_cand_tab=crypto&amp;beta_jobs=all&amp;beta_theme=dark"', markup)
+        self.assertIn('data-action="sync_account"', markup)
+        self.assertNotIn('target="_top"', markup)
+
+    def test_theme_button_uses_button_markup_with_toggle_href(self) -> None:
+        markup = _theme_button(
+            "light",
+            "beta-overview",
+            token="theme1",
+            candidate_tab="us",
+            jobs=None,
+        )
+
+        self.assertIn('type="button"', markup)
+        self.assertIn('data-beta-href="/beta?beta_anchor=beta-overview&amp;beta_action=toggle_theme&amp;beta_token=theme1&amp;beta_cand_tab=us&amp;beta_theme=dark"', markup)
+        self.assertIn('data-theme-toggle="1"', markup)
+        self.assertIn('id="theme-label"', markup)
+        self.assertNotIn('target="_top"', markup)
+
     def test_money_display_pair_converts_usd_to_krw_when_fx_available(self) -> None:
         primary, secondary = _money_display_pair(
             100.0,
@@ -195,6 +235,82 @@ class BetaMonitorCloneTest(unittest.TestCase):
 
         self.assertIn("145만", markup)
         self.assertIn("1,000.00 USD", markup)
+
+    def test_render_beta_overview_component_uses_light_theme_and_compact_detail_stack(self) -> None:
+        template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
+<nav class="top-nav"></nav>
+<div class="status-strip"></div>
+<div class="main">
+  <div class="account-row"></div>
+  <div class="stat-bar"></div>
+  <div class="content-grid"></div>
+  <div class="bottom-grid"></div>
+</div><!-- /main -->
+<script>window.template = true;</script>
+</body></html>"""
+        data = {
+            "summary": {"latest_account": {}},
+            "auto_trading_status": {"state": "running", "label": "가동 중"},
+            "execution_summary": {"today_noop_breakdown": pd.DataFrame()},
+            "broker_sync_status": pd.DataFrame(),
+            "broker_sync_errors": pd.DataFrame(),
+            "kis_runtime": {},
+            "runtime_profile": {"name": "active"},
+            "job_health": pd.DataFrame(),
+            "recent_errors": pd.DataFrame(),
+            "recent_events": pd.DataFrame(),
+            "open_positions": pd.DataFrame(),
+            "open_orders": pd.DataFrame(),
+            "candidate_scans": pd.DataFrame(),
+            "prediction_report": pd.DataFrame(),
+            "equity_curve": pd.DataFrame(),
+            "today_execution_events": pd.DataFrame(),
+            "asset_overview": pd.DataFrame(),
+        }
+        accounts_overview = {
+            ACCOUNT_KIS_KR_PAPER: {"currency": "KRW", "latest_snapshot": {"equity": 30000000.0, "cash": 30000000.0}},
+            ACCOUNT_SIM_US_EQUITY: {"currency": "USD", "latest_snapshot": {"equity": 21000.0, "cash": 21000.0}},
+            ACCOUNT_SIM_CRYPTO: {"currency": "USD", "latest_snapshot": {"equity": 21000.0, "cash": 21000.0}},
+        }
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            template_path = Path(tmp_dir) / "beta_template.html"
+            template_path.write_text(template, encoding="utf-8")
+            original_path = clone.TEMPLATE_PATH
+            original_html = clone.components.html
+            try:
+                clone.TEMPLATE_PATH = template_path
+                clone.components.html = lambda html, height, scrolling: captured.update(
+                    {"html": html, "height": height, "scrolling": scrolling}
+                )
+                clone.render_beta_overview_component(
+                    data=data,
+                    theme_mode="light",
+                    initial_anchor="beta-overview",
+                    feedback=None,
+                    accounts_overview=accounts_overview,
+                    total_portfolio_overview={},
+                    quote_snapshots={"KRW=X": {"current_price": 1450.0}},
+                    kr_asset_types={"한국주식"},
+                    recent_orders=pd.DataFrame(),
+                    current_candidate_tab="us",
+                    jobs_expanded=False,
+                )
+            finally:
+                clone.TEMPLATE_PATH = original_path
+                clone.components.html = original_html
+
+        markup = str(captured.get("html") or "")
+        self.assertIn('data-theme="light"', markup)
+        self.assertIn('data-theme-toggle="1"', markup)
+        self.assertIn("alt-beta-theme", markup)
+        self.assertIn("applyTheme(readStoredTheme())", markup)
+        self.assertIn("detail-events-grid", markup)
+        self.assertIn('id="assets"', markup)
+        self.assertIn('id="errors"', markup)
+        self.assertIn('data-beta-href="/beta?beta_anchor=beta-overview', markup)
+        self.assertNotIn("window.template = true;", markup)
 
 
 if __name__ == "__main__":

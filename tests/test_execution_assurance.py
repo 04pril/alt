@@ -4,8 +4,11 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+import pandas as pd
+
 from config.settings import RuntimeSettings
 from jobs.tasks import broker_account_sync_job, broker_market_status_job, broker_order_sync_job, broker_position_sync_job
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 from storage.repository import TradingRepository
 
 
@@ -88,6 +91,15 @@ class ExecutionAssuranceJobsTest(unittest.TestCase):
         self.assertTrue(result)
         for asset_type in self.settings.asset_schedules.keys():
             self.assertEqual(self.repo.get_control_flag(f"market_phase:{asset_type}", ""), "pre_close")
+
+    def test_broker_market_status_job_records_account_scoped_events(self) -> None:
+        broker_market_status_job(self.context)
+        events = self.repo.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=50)
+        scoped = events.loc[events["event_type"].astype(str) == "broker_market_status"].copy()
+        self.assertEqual(
+            set(scoped["account_id"].astype(str)),
+            {ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO},
+        )
 
 
 if __name__ == "__main__":

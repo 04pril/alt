@@ -573,6 +573,18 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertTrue({"last_broker_account_sync", "last_broker_order_sync", "last_websocket_execution_event", "pending_submitted_orders", "broker_rejects_today"} <= set(data["kis_runtime"].keys()))
         self.assertGreaterEqual(data["execution_summary"]["today_candidate_count"], 1)
 
+    def test_account_scoped_sync_events_exist_for_all_execution_accounts(self) -> None:
+        self._run_job("broker_market_status", lambda: broker_market_status_job(self.fixture.context))
+        self._run_job("broker_account_sync", lambda: broker_account_sync_job(self.fixture.context))
+        self._run_job("broker_position_sync", lambda: broker_position_sync_job(self.fixture.context))
+        self._run_job("broker_order_sync", lambda: broker_order_sync_job(self.fixture.context))
+
+        for account_id in (ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO):
+            self.assertIsNotNone(self.fixture.repository.latest_system_event("broker_market_status", account_id=account_id))
+            self.assertIsNotNone(self.fixture.repository.latest_system_event("broker_account_sync", account_id=account_id))
+            self.assertIsNotNone(self.fixture.repository.latest_system_event("broker_position_sync", account_id=account_id))
+            self.assertIsNotNone(self.fixture.repository.latest_system_event("broker_order_sync", account_id=account_id))
+
 
 if __name__ == "__main__":
     unittest.main()
