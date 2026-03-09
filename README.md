@@ -271,3 +271,18 @@ Execution assurance coverage includes:
 - Reservation orders are not wired into the worker yet.
 - KR daily pre-close gating is still schedule-based, not exchange-calendar-perfect.
 - US equities and crypto still use the sim broker path.
+
+## Final Merge Note
+
+- Merge recommendation: `go`
+- Recommended default profile: `balanced`
+- Broker policy: `한국주식 + KR 심볼 -> kis_mock`, `미국주식/코인 -> sim`
+- Canonical ledger: `account_snapshots`
+  - KR risk path -> `kis_account_sync` first
+  - US/crypto risk path -> sim-only snapshots
+
+Manual pre-merge checks:
+
+1. Start the worker with the balanced profile and confirm `runtime_profile_name=balanced` and the same value in the monitoring read model.
+2. Verify one KR candidate flows through `broker_account_sync -> candidate -> entry_allowed -> submit_requested -> submitted/acknowledged -> filled` with matching order/fill/position rows.
+3. Confirm operations monitoring still shows `한국주식=kis_mock`, `미국주식=sim`, `코인=sim` and `broker_sync_errors=0` on a healthy path.

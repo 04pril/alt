@@ -465,7 +465,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.fixture.repository.insert_account_snapshot(
             AccountSnapshotRecord(
                 snapshot_id="snap_sim",
-                created_at="2026-03-09T05:00:00Z",
+                created_at="2099-03-09T05:00:00Z",
                 cash=12_000_000.0,
                 equity=12_500_000.0,
                 gross_exposure=500_000.0,
@@ -484,7 +484,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.fixture.repository.insert_account_snapshot(
             AccountSnapshotRecord(
                 snapshot_id="snap_kis",
-                created_at="2026-03-09T05:01:00Z",
+                created_at="2099-03-09T05:01:00Z",
                 cash=30_000_000.0,
                 equity=31_000_000.0,
                 gross_exposure=1_000_000.0,
