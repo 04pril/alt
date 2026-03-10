@@ -14,6 +14,8 @@ from runtime_accounts import ACCOUNT_KIS_KR_PAPER
 KR_DAILY_PRE_CLOSE_V1 = "kr_daily_preclose_v1"
 KR_INTRADAY_1H_V1 = "kr_intraday_1h_v1"
 KR_INTRADAY_15M_V1 = "kr_intraday_15m_v1"
+KR_INTRADAY_15M_V1_AFTER_CLOSE_CLOSE = "kr_intraday_15m_v1_after_close_close"
+KR_INTRADAY_15M_V1_AFTER_CLOSE_SINGLE = "kr_intraday_15m_v1_after_close_single"
 
 
 def all_kr_strategies(settings: RuntimeSettings) -> dict[str, KRStrategyConfig]:
@@ -57,6 +59,7 @@ def strategy_schedule(settings: RuntimeSettings, strategy_id: str) -> AssetSched
     base = settings.asset_schedules["한국주식"]
     return replace(
         base,
+        session_mode=str(strategy.session_mode),
         timeframe=str(strategy.timeframe),
         scan_interval_minutes=int(strategy.scan_interval_minutes),
         entry_interval_minutes=int(strategy.entry_interval_minutes),
@@ -73,8 +76,22 @@ def strategy_label(strategy: KRStrategyConfig) -> str:
     return f"{strategy.display_name}{suffix}".strip()
 
 
+def strategy_session_mode(strategy: KRStrategyConfig | None) -> str:
+    return str((strategy.session_mode if strategy is not None else "") or "regular")
+
+
+def strategy_session_label(strategy: KRStrategyConfig | None) -> str:
+    mode = strategy_session_mode(strategy)
+    return {
+        "regular": "regular",
+        "pre_close": "pre_close",
+        "after_close_close_price": "after_close_close",
+        "after_close_single_price": "after_close_single",
+    }.get(mode, mode)
+
+
 def strategy_requires_flatten(strategy: KRStrategyConfig) -> bool:
-    return bool(strategy.strategy_family == "kr_intraday")
+    return bool(strategy_session_mode(strategy) == "regular" and strategy_is_intraday(strategy))
 
 
 def strategy_is_intraday(strategy: KRStrategyConfig) -> bool:
@@ -94,6 +111,19 @@ def _local_dt(schedule: AssetScheduleConfig, when: datetime | None = None) -> da
     if when is not None:
         return when.astimezone(ZoneInfo(schedule.timezone))
     return datetime.now(ZoneInfo(schedule.timezone))
+
+
+def _time_in_window(current: time, start_text: str, end_text: str) -> bool:
+    if not str(start_text or "").strip() or not str(end_text or "").strip():
+        return False
+    return time.fromisoformat(start_text) <= current <= time.fromisoformat(end_text)
+
+
+def _single_price_auction_open(local_now: datetime, strategy: KRStrategyConfig) -> bool:
+    interval = max(int(strategy.auction_interval_minutes or 10), 1)
+    if local_now.minute % interval != 0:
+        return False
+    return True
 
 
 def latest_completed_bar_close(schedule: AssetScheduleConfig, timeframe: str, when: datetime | None = None) -> pd.Timestamp | None:
@@ -126,15 +156,33 @@ def entry_gate_reason(
     if strategy is None:
         return None
     schedule = strategy_schedule(settings, strategy_id)
-    if not market_is_open:
+    session_mode = strategy_session_mode(strategy)
+    local_now = _local_dt(schedule, when)
+    if local_now.weekday() >= 5:
         return "market_closed"
     if not strategy.enabled:
+        if session_mode in {"after_close_close_price", "after_close_single_price"}:
+            return "after_close_strategy_disabled"
         return "strategy_disabled"
     if str(strategy.timeframe) == "1d":
-        local_now = _local_dt(schedule, when)
+        if not market_is_open:
+            return "market_closed"
         close_dt = datetime.combine(local_now.date(), time.fromisoformat(schedule.market_close), local_now.tzinfo)
         window_start = close_dt - timedelta(minutes=int(schedule.pre_close_buffer_minutes))
         return None if window_start <= local_now <= close_dt else "outside_preclose_window"
+
+    if session_mode == "after_close_close_price":
+        return None if _time_in_window(local_now.time(), str(strategy.entry_window_start), str(strategy.entry_window_end)) else "outside_after_close_close_session"
+
+    if session_mode == "after_close_single_price":
+        if not _time_in_window(local_now.time(), str(strategy.entry_window_start), str(strategy.entry_window_end)):
+            return "outside_after_close_single_session"
+        if not _single_price_auction_open(local_now, strategy):
+            return "after_close_single_waiting_auction"
+        return None
+
+    if not market_is_open:
+        return "market_closed"
 
     completed_close = latest_completed_bar_close(schedule, strategy.timeframe, when=when)
     if completed_close is None:
@@ -169,9 +217,33 @@ def strategy_execution_account_id(settings: RuntimeSettings, strategy_id: str) -
 
 def strategy_conflict_ids(settings: RuntimeSettings, strategy_id: str) -> set[str]:
     strategy = get_kr_strategy(settings, strategy_id)
-    if strategy is None or str(strategy.strategy_family) != "kr_intraday":
+    if strategy is None:
         return set()
     return {str(item.strategy_id) for item in all_kr_strategies(settings).values() if item.execution_account_id == strategy.execution_account_id}
+
+
+def strategy_session_is_open(
+    settings: RuntimeSettings,
+    strategy_id: str,
+    *,
+    when: datetime | None = None,
+    market_is_open: bool,
+) -> bool:
+    strategy = get_kr_strategy(settings, strategy_id)
+    if strategy is None:
+        return bool(market_is_open)
+    session_mode = strategy_session_mode(strategy)
+    if session_mode in {"regular", "pre_close"}:
+        return bool(market_is_open)
+    schedule = strategy_schedule(settings, strategy_id)
+    local_now = _local_dt(schedule, when)
+    if local_now.weekday() >= 5:
+        return False
+    if session_mode == "after_close_close_price":
+        return _time_in_window(local_now.time(), str(strategy.entry_window_start), str(strategy.entry_window_end))
+    if session_mode == "after_close_single_price":
+        return _time_in_window(local_now.time(), str(strategy.entry_window_start), str(strategy.entry_window_end))
+    return bool(market_is_open)
 
 
 def experimental_kr_strategy_ids(settings: RuntimeSettings) -> set[str]:

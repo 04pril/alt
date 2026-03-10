@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config.settings import RuntimeSettings
-from kr_strategy import active_kr_strategy_ids, default_kr_strategy, iter_strategy_rows, strategy_label
+from kr_strategy import active_kr_strategy_ids, default_kr_strategy, iter_strategy_rows, strategy_label, strategy_schedule, strategy_session_label
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -28,6 +28,7 @@ EXECUTION_EVENT_KEYS = [
     "submit_requested",
     "submitted",
     "acknowledged",
+    "pending_fill",
     "filled",
     "rejected",
     "cancelled",
@@ -120,6 +121,11 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
         for strategy in iter_strategy_rows(settings)
         if str(strategy.strategy_id) in set(active_ids)
     ]
+    active_session_modes = [
+        strategy_session_label(strategy)
+        for strategy in iter_strategy_rows(settings)
+        if str(strategy.strategy_id) in set(active_ids)
+    ]
     return {
         "name": normalized_name,
         "source": str(profile_source or "embedded_defaults"),
@@ -129,8 +135,10 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
         "note": str(profile_meta["note"]),
         "kr_default_strategy_id": str((default_strategy.strategy_id if default_strategy is not None else settings.kr_default_strategy_id) or ""),
         "kr_default_strategy_label": str(strategy_label(default_strategy) if default_strategy is not None else settings.kr_default_strategy_id or ""),
+        "kr_default_strategy_session_mode": str(strategy_session_label(default_strategy)),
         "kr_active_strategies": ",".join(active_ids),
         "kr_active_strategy_labels": ", ".join(active_labels),
+        "kr_active_strategy_session_modes": ", ".join(active_session_modes),
     }
 
 
@@ -273,15 +281,43 @@ def load_monitor_recent_orders(settings: RuntimeSettings, limit: int = 30) -> pd
 
 def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
+    active_kr_ids = set(active_kr_strategy_ids(settings))
     for asset_type, schedule in settings.asset_schedules.items():
         universe = settings.universes.get(asset_type)
         watchlist = list(universe.watchlist) if universe else []
         top_universe = list(universe.top_universe) if universe else []
         representative_symbols = watchlist or top_universe
         representative_symbol = representative_symbols[0] if representative_symbols else ""
+        if asset_type == "한국주식" and active_kr_ids:
+            for strategy in iter_strategy_rows(settings):
+                strategy_id = str(strategy.strategy_id)
+                if strategy_id not in active_kr_ids:
+                    continue
+                rows.append(
+                    {
+                        "자산유형": asset_type,
+                        "전략": str(strategy_label(strategy)),
+                        "전략ID": strategy_id,
+                        "실험전략": "예" if bool(strategy.experimental) else "",
+                        "타임프레임": str(strategy.timeframe),
+                        "세션모드": strategy_session_label(strategy),
+                        "시간대": schedule.timezone,
+                        "스캔주기(분)": int(strategy.scan_interval_minutes),
+                        "진입주기(분)": int(strategy.entry_interval_minutes),
+                        "청산주기(분)": int(strategy.exit_interval_minutes),
+                        "실행브로커": resolve_broker_mode(symbol=representative_symbol, asset_type=asset_type, kis_enabled=kis_enabled),
+                        "Watchlist 개수": len(watchlist),
+                        "Top Universe 개수": len(top_universe),
+                        "대표 종목": ", ".join((watchlist or top_universe)[:4]),
+                    }
+                )
+            continue
         rows.append(
             {
                 "자산유형": asset_type,
+                "전략": "",
+                "전략ID": "",
+                "실험전략": "",
                 "타임프레임": schedule.timeframe,
                 "세션모드": schedule.session_mode,
                 "시간대": schedule.timezone,
@@ -295,7 +331,7 @@ def build_asset_overview(settings: RuntimeSettings, kis_enabled: bool) -> pd.Dat
             }
         )
     frame = pd.DataFrame(rows)
-    return frame.sort_values("자산유형").reset_index(drop=True) if not frame.empty else frame
+    return frame.sort_values(["자산유형", "전략ID"]).reset_index(drop=True) if not frame.empty else frame
 
 
 def compute_auto_trading_status(repository: TradingRepository, loop_sleep_seconds: int, now: datetime | None = None) -> Dict[str, Any]:
@@ -395,6 +431,21 @@ def _top_reason(frame: pd.DataFrame, event_type: str) -> str:
     return str(series.index[0])
 
 
+def _reason_breakdown(frame: pd.DataFrame, event_type: str, *, limit: int = 3) -> str:
+    if frame.empty:
+        return ""
+    series = (
+        frame.loc[frame["event_type"].astype(str) == event_type, "details"]
+        .map(lambda item: str((item or {}).get("reason") or ""))
+        .loc[lambda values: values.astype(str).str.strip() != ""]
+        .value_counts()
+        .head(limit)
+    )
+    if series.empty:
+        return ""
+    return ", ".join(f"{idx}({int(value)})" for idx, value in series.items())
+
+
 def _build_kr_strategy_overview(repository: TradingRepository, settings: RuntimeSettings, today_events: pd.DataFrame) -> pd.DataFrame:
     created_date = str(pd.Timestamp.utcnow().date())
     rows: list[dict[str, Any]] = []
@@ -426,12 +477,20 @@ def _build_kr_strategy_overview(repository: TradingRepository, settings: Runtime
             fill_rows = strategy_events.loc[strategy_events["event_type"].astype(str) == "filled"]
             if not fill_rows.empty:
                 last_fill_at = str(fill_rows.iloc[0].get("created_at") or "")
+        pending_fill_count = int(
+            len(
+                order_frame.loc[
+                    order_frame["status"].astype(str).isin({"pending_fill", "partially_filled"})
+                ]
+            )
+        ) if not order_frame.empty else 0
         rows.append(
             {
                 "strategy_id": strategy_id,
                 "display_name": str(strategy.display_name),
                 "label": str(strategy_label(strategy)),
                 "strategy_family": str(strategy.strategy_family),
+                "session_mode": str(strategy_session_label(strategy)),
                 "timeframe": str(strategy.timeframe),
                 "enabled": bool(strategy.enabled),
                 "experimental": bool(strategy.experimental),
@@ -444,10 +503,16 @@ def _build_kr_strategy_overview(repository: TradingRepository, settings: Runtime
                 "today_entry_rejected_count": int(event_counts.get("entry_rejected", 0)),
                 "today_submit_requested_count": int(event_counts.get("submit_requested", 0)),
                 "today_submitted_count": int(event_counts.get("submitted", 0)),
+                "today_acknowledged_count": int(event_counts.get("acknowledged", 0)),
+                "today_pending_fill_count": max(int(event_counts.get("pending_fill", 0)), pending_fill_count),
                 "today_filled_count": int(event_counts.get("filled", 0)),
+                "today_rejected_count": int(event_counts.get("rejected", 0)),
+                "today_cancelled_count": int(event_counts.get("cancelled", 0)),
                 "today_noop_count": int(event_counts.get("noop", 0)),
                 "today_noop_top_reason": _top_reason(strategy_events, "noop"),
+                "today_noop_breakdown": _reason_breakdown(strategy_events, "noop"),
                 "today_reject_top_reason": _top_reason(strategy_events, "entry_rejected"),
+                "today_reject_breakdown": _reason_breakdown(strategy_events, "entry_rejected"),
                 "open_positions": int(len(position_frame)),
                 "pending_orders": pending_orders,
                 "last_event_at": last_event_at,
@@ -472,6 +537,7 @@ def _build_kr_strategy_recent_events(settings: RuntimeSettings, today_events: pd
             {
                 "created_at": row.get("created_at"),
                 "strategy_id": strategy_id,
+                "session_mode": str(strategy_session_label(next((item for item in iter_strategy_rows(settings) if str(item.strategy_id) == strategy_id), None))),
                 "account_id": row.get("account_id") or details.get("account_id") or details.get("execution_account_id") or "",
                 "symbol": details.get("symbol") or "",
                 "event_type": row.get("event_type") or "",
@@ -534,6 +600,9 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "last_broker_account_sync": repository.get_control_flag("kis_last_account_sync_at", ""),
         "last_broker_order_sync": repository.get_control_flag("kis_last_order_sync_at", ""),
         "last_websocket_execution_event": repository.get_control_flag("kis_last_websocket_execution_at", ""),
+        "last_websocket_quote_at": repository.get_control_flag("kis_last_websocket_quote_at", ""),
+        "quote_stream_status": repository.get_control_flag("kis_quote_stream_status", ""),
+        "quote_stream_symbols": repository.get_control_flag("kis_quote_stream_symbols", ""),
         "pending_submitted_orders": pending_submitted_orders,
         "broker_rejects_today": broker_rejects_today,
     }

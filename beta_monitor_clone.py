@@ -7,10 +7,12 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Sequence, Tuple
 from urllib.parse import urlencode
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import streamlit.components.v1 as components
+from monitoring.live_display import build_live_accounts_overview, build_live_total_portfolio_overview
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -20,6 +22,8 @@ from runtime_accounts import (
 _TEMPLATE_OVERRIDE = str(os.getenv("ALT_BETA_TEMPLATE_PATH", "") or "").strip()
 TEMPLATE_PATH = Path(_TEMPLATE_OVERRIDE).expanduser() if _TEMPLATE_OVERRIDE else Path.home() / "Desktop" / "monitor_redesign_v2.html"
 BETA_PATH = "/beta"
+BETA_LIVE_PAYLOAD_ELEMENT_ID = "beta-live-payload"
+KST = ZoneInfo("Asia/Seoul")
 ACCOUNT_VIEW_SPECS: Sequence[Tuple[str, str, str, str, str]] = (
     (ACCOUNT_KIS_KR_PAPER, "KIS", "한국주식 계좌", "kis", "KRW"),
     (ACCOUNT_SIM_US_EQUITY, "SIM", "미국주식 계좌", "sim", "USD"),
@@ -224,8 +228,10 @@ def _i(value: object) -> int:
 
 
 def _fmt_time(value: object) -> str:
-    parsed = pd.to_datetime(value, errors="coerce")
-    return str(parsed.strftime("%Y-%m-%d %H:%M:%S")) if pd.notna(parsed) else "기록 없음"
+    parsed = pd.to_datetime(value, errors="coerce", utc=True)
+    if pd.isna(parsed):
+        return "기록 없음"
+    return str(parsed.tz_convert(KST).strftime("%Y-%m-%d %H:%M:%S"))
 
 
 def _fmt_money(value: object, currency: str | None = None) -> str:
@@ -448,6 +454,8 @@ def _optional_money_text(value: object, currency: str) -> str:
 def _build_realized_trade_table_frame(
     recent_realized_trades: pd.DataFrame,
     quote_snapshots: Dict[str, Dict[str, Any]],
+    *,
+    kr_symbol_names: Dict[str, str] | None = None,
 ) -> pd.DataFrame:
     if recent_realized_trades.empty:
         return pd.DataFrame()
@@ -461,7 +469,11 @@ def _build_realized_trade_table_frame(
             {
                 "종료시각": _fmt_time(row.get("closed_at")),
                 "계좌": _account_label(account_id),
-                "종목": str(row.get("symbol") or "-"),
+                "종목": _symbol_display_text(
+                    row.get("symbol"),
+                    asset_type=row.get("asset_type"),
+                    kr_symbol_names=kr_symbol_names,
+                ),
                 "방향": "롱" if str(row.get("side") or "").upper() == "LONG" else "숏" if str(row.get("side") or "").upper() == "SHORT" else "-",
                 "보유기간": _holding_duration_text(row.get("created_at"), row.get("closed_at")),
                 "진입가": _trade_money_text(row.get("entry_price"), currency, quote_snapshots),
@@ -538,8 +550,57 @@ def _build_kr_symbol_name_map(krx_name_map: Dict[str, Dict[str, str]] | None) ->
             continue
         suffix = ".KQ" if "KOSDAQ" in market else ".KS"
         symbol = f"{code.zfill(6)}{suffix}".upper()
+        bare_code = code.zfill(6)
+        symbol_map.setdefault(bare_code, clean_name)
         symbol_map.setdefault(symbol, clean_name)
     return symbol_map
+
+
+def _kr_symbol_candidates(symbol: object) -> Tuple[str, ...]:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return ()
+    candidates = [normalized]
+    if normalized.endswith(".KS") or normalized.endswith(".KQ"):
+        candidates.append(normalized[:-3])
+    elif normalized.isdigit() and len(normalized) == 6:
+        candidates.extend([f"{normalized}.KS", f"{normalized}.KQ"])
+    seen: list[str] = []
+    for candidate in candidates:
+        if candidate and candidate not in seen:
+            seen.append(candidate)
+    return tuple(seen)
+
+
+def _kr_symbol_code(symbol: object) -> str:
+    normalized = str(symbol or "").strip().upper()
+    if normalized.endswith(".KS") or normalized.endswith(".KQ"):
+        return normalized[:-3]
+    if normalized.isdigit() and len(normalized) == 6:
+        return normalized
+    return ""
+
+
+def _symbol_display_text(
+    symbol: object,
+    *,
+    asset_type: object = "",
+    kr_symbol_names: Dict[str, str] | None = None,
+    name_only: bool = False,
+) -> str:
+    text = str(symbol or "").strip()
+    normalized = text.upper()
+    display_name = ""
+    for candidate in _kr_symbol_candidates(text):
+        display_name = str((kr_symbol_names or {}).get(candidate) or "").strip()
+        if display_name:
+            break
+    code = _kr_symbol_code(text)
+    if display_name:
+        return display_name if name_only else f"{display_name} ({code or normalized})"
+    if code:
+        return code
+    return text or "-"
 
 
 def _candidate_symbol_markup(
@@ -622,7 +683,12 @@ def _entry_result_body(event_type: str, details: Dict[str, Any], row: pd.Series)
     return " · ".join(parts) if parts else "세부 정보 없음"
 
 
-def _build_entry_result_rows(today_execution_events: pd.DataFrame, limit: int | None = 4) -> list[str]:
+def _build_entry_result_rows(
+    today_execution_events: pd.DataFrame,
+    *,
+    kr_symbol_names: Dict[str, str] | None = None,
+    limit: int | None = 4,
+) -> list[str]:
     if today_execution_events.empty:
         return []
     rows: list[str] = []
@@ -640,6 +706,11 @@ def _build_entry_result_rows(today_execution_events: pd.DataFrame, limit: int | 
         ).strip()
         if not symbol:
             continue
+        display_symbol = _symbol_display_text(
+            symbol,
+            asset_type=details.get("asset_type") or row.get("asset_type") or "",
+            kr_symbol_names=kr_symbol_names,
+        )
         body = _entry_result_body(event_type, details, row)
         tone_class = _entry_result_tone(event_type)
         chip_tone = {"ok": "ok", "fail": "bad", "skip": "warn"}.get(tone_class, "idle")
@@ -647,7 +718,7 @@ def _build_entry_result_rows(today_execution_events: pd.DataFrame, limit: int | 
             '<div class="signal-item s-'
             + tone_class
             + '"><div class="sig-main"><div class="sig-top"><div class="sig-sym">'
-            + html.escape(symbol)
+            + html.escape(display_symbol)
             + '</div><div class="sig-status">'
             + _chip(_entry_result_label(event_type), chip_tone)
             + '</div></div><div class="sig-body">'
@@ -704,6 +775,8 @@ def _format_cell(column: str, value: object) -> str:
         return html.escape(_job_label(value))
     if column in {"account_id", "execution_account_id"}:
         return html.escape(_account_label(value))
+    if column == "symbol":
+        return html.escape(_symbol_display_text(value))
     if column == "status":
         return _chip(_status_label(value), _tone(value))
     if column in {"side", "signal"}:
@@ -724,7 +797,14 @@ def _format_cell(column: str, value: object) -> str:
     return html.escape(_compact(value) or "-")
 
 
-def _table_html(frame: pd.DataFrame, columns: Sequence[str], empty_text: str, limit: int = 12) -> str:
+def _table_html(
+    frame: pd.DataFrame,
+    columns: Sequence[str],
+    empty_text: str,
+    limit: int = 12,
+    *,
+    kr_symbol_names: Dict[str, str] | None = None,
+) -> str:
     if frame.empty:
         return f'<div class="empty-block">{html.escape(empty_text)}</div>'
     hidden = HIDDEN_DETAIL_COLUMNS
@@ -740,7 +820,10 @@ def _table_html(frame: pd.DataFrame, columns: Sequence[str], empty_text: str, li
     header_html = "".join(f"<th>{html.escape(_column_label(column))}</th>" for column in selected)
     body_html = []
     for _, row in view.iterrows():
-        cells = "".join(f"<td>{_format_cell(column, row.get(column))}</td>" for column in selected)
+        cells = "".join(
+            f"<td>{html.escape(_symbol_display_text(row.get(column), asset_type=row.get('asset_type'), kr_symbol_names=kr_symbol_names)) if column == 'symbol' else _format_cell(column, row.get(column))}</td>"
+            for column in selected
+        )
         body_html.append(f"<tr>{cells}</tr>")
     return '<div class="detail-table-wrap"><table class="detail-table"><thead><tr>' + header_html + "</tr></thead><tbody>" + "".join(body_html) + "</tbody></table></div>"
 
@@ -1022,7 +1105,17 @@ def _account_card_compact(
     return f'<div class="acct-card {html.escape(css_class)}"><div class="acct-header"><span class="acct-broker-badge">{html.escape(broker)}</span><span class="acct-scope">{html.escape(scope)}</span></div><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">평가 자산</div><div class="acct-value compact">{html.escape(str(equity_display["compact_text"]))}</div><div class="acct-mini">{html.escape(equity_note)}</div></div><div class="acct-metric"><div class="acct-label">현재 손익</div><div class="acct-value compact{daily_class}">{html.escape(str(pnl_display["compact_text"]))}</div><div class="acct-mini">{html.escape(daily_note)}</div></div><div class="acct-metric"><div class="acct-label">예수금</div><div class="acct-value compact">{html.escape(str(cash_display["compact_text"]))}</div><div class="acct-mini">{html.escape(cash_note)}</div></div></div><hr class="acct-divider"><div class="acct-metrics"><div class="acct-metric"><div class="acct-label">총 익스포저</div><div class="acct-value sm">{html.escape(str(exposure_display["compact_text"]))}</div><div class="acct-mini">{html.escape(exposure_note)}</div></div><div class="acct-metric"><div class="acct-label">낙폭</div><div class="acct-value warn-c sm">{html.escape(_fmt_pct(drawdown))}</div></div><div class="acct-metric"><div class="acct-label">마지막 스냅샷</div><div class="acct-value sm" style="font-size:11px;font-weight:600;">{html.escape(updated)}</div>{footer_html}</div></div></div>'
 
 
-def _positions_card(frame: pd.DataFrame, title: str, broker_label: str, broker_class: str, account_equity: float, quote_snapshots: Dict[str, Dict[str, Any]], kr_asset_types: set[str]) -> str:
+def _positions_card(
+    frame: pd.DataFrame,
+    title: str,
+    broker_label: str,
+    broker_class: str,
+    account_equity: float,
+    quote_snapshots: Dict[str, Dict[str, Any]],
+    kr_asset_types: set[str],
+    *,
+    kr_symbol_names: Dict[str, str] | None = None,
+) -> str:
     rows: list[str] = []
     if frame.empty:
         rows.append('<tr><td colspan="6"><div class="empty-block">보유 포지션이 없습니다.</div></td></tr>')
@@ -1030,6 +1123,12 @@ def _positions_card(frame: pd.DataFrame, title: str, broker_label: str, broker_c
         for _, row in frame.head(8).iterrows():
             symbol = str(row.get("symbol") or "")
             icon, market = _market_meta(symbol, str(row.get("asset_type") or ""), kr_asset_types)
+            display_symbol = _symbol_display_text(
+                symbol,
+                asset_type=row.get("asset_type"),
+                kr_symbol_names=kr_symbol_names,
+                name_only=True,
+            )
             quote = _position_quote_snapshot(symbol, str(row.get("asset_type") or ""), quote_snapshots, kr_asset_types)
             currency = "KRW" if icon == "KR" else str(quote.get("currency") or "USD")
             quantity = _f(row.get("quantity"))
@@ -1051,11 +1150,13 @@ def _positions_card(frame: pd.DataFrame, title: str, broker_label: str, broker_c
             pnl_class = "pnl-p" if np.isfinite(pnl_value) and pnl_value > 0 else "pnl-n" if np.isfinite(pnl_value) and pnl_value < 0 else "pos-amt"
             market_value_text, market_value_sub = _money_display_pair(max(current_price, 0.0) * max(quantity, 0.0), currency, quote_snapshots)
             pnl_text, pnl_sub = _money_display_pair(pnl_value, currency, quote_snapshots)
+            current_price_text = _fmt_money(current_price, currency)
             stop_loss_text = _optional_money_text(row.get("stop_loss"), currency)
             take_profit_text = _optional_money_text(row.get("take_profit"), currency)
             market_value_sub_html = f'<div class="pos-amt">{html.escape(market_value_sub)}</div>' if market_value_sub else ""
+            current_price_html = f'<div class="pos-amt">현재가 {html.escape(current_price_text)}</div>' if current_price_text != "N/A" else ""
             pnl_sub_html = f'<div class="pos-amt">{html.escape(pnl_sub)}</div>' if pnl_sub else ""
-            rows.append(f'<tr><td><div class="sym-cell"><div class="sym-icon">{html.escape(icon)}</div><div><div class="sym-name">{html.escape(symbol or "-")}</div><div class="sym-mkt">{html.escape(market)}</div></div></div></td><td><div class="side-cell">{_side_badge(side)}<div class="exp-bar-wrap"><div class="exp-bar {direction_class}" style="width:{min(max(exposure_pct, 0.0), 100.0):.0f}%"></div></div><span style="font-size:10px;color:var(--text3);">{exposure_pct:.0f}%</span></div></td><td><div class="pos-qty">{html.escape(_fmt_qty(quantity))}</div></td><td><div class="pos-qty">{html.escape(market_value_text)}</div>{market_value_sub_html}</td><td style="font-size:11px;color:var(--text3);">{html.escape(stop_loss_text)} / {html.escape(take_profit_text)}</td><td><span class="{pnl_class}">{html.escape(pnl_text)}</span>{pnl_sub_html}<div class="pos-amt">{html.escape(_fmt_pct(pnl_pct))}</div></td></tr>')
+            rows.append(f'<tr><td><div class="sym-cell"><div class="sym-icon">{html.escape(icon)}</div><div><div class="sym-name">{html.escape(display_symbol)}</div><div class="sym-mkt">{html.escape(market)}</div></div></div></td><td><div class="side-cell">{_side_badge(side)}<div class="exp-bar-wrap"><div class="exp-bar {direction_class}" style="width:{min(max(exposure_pct, 0.0), 100.0):.0f}%"></div></div><span style="font-size:10px;color:var(--text3);">{exposure_pct:.0f}%</span></div></td><td><div class="pos-qty">{html.escape(_fmt_qty(quantity))}</div></td><td><div class="pos-qty">{html.escape(market_value_text)}</div>{market_value_sub_html}{current_price_html}</td><td style="font-size:11px;color:var(--text3);">{html.escape(stop_loss_text)} / {html.escape(take_profit_text)}</td><td><span class="{pnl_class}">{html.escape(pnl_text)}</span>{pnl_sub_html}<div class="pos-amt">{html.escape(_fmt_pct(pnl_pct))}</div></td></tr>')
     return '<div class="card"><div class="card-hd"><div style="display:flex;align-items:center;gap:8px;"><span class="broker-tag ' + html.escape(broker_class) + '">' + html.escape(broker_label) + '</span><div class="card-title">' + html.escape(title) + '</div></div><div class="card-meta">' + str(len(frame)) + ' 포지션</div></div><table class="pos-table"><thead><tr><th>종목</th><th>방향 · 익스포저</th><th>수량</th><th>평가금액</th><th>손절 / 익절</th><th>미실현 손익</th></tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>"
 
 
@@ -1161,6 +1262,172 @@ def _frame_for_account(frame: pd.DataFrame, account_id: str, *, column: str = "a
     return pd.DataFrame(columns=list(frame.columns))
 
 
+def _build_status_strip_html(
+    *,
+    auto_trading_status: Dict[str, Any],
+    kis_account_snapshot: Dict[str, Any],
+    kis_runtime: Dict[str, Any],
+    broker_sync_errors: pd.DataFrame,
+    scan_time: str,
+) -> str:
+    worker_state = str(auto_trading_status.get("state") or "").lower()
+    entry_label = "일시중지" if worker_state == "paused" else "가동 중"
+    worker_dot = "sdot-green" if worker_state == "running" else "sdot-yellow" if worker_state == "paused" else "sdot-red"
+    kis_dot = "sdot-green" if kis_account_snapshot or kis_runtime.get("last_broker_account_sync") else "sdot-gray"
+    error_dot = "sdot-red" if len(broker_sync_errors) else "sdot-gray"
+    entry_dot = "sdot-yellow" if worker_state == "paused" else "sdot-green"
+    now_text = pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f'<div id="beta-live-status-strip" class="status-strip">'
+        f'<div class="strip-item"><span class="sdot {worker_dot}"></span><span>워커 {html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span></div>'
+        f'<div class="strip-item"><span class="sdot {kis_dot}"></span><span>KIS {"연결됨 · 모의" if kis_account_snapshot or kis_runtime.get("last_broker_account_sync") else "확인 필요"}</span></div>'
+        f'<div class="strip-item"><span class="sdot sdot-green"></span><span>시그널 스캔 {html.escape(scan_time)}</span></div>'
+        f'<div class="strip-item"><span class="sdot {error_dot}"></span><span>브로커 오류 {len(broker_sync_errors)}건</span></div>'
+        f'<div class="strip-item"><span class="sdot {entry_dot}"></span><span>진입 {entry_label}</span></div>'
+        f'<span class="strip-time">{html.escape(now_text)}</span>'
+        "</div>"
+    )
+
+
+def _build_account_row_html(
+    *,
+    accounts_overview: Dict[str, Dict[str, Any]],
+    fallback_account: Dict[str, Any],
+    quote_snapshots: Dict[str, Dict[str, Any]],
+) -> str:
+    account_cards: list[str] = []
+    for account_id, broker_label, scope_label, css_class, default_currency in ACCOUNT_VIEW_SPECS:
+        account_row = dict(accounts_overview.get(account_id) or {})
+        snapshot = dict(account_row.get("latest_snapshot") or {})
+        for key in ("equity", "cash", "gross_exposure", "net_exposure", "realized_pnl", "unrealized_pnl", "drawdown_pct"):
+            if key not in snapshot and key in account_row:
+                snapshot[key] = account_row.get(key)
+        if "daily_pnl" not in snapshot and "realized_pnl" in account_row:
+            snapshot["daily_pnl"] = account_row.get("realized_pnl")
+        currency = str(account_row.get("currency") or default_currency or "KRW")
+        sync_status = _status_label(account_row.get("last_sync_status") or "never")
+        sync_time = _fmt_time(account_row.get("last_sync_time") or snapshot.get("created_at"))
+        footer_note = f"동기화 {sync_status} · {sync_time}"
+        account_cards.append(
+            _account_card_compact(
+                snapshot,
+                fallback_account,
+                account_row.get("trade_performance", {}),
+                broker_label,
+                scope_label,
+                css_class,
+                currency=currency,
+                quote_snapshots=quote_snapshots,
+                footer_note=footer_note,
+            )
+        )
+    return f'<div id="beta-live-account-row" class="account-row">{"".join(account_cards)}</div>'
+
+
+def _build_positions_region_html(
+    *,
+    open_positions: pd.DataFrame,
+    accounts_overview: Dict[str, Dict[str, Any]],
+    quote_snapshots: Dict[str, Dict[str, Any]],
+    kr_asset_types: set[str],
+    kr_symbol_names: Dict[str, str],
+) -> str:
+    kis_account = dict(accounts_overview.get(ACCOUNT_KIS_KR_PAPER) or {})
+    us_account = dict(accounts_overview.get(ACCOUNT_SIM_US_EQUITY) or {})
+    crypto_account = dict(accounts_overview.get(ACCOUNT_SIM_CRYPTO) or {})
+    kis_account_snapshot = dict(kis_account.get("latest_snapshot") or {})
+    us_account_snapshot = dict(us_account.get("latest_snapshot") or {})
+    crypto_account_snapshot = dict(crypto_account.get("latest_snapshot") or {})
+    kis_positions = _frame_for_account(open_positions, ACCOUNT_KIS_KR_PAPER)
+    us_positions = _frame_for_account(open_positions, ACCOUNT_SIM_US_EQUITY)
+    crypto_positions = _frame_for_account(open_positions, ACCOUNT_SIM_CRYPTO)
+    return (
+        '<div id="beta-live-positions">'
+        + _positions_card(
+            kis_positions,
+            "한국주식 포지션",
+            "KIS",
+            "broker-kis",
+            max(_f(kis_account_snapshot.get("equity")), 0.0),
+            quote_snapshots,
+            kr_asset_types,
+            kr_symbol_names=kr_symbol_names,
+        )
+        + _positions_card(
+            us_positions,
+            "미국주식 포지션",
+            "SIM",
+            "broker-sim",
+            max(_f(us_account_snapshot.get("equity")), 0.0),
+            quote_snapshots,
+            kr_asset_types,
+            kr_symbol_names=kr_symbol_names,
+        )
+        + _positions_card(
+            crypto_positions,
+            "코인 포지션",
+            "SIM",
+            "broker-sim",
+            max(_f(crypto_account_snapshot.get("equity")), 0.0),
+            quote_snapshots,
+            kr_asset_types,
+            kr_symbol_names=kr_symbol_names,
+        )
+        + "</div>"
+    )
+
+
+def build_beta_live_payload(
+    *,
+    data: Dict[str, Any],
+    accounts_overview: Dict[str, Dict[str, Any]],
+    quote_snapshots: Dict[str, Dict[str, Any]],
+    kr_asset_types: set[str],
+    krx_name_map: Dict[str, Dict[str, str]] | None = None,
+) -> Dict[str, Any]:
+    summary = data["summary"]
+    fallback_account = dict(summary.get("latest_account") or {})
+    auto_trading_status = data.get("auto_trading_status", {})
+    broker_sync_errors = data.get("broker_sync_errors", pd.DataFrame())
+    kis_runtime = data.get("kis_runtime", {})
+    job_health = data.get("job_health", pd.DataFrame())
+    open_positions = data.get("open_positions", pd.DataFrame())
+    kr_symbol_names = _build_kr_symbol_name_map(krx_name_map)
+    kis_account_snapshot = dict((accounts_overview.get(ACCOUNT_KIS_KR_PAPER) or {}).get("latest_snapshot") or {})
+    scan_time = _latest_scan_time(job_health)
+    return {
+        "version": str(pd.Timestamp.utcnow().value),
+        "status_strip_html": _build_status_strip_html(
+            auto_trading_status=auto_trading_status,
+            kis_account_snapshot=kis_account_snapshot,
+            kis_runtime=kis_runtime,
+            broker_sync_errors=broker_sync_errors,
+            scan_time=scan_time,
+        ),
+        "account_row_html": _build_account_row_html(
+            accounts_overview=accounts_overview,
+            fallback_account=fallback_account,
+            quote_snapshots=quote_snapshots,
+        ),
+        "positions_html": _build_positions_region_html(
+            open_positions=open_positions,
+            accounts_overview=accounts_overview,
+            quote_snapshots=quote_snapshots,
+            kr_asset_types=kr_asset_types,
+            kr_symbol_names=kr_symbol_names,
+        ),
+    }
+
+
+def render_beta_live_payload_host(payload: Dict[str, Any]) -> str:
+    payload_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    return (
+        '<div style="display:none!important;visibility:hidden!important;height:0;overflow:hidden" aria-hidden="true">'
+        f'<script id="{html.escape(BETA_LIVE_PAYLOAD_ELEMENT_ID)}" type="application/json">{payload_json}</script>'
+        "</div>"
+    )
+
+
 def render_beta_overview_component(
     *,
     data: Dict[str, Any],
@@ -1226,42 +1493,26 @@ def render_beta_overview_component(
 
     worker_state = str(auto_trading_status.get("state") or "").lower()
     scan_time = _latest_scan_time(job_health)
-    entry_label = "일시중지" if worker_state == "paused" else "가동 중"
-    worker_dot = "sdot-green" if worker_state == "running" else "sdot-yellow" if worker_state == "paused" else "sdot-red"
-    kis_dot = "sdot-green" if kis_account_snapshot or kis_runtime.get("last_broker_account_sync") else "sdot-gray"
-    error_dot = "sdot-red" if len(broker_sync_errors) else "sdot-gray"
-    entry_dot = "sdot-yellow" if worker_state == "paused" else "sdot-green"
-    strip_html = '<div class="status-strip">' + f'<div class="strip-item"><span class="sdot {worker_dot}"></span><span>워커 {html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span></div>' + f'<div class="strip-item"><span class="sdot {kis_dot}"></span><span>KIS {"연결됨 · 모의" if kis_account_snapshot or kis_runtime.get("last_broker_account_sync") else "확인 필요"}</span></div>' + f'<div class="strip-item"><span class="sdot sdot-green"></span><span>시그널 스캔 {html.escape(scan_time)}</span></div>' + f'<div class="strip-item"><span class="sdot {error_dot}"></span><span>브로커 오류 {len(broker_sync_errors)}건</span></div>' + f'<div class="strip-item"><span class="sdot {entry_dot}"></span><span>진입 {entry_label}</span></div>' + f'<span class="strip-time">{html.escape(pd.Timestamp.now(tz="Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S"))}</span></div>'
-    template = _replace_block(template, 'class="status-strip"', strip_html)
-
-    account_cards: list[str] = []
-    for account_id, broker_label, scope_label, css_class, default_currency in ACCOUNT_VIEW_SPECS:
-        account_row = dict(accounts_overview.get(account_id) or {})
-        snapshot = dict(account_row.get("latest_snapshot") or {})
-        for key in ("equity", "cash", "gross_exposure", "net_exposure", "realized_pnl", "unrealized_pnl", "drawdown_pct"):
-            if key not in snapshot and key in account_row:
-                snapshot[key] = account_row.get(key)
-        if "daily_pnl" not in snapshot and "realized_pnl" in account_row:
-            snapshot["daily_pnl"] = account_row.get("realized_pnl")
-        currency = str(account_row.get("currency") or default_currency or "KRW")
-        sync_status = _status_label(account_row.get("last_sync_status") or "never")
-        sync_time = _fmt_time(account_row.get("last_sync_time") or snapshot.get("created_at"))
-        footer_note = f"동기화 {sync_status} · {sync_time}"
-        account_cards.append(
-            _account_card_compact(
-                snapshot,
-                fallback_account,
-                account_row.get("trade_performance", {}),
-                broker_label,
-                scope_label,
-                css_class,
-                currency=currency,
-                quote_snapshots=quote_snapshots,
-                footer_note=footer_note,
-            )
-        )
-    account_row_html = '<div class="account-row">' + "".join(account_cards) + "</div>"
-    template = _replace_block(template, 'class="account-row"', account_row_html)
+    template = _replace_block(
+        template,
+        'class="status-strip"',
+        _build_status_strip_html(
+            auto_trading_status=auto_trading_status,
+            kis_account_snapshot=kis_account_snapshot,
+            kis_runtime=kis_runtime,
+            broker_sync_errors=broker_sync_errors,
+            scan_time=scan_time,
+        ),
+    )
+    template = _replace_block(
+        template,
+        'class="account-row"',
+        _build_account_row_html(
+            accounts_overview=accounts_overview,
+            fallback_account=fallback_account,
+            quote_snapshots=quote_snapshots,
+        ),
+    )
 
     stat_items = [("보유 포지션", _i(summary.get("open_positions", 0))), ("대기 주문", _i(summary.get("open_orders", 0))), ("미해결", _i(summary.get("unresolved_predictions", 0))), ("오늘 후보", _i(execution_summary.get("today_candidate_count", 0))), ("진입 허용", _i(execution_summary.get("today_entry_allowed_count", 0))), ("진입 거절", _i(execution_summary.get("today_entry_rejected_count", 0))), ("주문 제출", _i(execution_summary.get("today_submitted_count", 0))), ("체결 완료", _i(execution_summary.get("today_filled_count", 0))), ("브로커 오류", len(broker_sync_errors)), ("프로파일", str(runtime_profile.get("name") or "-")), ("KR 전략", str(runtime_profile.get("kr_active_strategy_labels") or runtime_profile.get("kr_active_strategies") or "-"))]
     stat_html = []
@@ -1277,11 +1528,11 @@ def render_beta_overview_component(
         stat_html.append(f'<div class="{" ".join(classes)}">{stat_value_html}<div class="stat-lbl">{html.escape(label)}</div></div>')
     template = _replace_block(template, 'class="stat-bar"', '<div class="stat-bar">' + "".join(stat_html) + "</div>")
 
-    kis_positions = _frame_for_account(open_positions, ACCOUNT_KIS_KR_PAPER)
-    us_positions = _frame_for_account(open_positions, ACCOUNT_SIM_US_EQUITY)
-    crypto_positions = _frame_for_account(open_positions, ACCOUNT_SIM_CRYPTO)
-
-    all_signal_rows = _build_entry_result_rows(today_execution_events, limit=None)
+    all_signal_rows = _build_entry_result_rows(
+        today_execution_events,
+        kr_symbol_names=kr_symbol_names,
+        limit=None,
+    )
     visible_signal_rows = all_signal_rows if signals_expanded else all_signal_rows[:4]
     signal_count = len(visible_signal_rows)
     signal_meta = f"표시 {signal_count}건"
@@ -1317,7 +1568,14 @@ def render_beta_overview_component(
         level_class = "li" if level == "INFO" else "lw" if level == "WARNING" else "le"
         event_rows.append(f'<div><span class="lt">{html.escape(_fmt_time(row.get("created_at")))}</span> <span class="{level_class}">[{html.escape(level)}]</span> {html.escape(str(row.get("message") or ""))}</div>')
 
-    left_html = '<div id="beta-overview" data-section-anchor="beta-overview"></div>' + _positions_card(kis_positions, "한국주식 포지션", "KIS", "broker-kis", max(_f(kis_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + _positions_card(us_positions, "미국주식 포지션", "SIM", "broker-sim", max(_f(us_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + _positions_card(crypto_positions, "코인 포지션", "SIM", "broker-sim", max(_f(crypto_account_snapshot.get("equity")), 0.0), quote_snapshots, kr_asset_types) + '<div class="card" data-section-anchor="events"><div class="card-hd job-card-head"><div class="card-title">진입 처리 결과</div>' + signals_toggle_html + '</div><div class="card-meta">' + html.escape(signal_meta) + '</div><div class="signal-list">' + "".join(visible_signal_rows) + '</div></div>' + '<div class="card" data-section-anchor="candidates"><div class="card-hd"><div class="card-title">오늘 후보 목록</div><div class="card-meta">' + f'{len(candidate_scans)}종목 · 허용 {_i(execution_summary.get("today_entry_allowed_count", 0))} / 거절 {_i(execution_summary.get("today_entry_rejected_count", 0))}' + '</div></div>' + candidate_tabs_html + '</div>' + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">실행 이벤트</div><div class="card-meta">최근 7건</div></div><div class="log-body">' + ("".join(event_rows) if event_rows else '<div class="empty-block">최근 이벤트가 없습니다.</div>') + "</div></div>"
+    positions_region_html = _build_positions_region_html(
+        open_positions=open_positions,
+        accounts_overview=accounts_overview,
+        quote_snapshots=quote_snapshots,
+        kr_asset_types=kr_asset_types,
+        kr_symbol_names=kr_symbol_names,
+    )
+    left_html = '<div id="beta-overview" data-section-anchor="beta-overview"></div>' + positions_region_html + '<div class="card" data-section-anchor="events"><div class="card-hd job-card-head"><div class="card-title">진입 처리 결과</div>' + signals_toggle_html + '</div><div class="card-meta">' + html.escape(signal_meta) + '</div><div class="signal-list">' + "".join(visible_signal_rows) + '</div></div>' + '<div class="card" data-section-anchor="candidates"><div class="card-hd"><div class="card-title">오늘 후보 목록</div><div class="card-meta">' + f'{len(candidate_scans)}종목 · 허용 {_i(execution_summary.get("today_entry_allowed_count", 0))} / 거절 {_i(execution_summary.get("today_entry_rejected_count", 0))}' + '</div></div>' + candidate_tabs_html + '</div>' + '<div class="card" data-section-anchor="events"><div class="card-hd"><div class="card-title">실행 이벤트</div><div class="card-meta">최근 7건</div></div><div class="log-body">' + ("".join(event_rows) if event_rows else '<div class="empty-block">최근 이벤트가 없습니다.</div>') + "</div></div>"
 
     sync_rows = []
     for label, action, job_name in [("계좌", "sync_account", "broker_account_sync"), ("주문", "sync_order", "broker_order_sync"), ("포지션", "sync_position", "broker_position_sync"), ("시세", "sync_market", "broker_market_status")]:
@@ -1335,7 +1593,10 @@ def render_beta_overview_component(
             '<div class="sync-row"><div class="sync-left"><span class="sync-lbl">'
             + html.escape(str(row.get("label") or row.get("display_name") or row.get("strategy_id") or "-"))
             + '</span></div><span class="sync-time">'
-            + html.escape(f'후보 {_i(row.get("today_candidate_count"))} / 제출 {_i(row.get("today_submitted_count"))} / 체결 {_i(row.get("today_filled_count"))}')
+            + html.escape(
+                f"{str(row.get('session_mode') or 'regular')} · "
+                f"후보 {_i(row.get('today_candidate_count'))} / 제출 {_i(row.get('today_submitted_count'))} / 체결 {_i(row.get('today_filled_count'))}"
+            )
             + "</span>"
             + enabled_badge
             + experimental_badge
@@ -1345,12 +1606,16 @@ def render_beta_overview_component(
         strategy_rows.append('<div class="empty-block">표시할 KR 전략 상태가 없습니다.</div>')
 
     worker_tone = "s-g" if worker_state == "running" else "s-y" if worker_state == "paused" else "s-r"
+    quote_stream_status = str(kis_runtime.get("quote_stream_status") or "").lower()
+    quote_stream_at = _fmt_time(kis_runtime.get("last_websocket_quote_at"))
+    quote_stream_badge = "수신중" if quote_stream_status == "connected" else "재연결" if quote_stream_status == "reconnecting" else "대기"
+    quote_stream_tone = "b-ok" if quote_stream_status == "connected" else "b-warn"
     total_curve, total_curve_note, total_curve_currency = _build_total_equity_curve(data.get("equity_curves_by_account", {}), quote_snapshots)
     if total_curve.empty:
         total_curve = equity_curve
         total_curve_note = "계좌 스냅샷 참고용"
         total_curve_currency = None
-    right_html = '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">트레이딩 제어</div></div>' + f'<div class="worker-pill"><span class="s-dot {worker_tone}"></span><span class="wp-label">워커</span><span class="wp-val">{html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span>{_action_button("재시작", "restart_worker", "wp-restart", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode)}</div>' + '<div class="ctrl-sect"><div class="ctrl-lbl">진입</div><div class="ctrl-btns">' + _action_button("일시정지", "pause_entries", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + _action_button("재개", "resume_entries", "btn btn-go", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div><div class="ctrl-sect"><div class="ctrl-lbl">전체 매매</div><div class="ctrl-btns">' + _action_button("전체 정지", "halt_all", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div></div>' + '<div id="sync" class="card" data-section-anchor="sync"><div class="card-hd"><div class="card-title">런타임 상태</div></div><div class="sync-section"><div class="sync-title">동기화</div>' + "".join(sync_rows) + '<div class="sync-row"><div class="sync-left"><span class="s-dot s-g"></span><span class="sync-lbl">시그널 스캔</span></div><span class="sync-time">' + html.escape(scan_time) + '</span>' + _action_button("즉시 스캔", "scan_now", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div><div class="sync-section"><div class="sync-title">KR 전략</div><div class="card-meta">' + html.escape(str(runtime_profile.get("kr_default_strategy_label") or runtime_profile.get("kr_default_strategy_id") or "-")) + "</div>" + "".join(strategy_rows) + '</div><div class="sync-section"><div class="sync-title">KIS 브로커</div><div class="sync-row"><div class="sync-left"><span class="sync-lbl">대기 주문</span></div><span style="color:var(--warn);font-weight:700;font-size:12px;margin-right:6px;">' + str(_i(kis_runtime.get("pending_submitted_orders"))) + '건</span>' + _action_button("주문 확인", "order_check", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">웹소켓</span></div><span class="badge {"b-ok" if kis_runtime.get("last_websocket_execution_event") else "b-warn"}">{"수신중" if kis_runtime.get("last_websocket_execution_event") else "대기"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">API 토큰</span></div><span class="badge {"b-ok" if kis_account_snapshot else "b-warn"}">{"유효" if kis_account_snapshot else "확인 필요"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">거래 모드</span></div><span class="badge {"b-mod" if kis_account_snapshot else "b-warn"}">{"모의" if kis_account_snapshot else "비활성"}</span></div></div></div>' + '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">자산 추이</div><div class="card-meta">계좌 합산 · 최근 24개 구간</div></div>' + _equity_svg(total_curve, theme_mode, legend_currency=total_curve_currency, legend_note=total_curve_note) + "</div>"
+    right_html = '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">트레이딩 제어</div></div>' + f'<div class="worker-pill"><span class="s-dot {worker_tone}"></span><span class="wp-label">워커</span><span class="wp-val">{html.escape(str(auto_trading_status.get("label") or auto_trading_status.get("state") or "-"))}</span>{_action_button("재시작", "restart_worker", "wp-restart", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode)}</div>' + '<div class="ctrl-sect"><div class="ctrl-lbl">진입</div><div class="ctrl-btns">' + _action_button("일시정지", "pause_entries", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + _action_button("재개", "resume_entries", "btn btn-go", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div><div class="ctrl-sect"><div class="ctrl-lbl">전체 매매</div><div class="ctrl-btns">' + _action_button("전체 정지", "halt_all", "btn btn-stop", "beta-overview", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div></div>' + '<div id="sync" class="card" data-section-anchor="sync"><div class="card-hd"><div class="card-title">런타임 상태</div></div><div class="sync-section"><div class="sync-title">동기화</div>' + "".join(sync_rows) + '<div class="sync-row"><div class="sync-left"><span class="s-dot s-g"></span><span class="sync-lbl">시그널 스캔</span></div><span class="sync-time">' + html.escape(scan_time) + '</span>' + _action_button("즉시 스캔", "scan_now", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div></div><div class="sync-section"><div class="sync-title">KR 전략</div><div class="card-meta">' + html.escape(str(runtime_profile.get("kr_default_strategy_label") or runtime_profile.get("kr_default_strategy_id") or "-")) + " · 세션 " + html.escape(str(runtime_profile.get("kr_default_strategy_session_mode") or "-")) + "</div>" + "".join(strategy_rows) + '</div><div class="sync-section"><div class="sync-title">KIS 브로커</div><div class="sync-row"><div class="sync-left"><span class="sync-lbl">대기 주문</span></div><span style=\"color:var(--warn);font-weight:700;font-size:12px;margin-right:6px;\">' + str(_i(kis_runtime.get("pending_submitted_orders"))) + '건</span>' + _action_button("주문 확인", "order_check", "btn-mini", "sync", token=action_token, candidate_tab=current_candidate_tab or None, jobs=jobs_query_value, signals=signals_query_value, theme_mode=theme_mode) + '</div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">실시간 시세</span></div><span class="sync-time">{html.escape(quote_stream_at)}</span><span class="badge {quote_stream_tone}">{html.escape(quote_stream_badge)}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">API 토큰</span></div><span class="badge {"b-ok" if kis_account_snapshot else "b-warn"}">{"유효" if kis_account_snapshot else "확인 필요"}</span></div>' + f'<div class="sync-row"><div class="sync-left"><span class="sync-lbl">거래 모드</span></div><span class="badge {"b-mod" if kis_account_snapshot else "b-warn"}">{"모의" if kis_account_snapshot else "비활성"}</span></div></div></div>' + '<div class="card" data-section-anchor="beta-overview"><div class="card-hd"><div class="card-title">자산 추이</div><div class="card-meta">계좌 합산 · 최근 24개 구간</div></div>' + _equity_svg(total_curve, theme_mode, legend_currency=total_curve_currency, legend_note=total_curve_note) + "</div>"
     template = _replace_block(template, 'class="content-grid"', '<div class="content-grid"><div class="left-col">' + left_html + '</div><div class="right-col">' + right_html + "</div></div>")
 
     all_job_rows = []
@@ -1394,6 +1659,7 @@ def render_beta_overview_component(
                 ["created_at", "account_id", "event_type", "component", "level", "message"],
                 "실행 이벤트가 없습니다.",
                 limit=14,
+                kr_symbol_names=kr_symbol_names,
             ),
             note=f"최근 {min(len(today_execution_events), 14)}건",
         )
@@ -1411,9 +1677,10 @@ def render_beta_overview_component(
             "KR 전략 집계",
             _table_html(
                 kr_strategy_overview,
-                ["label", "timeframe", "enabled", "experimental", "today_candidate_count", "today_entry_allowed_count", "today_entry_rejected_count", "today_submitted_count", "today_filled_count", "today_noop_count"],
+                ["label", "session_mode", "timeframe", "enabled", "experimental", "today_candidate_count", "today_entry_allowed_count", "today_entry_rejected_count", "today_submit_requested_count", "today_submitted_count", "today_acknowledged_count", "today_pending_fill_count", "today_filled_count", "today_rejected_count", "today_cancelled_count", "today_noop_breakdown"],
                 "KR 전략 집계가 없습니다.",
                 limit=6,
+                kr_symbol_names=kr_symbol_names,
             ),
             note=f"전략 {len(kr_strategy_overview)}개",
             card_class="detail-card compact",
@@ -1424,9 +1691,10 @@ def render_beta_overview_component(
             "KR 전략 최근 이벤트",
             _table_html(
                 kr_strategy_recent_events,
-                ["created_at", "strategy_id", "symbol", "event_type", "reason", "message"],
+                ["created_at", "strategy_id", "session_mode", "symbol", "event_type", "reason", "message"],
                 "최근 KR 전략 이벤트가 없습니다.",
                 limit=8,
+                kr_symbol_names=kr_symbol_names,
             ),
             note=f"최근 {min(len(kr_strategy_recent_events), 8)}건",
             card_class="detail-card compact",
@@ -1461,6 +1729,7 @@ def render_beta_overview_component(
                         ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"],
                         "최근 주문 활동이 없습니다.",
                         limit=12,
+                        kr_symbol_names=kr_symbol_names,
                     ),
                     note=f"최근 {min(len(recent_orders), 12)}건",
                 ),
@@ -1471,16 +1740,22 @@ def render_beta_overview_component(
                         ["updated_at", "account_id", "symbol", "asset_type", "side", "requested_qty", "filled_qty", "requested_price", "status", "reason"],
                         "대기 주문이 없습니다.",
                         limit=12,
+                        kr_symbol_names=kr_symbol_names,
                     ),
                     note=f"현재 {_i(summary.get('open_orders', 0))}건",
                 ),
                 _detail_card(
                     "최근 거래 손익",
                     _table_html(
-                        _build_realized_trade_table_frame(recent_realized_trades, quote_snapshots),
+                        _build_realized_trade_table_frame(
+                            recent_realized_trades,
+                            quote_snapshots,
+                            kr_symbol_names=kr_symbol_names,
+                        ),
                         ["종료시각", "계좌", "종목", "방향", "보유기간", "진입가", "청산가", "실현손익", "청산사유"],
                         "최근 실현손익 거래가 없습니다.",
                         limit=12,
+                        kr_symbol_names=kr_symbol_names,
                     ),
                     note=f"최근 {min(len(recent_realized_trades), 12)}건",
                 ),
@@ -1505,8 +1780,10 @@ def render_beta_overview_component(
 (() => {{
   const initialAnchor = {json.dumps(initial_anchor or "beta-overview")};
   const serverThemeMode = {json.dumps(theme_mode if theme_mode in {"light", "dark"} else "light")};
+  const livePayloadElementId = {json.dumps(BETA_LIVE_PAYLOAD_ELEMENT_ID)};
   const themeStorageKey = "alt-beta-theme";
   let disposed = false;
+  let livePayloadVersion = "";
   const root = document.documentElement;
   const actionButtons = Array.from(document.querySelectorAll("[data-beta-href]"));
   const navButtons = Array.from(document.querySelectorAll("[data-nav-target]"));
@@ -1518,6 +1795,8 @@ def render_beta_overview_component(
   const navIds = navButtons.map((button) => button.dataset.navTarget).filter(Boolean);
   const pendingTimers = [];
   let resizeObserver = null;
+  let parentScrollHandler = null;
+  let livePayloadTimer = null;
   const readStoredTheme = () => {{
     try {{
       const storedTheme = window.localStorage.getItem(themeStorageKey);
@@ -1564,7 +1843,18 @@ def render_beta_overview_component(
   const cleanupNavigation = () => {{
     disposed = true;
     if (resizeObserver) resizeObserver.disconnect();
+    if (parentScrollHandler) {{
+      try {{
+        window.parent.removeEventListener("scroll", parentScrollHandler);
+      }} catch (error) {{
+      }}
+      parentScrollHandler = null;
+    }}
     pendingTimers.forEach((timerId) => clearTimeout(timerId));
+    if (livePayloadTimer) {{
+      clearInterval(livePayloadTimer);
+      livePayloadTimer = null;
+    }}
   }};
   const notifyHeight = () => {{
     if (disposed) return;
@@ -1599,6 +1889,31 @@ def render_beta_overview_component(
     }}
     window.location.assign(absoluteUrl);
   }};
+  const targetTopInParentViewport = (target) => {{
+    if (!target) return null;
+    try {{
+      if (!window.frameElement || !window.parent) return null;
+      const frameRect = window.frameElement.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      return frameRect.top + targetRect.top;
+    }} catch (error) {{
+      return null;
+    }}
+  }};
+  const scrollParentToTarget = (target, smooth = true) => {{
+    if (!target) return false;
+    try {{
+      if (!window.frameElement || !window.parent || !window.parent.scrollTo) return false;
+      const frameRect = window.frameElement.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      const currentScrollY = window.parent.scrollY || window.parent.pageYOffset || 0;
+      const nextTop = Math.max(currentScrollY + frameRect.top + targetRect.top - 20, 0);
+      window.parent.scrollTo({{ top: nextTop, behavior: smooth ? "smooth" : "auto" }});
+      return true;
+    }} catch (error) {{
+      return false;
+    }}
+  }};
   const activateTab = (targetId) => {{
     navButtons.forEach((button) => button.classList.toggle("active", button.dataset.navTarget === targetId));
   }};
@@ -1607,6 +1922,41 @@ def render_beta_overview_component(
     candidatePanes.forEach((pane) => pane.classList.toggle("active", pane.dataset.candPane === targetKey));
     rewriteCandidateTabOnLinks(targetKey);
     notifyHeight();
+  }};
+  const readLivePayload = () => {{
+    try {{
+      if (!window.parent || !window.parent.document) return null;
+      const node = window.parent.document.getElementById(livePayloadElementId);
+      if (!node) return null;
+      const raw = node.textContent || "";
+      if (!raw.trim()) return null;
+      return JSON.parse(raw);
+    }} catch (error) {{
+      return null;
+    }}
+  }};
+  const replaceLiveOuterHtml = (elementId, nextHtml) => {{
+    if (!nextHtml) return;
+    const node = document.getElementById(elementId);
+    if (!node) return;
+    node.outerHTML = nextHtml;
+  }};
+  const applyLivePayload = (payload) => {{
+    if (!payload || !payload.version || payload.version === livePayloadVersion) return;
+    livePayloadVersion = payload.version;
+    replaceLiveOuterHtml("beta-live-status-strip", payload.status_strip_html);
+    replaceLiveOuterHtml("beta-live-account-row", payload.account_row_html);
+    replaceLiveOuterHtml("beta-live-positions", payload.positions_html);
+    notifyHeight();
+    updateActiveFromScroll();
+  }};
+  const startLivePayloadPolling = () => {{
+    if (livePayloadTimer) clearInterval(livePayloadTimer);
+    livePayloadTimer = setInterval(() => {{
+      if (disposed) return;
+      if (document.visibilityState === "hidden") return;
+      applyLivePayload(readLivePayload());
+    }}, 1200);
   }};
   actionButtons.forEach((button) => {{
     button.addEventListener("click", (event) => {{
@@ -1630,7 +1980,9 @@ def render_beta_overview_component(
       const target = document.getElementById(button.dataset.navTarget || "");
       if (!target) return;
       activateTab(button.dataset.navTarget || "beta-overview");
-      target.scrollIntoView({{ behavior: "smooth", block: "start" }});
+      if (!scrollParentToTarget(target, true)) {{
+        target.scrollIntoView({{ behavior: "smooth", block: "start" }});
+      }}
     }});
   }});
   candidateTabs.forEach((button) => {{
@@ -1645,12 +1997,25 @@ def render_beta_overview_component(
     let active = "beta-overview";
     navIds.forEach((targetId) => {{
       const section = document.getElementById(targetId);
-      if (section && section.getBoundingClientRect().top <= 120) active = targetId;
+      const parentTop = targetTopInParentViewport(section);
+      const localTop = section ? section.getBoundingClientRect().top : null;
+      const effectiveTop = parentTop ?? localTop;
+      if (typeof effectiveTop === "number" && effectiveTop <= 120) active = targetId;
     }});
     activateTab(active);
   }};
   window.addEventListener("scroll", updateActiveFromScroll, {{ passive: true }});
   window.addEventListener("resize", notifyHeight);
+  try {{
+    if (window.parent && window.parent !== window) {{
+      parentScrollHandler = () => {{
+        if (!disposed) updateActiveFromScroll();
+      }};
+      window.parent.addEventListener("scroll", parentScrollHandler, {{ passive: true }});
+    }}
+  }} catch (error) {{
+    parentScrollHandler = null;
+  }}
   if (window.ResizeObserver) {{
     resizeObserver = new ResizeObserver(() => {{
       if (!disposed) notifyHeight();
@@ -1664,11 +2029,17 @@ def render_beta_overview_component(
   requestAnimationFrame(() => {{
     const initialCandidateTab = candidateTabs.find((button) => button.classList.contains("active"))?.dataset.candTab || candidateTabs[0]?.dataset.candTab;
     if (initialCandidateTab) activateCandidateTab(initialCandidateTab);
-    const target = document.getElementById(initialAnchor) || document.getElementById("beta-overview");
+    const target = initialAnchor ? document.getElementById(initialAnchor) : null;
     if (target) {{
-      target.scrollIntoView({{ block: "start" }});
+      if (!scrollParentToTarget(target, false)) {{
+        target.scrollIntoView({{ block: "start" }});
+      }}
       activateTab(target.id || "beta-overview");
+    }} else {{
+      activateTab("beta-overview");
     }}
+    applyLivePayload(readLivePayload());
+    startLivePayloadPolling();
     notifyHeight();
     updateActiveFromScroll();
   }});

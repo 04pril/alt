@@ -130,18 +130,33 @@ KR strategies:
   - current recommended default KR strategy
   - `1h` bars
   - KIS mock only
-- `kr_intraday_15m_v1`
-  - separate experimental KR intraday strategy
-  - `15m` bars
-  - disabled by default
-  - complete-bar only, opening bar blocked, no overnight, session flatten near the close
+- `kr_intraday_15m` experimental family
+  - `kr_intraday_15m_v1`
+    - regular-session `15m`
+    - complete-bar only, opening bar blocked, no overnight, session flatten near the close
+    - disabled by default
+  - `kr_intraday_15m_v1_after_close_close`
+    - after-close close-price session
+    - `15:40~16:00`
+    - fixed same-day close price
+    - disabled by default
+    - first recommended after-hours mode when testing KR 15m after-hours execution
+  - `kr_intraday_15m_v1_after_close_single`
+    - after-close single-price session
+    - `16:00~18:00`
+    - 10-minute auction cadence
+    - disabled by default
+    - more experimental than the close-price mode
 
-The `15m` path is intentionally a separate strategy instead of a timeframe toggle on the `1h` strategy. It has its own target horizon, feature profile, gating window, conflict rules, and monitoring rows.
+The `15m` path is intentionally a separate strategy family instead of a timeframe toggle on the `1h` strategy. Regular and after-hours modes share the completed-bar signal base, but keep separate session windows, price policies, order intents, no-op reasons, conflict handling, and monitoring rows.
 
 Current default KR execution policy:
 
 - recommended default: `kr_intraday_1h_v1`
-- experimental opt-in only: `kr_intraday_15m_v1`
+- experimental opt-in only:
+  - `kr_intraday_15m_v1`
+  - `kr_intraday_15m_v1_after_close_close`
+  - `kr_intraday_15m_v1_after_close_single`
 - legacy only: `kr_daily_preclose_v1`
 
 Current KR execution order:
@@ -160,10 +175,20 @@ Current KR execution order:
 KR strategy rules:
 
 - only `kis_kr_paper` is allowed as the execution account
-- `kr_intraday_15m_v1` uses completed `15m` bars only
-- `09:00~09:15` opening bar is blocked for the `15m` strategy
-- new `15m` entries are allowed only from `09:15` to `14:45`
-- intraday KR strategies flatten between `15:15` and `15:20`
+- the full KR `15m` family uses completed `15m` bars only; no partial-bar look-ahead
+- `kr_intraday_15m_v1`
+  - `09:00~09:15` opening bar blocked
+  - new entries allowed only from `09:15` to `14:45`
+  - flatten between `15:15` and `15:20`
+- `kr_intraday_15m_v1_after_close_close`
+  - session mode: `after_close_close_price`
+  - entries allowed only from `15:40` to `16:00`
+  - price policy: same-day close price
+- `kr_intraday_15m_v1_after_close_single`
+  - session mode: `after_close_single_price`
+  - entries allowed only from `16:00` to `18:00`
+  - price policy: after-hours single-price expected/auction quote
+  - 10-minute auction cadence gate
 - duplicate pending entry, active strategy conflict, and cross-strategy same-symbol overlap are blocked inside the same KIS account
 
 Source-of-truth priorities for KR mock execution:
@@ -229,7 +254,10 @@ Gate tuning is tracked as explicit runtime profiles instead of editing the embed
 KR strategy policy inside all profiles:
 
 - default KR strategy id: `kr_intraday_1h_v1`
-- `kr_intraday_15m_v1`: experimental, off-by-default
+- `kr_intraday_15m` family: experimental, off-by-default
+  - `kr_intraday_15m_v1`
+  - `kr_intraday_15m_v1_after_close_close`
+  - `kr_intraday_15m_v1_after_close_single`
 - `kr_daily_preclose_v1`: legacy fallback, disabled unless explicitly opted in
 
 This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
@@ -277,7 +305,9 @@ It exposes:
 - broker rejects today
 - last websocket execution timestamp
 - `kr_strategy_overview`
-  - strategy id / label / timeframe / enabled / experimental
+  - strategy id / label / timeframe / session mode / enabled / experimental
+  - candidate / allowed / submit requested / submitted / acknowledged / pending fill / filled / rejected / cancelled
+  - no-op reason breakdown / reject reason breakdown
   - today candidate / allowed / rejected / submitted / filled / noop counts
   - per-strategy open positions / pending orders
   - top noop / reject reason
@@ -347,8 +377,8 @@ Execution assurance coverage includes:
 - pending entry duplicate blocking
 - KR market closed / outside intraday entry window / insufficient buying power rejection
 - KR submit -> acknowledged -> pending_fill -> filled / rejected / cancelled
-- KR strategy conflict blocking across `kr_daily_preclose_v1`, `kr_intraday_1h_v1`, `kr_intraday_15m_v1`
-- KR `15m` complete-bar gate / opening bar block / session flatten
+- KR strategy conflict blocking across `kr_daily_preclose_v1`, `kr_intraday_1h_v1`, and the full `kr_intraday_15m` family
+- KR `15m` complete-bar gate / opening bar block / session flatten / after-hours session-mode gating
 - websocket execution event state transition
 - REST reconcile fallback when websocket is absent
 - scheduler retry/backoff and lease refresh
@@ -356,15 +386,20 @@ Execution assurance coverage includes:
 
 ## Known Limitations
 
-- KR websocket execution handling is implemented as an ingest path, but a persistent websocket manager is not auto-started by the worker yet.
+- KR websocket execution handling is implemented as an ingest path.
+- KR quote websocket streaming is now auto-started by the worker for domestic stock symbols that matter to runtime monitoring (open KR positions, open KR orders, recent KR candidates, watchlist).
+- realtime KR quote updates are used for monitoring-only mark-to-market display; strategy signal generation still uses completed bars only.
 - If websocket events are unavailable, KR execution falls back to REST daily order/fill reconcile.
 - Reservation orders are not wired into the worker yet.
 - KR daily pre-close and intraday flatten windows are still schedule-based, not exchange-calendar-perfect.
 - KR intraday history currently depends on the configured market data provider for `1h` / `15m` bars and trims incomplete bars locally before signal generation.
+- KR after-close close-price execution uses explicit session-mode submission and REST/websocket reconcile fallback; it is not backed by a dedicated after-hours execution manager yet.
+- KR after-close single-price execution is more fragile than regular or after-close close-price because quote availability and 10-minute auction timing can delay or reject orders.
 - US equities and crypto still use the sim broker path.
 - legacy rows without `account_id` are backfilled during migration, but very old mixed sim snapshots can only be mapped conservatively to `sim_legacy_mixed` when asset type is unavailable.
 - `sim_legacy_mixed` is migration/backfill-only and must not appear in new runtime writes.
 - beta monitor depends on Streamlit DOM selectors for header/toolbar suppression and still needs visual regression checks after Streamlit upgrades.
+- beta monitor now auto-refreshes on a short cadence for realtime quote display, so visual checks should also verify scroll/anchor behavior after Streamlit upgrades.
 
 ## Final Merge Note
 

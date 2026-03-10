@@ -21,6 +21,8 @@ from jobs.tasks import (
     scan_job,
 )
 from kr_strategy import active_kr_strategy_ids, strategy_schedule
+from services.kis_quote_stream import KISKRQuoteStream
+from storage.repository import TradingRepository
 from storage.repository import utc_now_iso
 
 
@@ -168,7 +170,13 @@ def run_once(settings_path: str | None = None) -> None:
 
 def run_loop(settings_path: str | None = None) -> None:
     settings = load_settings(settings_path)
+    repository = TradingRepository(settings.storage.db_path)
+    repository.initialize()
+    quote_stream = KISKRQuoteStream(settings, repository)
+    quote_stream.refresh_symbols()
+    quote_stream.start()
     while True:
+        quote_stream.refresh_symbols()
         run_once(settings_path)
         time.sleep(max(settings.scheduler.loop_sleep_seconds, 5))
 

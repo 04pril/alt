@@ -6,7 +6,7 @@ import time
 import unittest
 
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_LEGACY_MIXED, ACCOUNT_SIM_US_EQUITY
-from storage.models import AccountSnapshotRecord, OrderRecord, PositionRecord
+from storage.models import AccountSnapshotRecord, LiveMarketQuoteRecord, OrderRecord, PositionRecord
 from storage.repository import TradingRepository, make_id, utc_now_iso
 
 
@@ -164,6 +164,31 @@ class RepositoryRuntimeTest(unittest.TestCase):
         self.assertIsNotNone(latest)
         self.assertEqual(latest["snapshot_id"], "snap_new")
         self.assertEqual(float(latest["equity"]), 150.0)
+
+    def test_live_market_quote_roundtrip_uses_symbol_code_lookup(self) -> None:
+        now_iso = utc_now_iso()
+        self.repo.upsert_live_market_quote(
+            LiveMarketQuoteRecord(
+                symbol_code="005930",
+                symbol="005930",
+                asset_type="한국주식",
+                currency="KRW",
+                source="kis_quote_websocket",
+                current_price=190000.0,
+                previous_close=189500.0,
+                change_pct=0.26,
+                ask_price=190100.0,
+                bid_price=189900.0,
+                volume=1234567.0,
+                updated_at=now_iso,
+            )
+        )
+
+        frame = self.repo.latest_live_market_quotes(symbols=("005930.KS",), max_age_seconds=60)
+
+        self.assertEqual(len(frame), 1)
+        self.assertEqual(str(frame.iloc[0]["symbol_code"]), "005930")
+        self.assertEqual(float(frame.iloc[0]["current_price"]), 190000.0)
 
     def test_max_account_equity_honors_source_scope(self) -> None:
         rows = [

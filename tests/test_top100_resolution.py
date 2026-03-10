@@ -21,6 +21,7 @@ class _FakeResponse:
 class Top100ResolutionTest(unittest.TestCase):
     def tearDown(self) -> None:
         app.load_krx_name_map.clear()
+        app.load_krx_symbol_name_map.clear()
         app.resolve_single_top100_entries.clear()
 
     def test_top100_universe_preserves_expected_korean_literals(self) -> None:

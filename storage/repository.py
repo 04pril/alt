@@ -24,6 +24,7 @@ from storage.models import (
     EvaluationRecord,
     FillRecord,
     JobRunLease,
+    LiveMarketQuoteRecord,
     OrderRecord,
     OutcomeRecord,
     PositionRecord,
@@ -237,6 +238,23 @@ CREATE TABLE IF NOT EXISTS broker_accounts (
     metadata_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS live_market_quotes (
+    symbol_code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL,
+    asset_type TEXT NOT NULL,
+    currency TEXT NOT NULL,
+    source TEXT NOT NULL,
+    current_price REAL,
+    previous_close REAL,
+    change_pct REAL,
+    ask_price REAL,
+    bid_price REAL,
+    volume REAL,
+    updated_at TEXT NOT NULL,
+    raw_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_live_market_quotes_updated_at ON live_market_quotes(updated_at);
+
 CREATE TABLE IF NOT EXISTS model_registry (
     model_version TEXT PRIMARY KEY,
     model_name TEXT NOT NULL,
@@ -320,6 +338,15 @@ def parse_utc_timestamp(value: Any) -> datetime | None:
         return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
     except ValueError:
         return None
+
+
+def _normalize_live_quote_symbol_code(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    if text.endswith(".KS") or text.endswith(".KQ"):
+        text = text[:-3]
+    if len(text) == 6 and text.isdigit():
+        return text
+    return text
 
 
 class TradingRepository:
@@ -658,6 +685,59 @@ class TradingRepository:
         with self.connect() as conn:
             row = conn.execute("SELECT flag_value FROM control_flags WHERE flag_name = ?", (flag_name,)).fetchone()
         return str(row["flag_value"]) if row else default
+
+    def upsert_live_market_quote(self, record: LiveMarketQuoteRecord) -> None:
+        row = asdict(record)
+        row["symbol_code"] = _normalize_live_quote_symbol_code(str(record.symbol_code or record.symbol))
+        row["symbol"] = str(record.symbol or row["symbol_code"])
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO live_market_quotes(
+                    symbol_code, symbol, asset_type, currency, source, current_price, previous_close,
+                    change_pct, ask_price, bid_price, volume, updated_at, raw_json
+                ) VALUES(
+                    :symbol_code, :symbol, :asset_type, :currency, :source, :current_price, :previous_close,
+                    :change_pct, :ask_price, :bid_price, :volume, :updated_at, :raw_json
+                )
+                ON CONFLICT(symbol_code) DO UPDATE SET
+                    symbol=excluded.symbol,
+                    asset_type=excluded.asset_type,
+                    currency=excluded.currency,
+                    source=excluded.source,
+                    current_price=excluded.current_price,
+                    previous_close=excluded.previous_close,
+                    change_pct=excluded.change_pct,
+                    ask_price=excluded.ask_price,
+                    bid_price=excluded.bid_price,
+                    volume=excluded.volume,
+                    updated_at=excluded.updated_at,
+                    raw_json=excluded.raw_json
+                """,
+                row,
+            )
+
+    def latest_live_market_quotes(
+        self,
+        *,
+        symbols: Iterable[str] | None = None,
+        max_age_seconds: int | None = 20,
+    ) -> pd.DataFrame:
+        query = "SELECT rowid, * FROM live_market_quotes"
+        params: list[Any] = []
+        normalized_symbols = [_normalize_live_quote_symbol_code(symbol) for symbol in (symbols or []) if str(symbol or "").strip()]
+        if normalized_symbols:
+            placeholders = ",".join("?" for _ in normalized_symbols)
+            query += f" WHERE symbol_code IN ({placeholders})"
+            params.extend(normalized_symbols)
+        query += " ORDER BY updated_at DESC, rowid DESC"
+        with self.connect() as conn:
+            frame = pd.read_sql_query(query, conn, params=params)
+        if frame.empty or max_age_seconds is None or "updated_at" not in frame.columns:
+            return frame
+        updated = pd.to_datetime(frame["updated_at"], errors="coerce", utc=True)
+        cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=max(int(max_age_seconds), 0))
+        return frame.loc[updated >= cutoff].reset_index(drop=True)
 
     def insert_system_event(self, record: SystemEventRecord) -> None:
         with self.connect() as conn:

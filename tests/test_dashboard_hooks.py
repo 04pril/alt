@@ -67,12 +67,46 @@ class DashboardHooksTest(unittest.TestCase):
         overview = build_asset_overview(settings, kis_enabled=True)
         self.assertFalse(overview.empty)
         self.assertEqual(set(overview["자산유형"]), {"코인", "미국주식", "한국주식"})
+        self.assertIn("전략", overview.columns)
         self.assertIn("대표 종목", overview.columns)
         self.assertIn("실행브로커", overview.columns)
         broker_modes = dict(zip(overview["자산유형"], overview["실행브로커"]))
         self.assertEqual(broker_modes["한국주식"], "kis_mock")
         self.assertEqual(broker_modes["미국주식"], "sim")
         self.assertEqual(broker_modes["코인"], "sim")
+        kr_row = overview.loc[overview["자산유형"] == "한국주식"].iloc[0]
+        self.assertEqual(str(kr_row["전략ID"]), "kr_intraday_1h_v1")
+        self.assertEqual(str(kr_row["타임프레임"]), "1h")
+
+    def test_asset_overview_reflects_active_kr_15m_strategy(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_default_strategy_id = "kr_intraday_15m_v1"
+        settings.kr_strategies["kr_intraday_1h_v1"].enabled = False
+        settings.kr_strategies["kr_intraday_15m_v1"].enabled = True
+
+        overview = build_asset_overview(settings, kis_enabled=True)
+
+        kr_row = overview.loc[overview["자산유형"] == "한국주식"].iloc[0]
+        self.assertEqual(str(kr_row["전략ID"]), "kr_intraday_15m_v1")
+        self.assertEqual(str(kr_row["타임프레임"]), "15m")
+        self.assertEqual(int(kr_row["스캔주기(분)"]), 15)
+        self.assertEqual(str(kr_row["실험전략"]), "예")
+        self.assertEqual(str(kr_row["세션모드"]), "regular")
+
+    def test_dashboard_reader_lists_regular_and_after_hours_kr_15m_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+
+            data = load_dashboard_data(settings)
+            rows = data["kr_strategy_overview"]
+            session_modes = dict(zip(rows["strategy_id"].astype(str), rows["session_mode"].astype(str)))
+
+            self.assertEqual(session_modes["kr_intraday_15m_v1"], "regular")
+            self.assertEqual(session_modes["kr_intraday_15m_v1_after_close_close"], "after_close_close")
+            self.assertEqual(session_modes["kr_intraday_15m_v1_after_close_single"], "after_close_single")
 
     def test_auto_trading_status_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,6 +177,8 @@ class DashboardHooksTest(unittest.TestCase):
             )
             repo.finish_job_run(lease.job_run_id, status="completed", metrics={"fills": 0})
             repo.set_control_flag("kis_last_order_sync_at", "2026-03-09T06:20:00Z", "test")
+            repo.set_control_flag("kis_last_websocket_quote_at", "2026-03-09T06:21:00Z", "test")
+            repo.set_control_flag("kis_quote_stream_status", "connected", "test")
 
             data = load_dashboard_data(settings)
             self.assertEqual(data["execution_summary"]["today_candidate_count"], 1)
@@ -151,13 +187,17 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(data["execution_summary"]["today_noop_count"], 1)
             self.assertFalse(data["broker_sync_status"].empty)
             self.assertEqual(data["kis_runtime"]["last_broker_order_sync"], "2026-03-09T06:20:00Z")
+            self.assertEqual(data["kis_runtime"]["last_websocket_quote_at"], "2026-03-09T06:21:00Z")
+            self.assertEqual(data["kis_runtime"]["quote_stream_status"], "connected")
             self.assertEqual(data["runtime_profile"]["name"], "balanced")
             self.assertEqual(data["runtime_profile"]["source"], "config/runtime_settings.balanced.json")
             self.assertEqual(data["runtime_profile"]["mode"], "recommended")
             self.assertEqual(data["runtime_profile"]["recommended_default"], "true")
             self.assertEqual(data["runtime_profile"]["experimental"], "false")
             self.assertEqual(data["runtime_profile"]["kr_default_strategy_id"], "kr_intraday_1h_v1")
+            self.assertEqual(data["runtime_profile"]["kr_default_strategy_session_mode"], "regular")
             self.assertIn("kr_intraday_1h_v1", data["runtime_profile"]["kr_active_strategies"])
+            self.assertIn("regular", data["runtime_profile"]["kr_active_strategy_session_modes"])
 
     def test_broker_sync_errors_filters_out_healthy_info_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -328,10 +368,22 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(str(data["recent_realized_trades"].iloc[0]["position_id"]), "pos_us_closed")
             self.assertFalse(data["kr_strategy_overview"].empty)
             strategy_ids = set(data["kr_strategy_overview"]["strategy_id"].astype(str))
-            self.assertEqual(strategy_ids, {"kr_daily_preclose_v1", "kr_intraday_1h_v1", "kr_intraday_15m_v1"})
+            self.assertEqual(
+                strategy_ids,
+                {
+                    "kr_daily_preclose_v1",
+                    "kr_intraday_1h_v1",
+                    "kr_intraday_15m_v1",
+                    "kr_intraday_15m_v1_after_close_close",
+                    "kr_intraday_15m_v1_after_close_single",
+                },
+            )
             intraday_15m = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1"].iloc[0]
             self.assertFalse(bool(intraday_15m["enabled"]))
             self.assertTrue(bool(intraday_15m["experimental"]))
+            self.assertEqual(str(intraday_15m["session_mode"]), "regular")
+            after_close = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_after_close_close"].iloc[0]
+            self.assertEqual(str(after_close["session_mode"]), "after_close_close")
 
 
 if __name__ == "__main__":

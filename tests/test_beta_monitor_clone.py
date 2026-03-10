@@ -16,17 +16,23 @@ from beta_monitor_clone import (
     _candidate_tabs_html,
     _equity_svg,
     _ensure_template_base_href,
+    _fmt_time,
     _frame_for_account,
     _job_label,
     _money_display_pair,
     _positions_card,
     _replace_template_script,
     _theme_button,
+    build_beta_live_payload,
+    render_beta_live_payload_host,
 )
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
 
 
 class BetaMonitorCloneTest(unittest.TestCase):
+    def test_fmt_time_localizes_utc_to_kst(self) -> None:
+        self.assertEqual(_fmt_time("2026-03-10T06:59:52.164629Z"), "2026-03-10 15:59:52")
+
     def test_ensure_template_base_href_inserts_root_base_tag(self) -> None:
         template = "<html><head><title>beta</title></head><body></body></html>"
 
@@ -84,10 +90,33 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("ETH-USD", rows[0])
         self.assertIn("진입 거절", rows[0])
         self.assertIn("주문 가능 금액 부족", rows[0])
-        self.assertIn("005930.KS", rows[1])
+        self.assertIn("005930", rows[1])
         self.assertIn("체결 완료", rows[1])
         self.assertNotIn("scan_complete", "".join(rows))
         self.assertNotIn("execution_pipeline", "".join(rows))
+
+    def test_build_entry_result_rows_formats_kr_symbol_name(self) -> None:
+        events = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T14:01:40Z",
+                    "component": "kis_execution",
+                    "event_type": "filled",
+                    "message": "filled",
+                    "details": {"symbol": "005930.KS", "expected_return": 0.0125, "confidence": 0.61},
+                }
+            ]
+        )
+
+        rows = _build_entry_result_rows(
+            events,
+            kr_symbol_names={"005930": "삼성전자", "005930.KS": "삼성전자"},
+            limit=4,
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("삼성전자", rows[0])
+        self.assertIn("005930", rows[0])
 
     def test_equity_svg_uses_responsive_viewbox_markup(self) -> None:
         curve = pd.DataFrame(
@@ -259,7 +288,11 @@ class BetaMonitorCloneTest(unittest.TestCase):
             ]
         )
 
-        view = _build_realized_trade_table_frame(trades, {"KRW=X": {"current_price": 1450.0}})
+        view = _build_realized_trade_table_frame(
+            trades,
+            {"KRW=X": {"current_price": 1450.0}},
+            kr_symbol_names={"005930": "삼성전자", "005930.KS": "삼성전자"},
+        )
 
         self.assertEqual(list(view.columns), ["종료시각", "계좌", "종목", "방향", "보유기간", "진입가", "청산가", "실현손익", "청산사유"])
         self.assertEqual(view.iloc[0]["계좌"], "SIM 미국주식 계좌")
@@ -334,9 +367,12 @@ class BetaMonitorCloneTest(unittest.TestCase):
             30000000.0,
             {"005930.KS": {"currency": "KRW", "current_price": 190000.0}},
             {"한국주식"},
+            kr_symbol_names={"005930": "삼성전자", "005930.KS": "삼성전자"},
         )
 
+        self.assertIn("삼성전자", markup)
         self.assertIn("190,000.00 KRW", markup)
+        self.assertIn("현재가 190,000.00 KRW", markup)
         self.assertIn("100.00 KRW", markup)
         self.assertIn("- / -", markup)
         self.assertNotIn("USD", markup)
@@ -417,6 +453,16 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("alt-beta-theme", markup)
         self.assertIn("applyTheme(readStoredTheme())", markup)
         self.assertIn("beta_theme=light", markup)
+        self.assertIn("window.parent.scrollTo", markup)
+        self.assertIn("window.parent.addEventListener(\"scroll\", parentScrollHandler", markup)
+        self.assertIn('id="beta-live-status-strip"', markup)
+        self.assertIn('id="beta-live-account-row"', markup)
+        self.assertIn('id="beta-live-positions"', markup)
+        self.assertIn("startLivePayloadPolling()", markup)
+        self.assertIn("applyLivePayload(readLivePayload())", markup)
+        self.assertNotIn("const autoRefreshMs = 5000;", markup)
+        self.assertNotIn("beta_live_tick", markup)
+        self.assertNotIn("window.parent.location.replace", markup)
         self.assertIn("detail-events-grid", markup)
         self.assertIn('id="assets"', markup)
         self.assertIn('id="errors"', markup)
@@ -613,6 +659,48 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("표시 4 / 전체 5건", markup)
         self.assertIn("상세보기", markup)
         self.assertIn("beta_signals=all", markup)
+
+    def test_build_beta_live_payload_and_host_include_live_sections(self) -> None:
+        payload = build_beta_live_payload(
+            data={
+                "summary": {"latest_account": {}},
+                "auto_trading_status": {"state": "running", "label": "가동 중"},
+                "broker_sync_errors": pd.DataFrame(),
+                "kis_runtime": {"last_broker_account_sync": "2026-03-10T05:00:00Z"},
+                "job_health": pd.DataFrame(),
+                "open_positions": pd.DataFrame(
+                    [
+                        {
+                            "account_id": ACCOUNT_KIS_KR_PAPER,
+                            "symbol": "005930",
+                            "asset_type": "한국주식",
+                            "side": "LONG",
+                            "quantity": 1,
+                            "entry_price": 187000.0,
+                            "mark_price": 187300.0,
+                            "unrealized_pnl": 300.0,
+                        }
+                    ]
+                ),
+            },
+            accounts_overview={
+                ACCOUNT_KIS_KR_PAPER: {
+                    "currency": "KRW",
+                    "latest_snapshot": {"equity": 30000000.0, "cash": 29813000.0},
+                }
+            },
+            quote_snapshots={"005930": {"currency": "KRW", "current_price": 187300.0}},
+            kr_asset_types={"한국주식"},
+            krx_name_map={"삼성전자": {"code": "005930", "market": "KOSPI"}},
+        )
+
+        self.assertIn('id="beta-live-status-strip"', payload["status_strip_html"])
+        self.assertIn('id="beta-live-account-row"', payload["account_row_html"])
+        self.assertIn('id="beta-live-positions"', payload["positions_html"])
+
+        host_markup = render_beta_live_payload_host(payload)
+        self.assertIn('id="beta-live-payload"', host_markup)
+        self.assertIn('"version"', host_markup)
 
 
 if __name__ == "__main__":

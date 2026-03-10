@@ -21,7 +21,7 @@ import streamlit.config as st_config
 import streamlit.components.v1 as components
 import yfinance as yf
 
-from beta_monitor_clone import render_beta_overview_component
+from beta_monitor_clone import build_beta_live_payload, render_beta_live_payload_host, render_beta_overview_component
 from config.settings import load_settings
 from kis_paper import (
     KISPaperClient,
@@ -33,6 +33,7 @@ from kis_paper import (
     load_order_log,
 )
 from monitoring.dashboard_hooks import load_dashboard_data, load_monitor_open_positions, load_monitor_recent_orders
+from monitoring.live_display import build_live_accounts_overview, build_live_total_portfolio_overview
 from prediction_store import (
     attach_order_to_prediction,
     filter_prediction_history,
@@ -315,6 +316,44 @@ def load_krx_name_map() -> Dict[str, Dict[str, str]]:
     return out
 
 
+@st.cache_data(ttl=60 * 10, show_spinner=False)
+def load_krx_symbol_name_map() -> Dict[str, str]:
+    symbol_map: Dict[str, str] = {}
+    for name, payload in load_krx_name_map().items():
+        if not isinstance(payload, dict):
+            continue
+        clean_name = str(name or "").strip()
+        code = str(payload.get("code") or "").strip().zfill(6)
+        market = str(payload.get("market") or "").strip().upper()
+        if not clean_name or not code:
+            continue
+        suffix = ".KQ" if "KOSDAQ" in market or "코스닥" in market else ".KS"
+        symbol_map.setdefault(code, clean_name)
+        symbol_map.setdefault(f"{code}{suffix}", clean_name)
+    return symbol_map
+
+
+def format_display_symbol_name(symbol: object, asset_type: object = "") -> str:
+    text = str(symbol or "").strip()
+    if not text:
+        return "-"
+    upper = text.upper()
+    if not is_korean_stock_symbol(upper):
+        return text
+    code = extract_korean_stock_code(upper)
+    symbol_name_map = load_krx_symbol_name_map()
+    display_name = (
+        symbol_name_map.get(upper)
+        or symbol_name_map.get(code)
+        or symbol_name_map.get(f"{code}.KS")
+        or symbol_name_map.get(f"{code}.KQ")
+        or ""
+    )
+    if display_name:
+        return f"{display_name} ({code})"
+    return code
+
+
 @st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
 def search_symbol_from_yf(query: str, market_hint: str) -> str | None:
     q = query.strip()
@@ -536,7 +575,42 @@ def _build_kr_snapshot(symbol: str, item: Dict[str, object]) -> Dict[str, float 
     }
 
 
+def load_live_kr_quote_snapshots(symbols: Tuple[str, ...], max_age_seconds: int = 20) -> Dict[str, Dict[str, float | str]]:
+    if not symbols:
+        return {}
+    repository = TradingRepository(runtime_settings.storage.db_path)
+    repository.initialize()
+    frame = repository.latest_live_market_quotes(symbols=symbols, max_age_seconds=max_age_seconds)
+    if frame.empty:
+        return {}
+    snapshots: Dict[str, Dict[str, float | str]] = {}
+    by_code = {
+        str(row.get("symbol_code") or "").strip(): row.to_dict()
+        for _, row in frame.iterrows()
+        if str(row.get("symbol_code") or "").strip()
+    }
+    for symbol in symbols:
+        code = extract_korean_stock_code(symbol)
+        row = by_code.get(code)
+        if not row:
+            continue
+        snapshots[symbol] = {
+            "symbol": symbol,
+            "currency": str(row.get("currency") or "KRW"),
+            "current_price": first_valid_float(row.get("current_price")),
+            "previous_close": first_valid_float(row.get("previous_close")),
+            "change_pct": first_valid_float(row.get("change_pct")),
+            "ask_price": first_valid_float(row.get("ask_price")),
+            "bid_price": first_valid_float(row.get("bid_price")),
+            "updated_at": str(row.get("updated_at") or ""),
+        }
+    return snapshots
+
+
 def fetch_single_kr_quote_snapshot(symbol: str) -> Dict[str, float | str]:
+    live_snapshot = load_live_kr_quote_snapshots((symbol,)).get(symbol)
+    if live_snapshot:
+        return live_snapshot
     try:
         kis_quote = KISPaperClient().get_quote(symbol_or_code=symbol)
         current_price = first_valid_float(kis_quote.get("current_price"))
@@ -576,11 +650,14 @@ def fetch_single_kr_quote_snapshot(symbol: str) -> Dict[str, float | str]:
 
 
 def fetch_kr_quote_snapshots(symbols: Tuple[str, ...]) -> Dict[str, Dict[str, float | str]]:
-    snapshots: Dict[str, Dict[str, float | str]] = {}
+    snapshots: Dict[str, Dict[str, float | str]] = load_live_kr_quote_snapshots(symbols)
     if not symbols:
         return snapshots
 
-    code_to_symbol = {extract_korean_stock_code(symbol): symbol for symbol in symbols}
+    remaining_symbols = tuple(symbol for symbol in symbols if symbol not in snapshots)
+    if not remaining_symbols:
+        return snapshots
+    code_to_symbol = {extract_korean_stock_code(symbol): symbol for symbol in remaining_symbols}
     for chunk in _chunked(tuple(code_to_symbol.keys()), size=40):
         response = requests.get(
             "https://polling.finance.naver.com/api/realtime",
@@ -599,7 +676,7 @@ def fetch_kr_quote_snapshots(symbols: Tuple[str, ...]) -> Dict[str, Dict[str, fl
                     continue
                 snapshots[symbol] = _build_kr_snapshot(symbol=symbol, item=item)
 
-    for symbol in symbols:
+    for symbol in remaining_symbols:
         snapshots.setdefault(symbol, fetch_single_kr_quote_snapshot(symbol))
     return snapshots
 
@@ -1141,6 +1218,12 @@ def build_monitor_table_view(frame: pd.DataFrame, limit: int | None = None) -> p
         view["job"] = view["job"].map(_monitor_job_label)
     if "status" in view.columns:
         view["status"] = view["status"].map(_monitor_status_label)
+    if "symbol" in view.columns:
+        asset_types = view["asset_type"] if "asset_type" in view.columns else pd.Series("", index=view.index)
+        view["symbol"] = [
+            format_display_symbol_name(symbol, asset_type)
+            for symbol, asset_type in zip(view["symbol"].tolist(), asset_types.tolist())
+        ]
     return view.rename(columns={key: value for key, value in MONITOR_FRAME_COLUMN_LABELS.items() if key in view.columns})
 
 
@@ -1796,7 +1879,7 @@ def build_live_open_positions_view(open_positions: pd.DataFrame, refresh_token: 
             market_value = float("nan")
         rows.append(
             {
-                "종목": symbol,
+                "종목": format_display_symbol_name(symbol, row.get("asset_type")),
                 "자산": str(row.get("asset_type") or ""),
                 "방향": side,
                 "수량": quantity,
@@ -1824,7 +1907,7 @@ def build_recent_order_activity_view(recent_orders: pd.DataFrame) -> pd.DataFram
         reason = str(row.get("reason") or "")
         rows.append(
             {
-                "종목": symbol,
+                "종목": format_display_symbol_name(symbol, row.get("asset_type")),
                 "자산": str(row.get("asset_type") or ""),
                 "주문": PAPER_ORDER_SIDE_LABELS.get(side, side.upper() or "-"),
                 "요청수량": int(first_valid_float(row.get("requested_qty"), default=0.0)),
@@ -1887,7 +1970,7 @@ def build_recent_realized_trades_view(recent_realized_trades: pd.DataFrame) -> p
             {
                 "종료시각": format_display_timestamp(row.get("closed_at")),
                 "계좌": account_labels.get(str(row.get("account_id") or ""), str(row.get("account_id") or "-")),
-                "종목": symbol,
+                "종목": format_display_symbol_name(symbol, row.get("asset_type")),
                 "자산": str(row.get("asset_type") or ""),
                 "방향": side,
                 "보유기간": _format_holding_duration(row.get("created_at"), row.get("closed_at")),
@@ -2570,9 +2653,16 @@ def _build_operations_runtime_card_html(
     position_sync = broker_sync_rows.get("broker_position_sync", {})
     market_sync = broker_sync_rows.get("broker_market_status", {})
     profile_source = str(runtime_profile.get("source") or "embedded_defaults")
-    ws_event_text = format_display_timestamp(kis_runtime.get("last_websocket_execution_event"))
-    ws_event = ws_event_text or "기록 없음"
-    ws_note = "KIS 체결 이벤트를 마지막으로 받은 시각" if ws_event_text else "아직 받은 실시간 체결 이벤트가 없습니다"
+    ws_quote_text = format_display_timestamp(kis_runtime.get("last_websocket_quote_at"))
+    ws_quote = ws_quote_text or "기록 없음"
+    ws_status = str(kis_runtime.get("quote_stream_status") or "").lower()
+    ws_note = (
+        "KIS KR 시세 웹소켓이 현재 연결되어 있습니다"
+        if ws_status == "connected"
+        else "KIS KR 시세 웹소켓 최근 수신 시각"
+        if ws_quote_text
+        else "아직 받은 실시간 시세 이벤트가 없습니다"
+    )
     pending_orders = int(first_valid_float(kis_runtime.get("pending_submitted_orders"), default=0.0))
     if str(MONITOR_UI_VARIANT or "polished").lower() == "classic":
         return f"""
@@ -2611,9 +2701,9 @@ def _build_operations_runtime_card_html(
                   <small>아직 체결되지 않은 KIS 주문 수</small>
                 </div>
                 <div class="alt-ops-runtime-chip">
-                  <span>최근 실시간 체결 수신</span>
-                  <strong>{html.escape(ws_event)}</strong>
-                  <small>KIS 체결 이벤트 수신 시각</small>
+                  <span>KR 실시간 시세</span>
+                  <strong>{html.escape(ws_quote)}</strong>
+                  <small>{html.escape(ws_note)}</small>
                 </div>
               </div>
             </div>
@@ -2659,8 +2749,8 @@ def _build_operations_runtime_card_html(
               <small>아직 체결되지 않은 KIS 주문 수</small>
             </div>
             <div class="alt-ops-runtime-chip alt-ops-runtime-chip-accent">
-              <span>최근 실시간 체결 수신</span>
-              <strong>{html.escape(ws_event)}</strong>
+              <span>KR 실시간 시세</span>
+              <strong>{html.escape(ws_quote)}</strong>
               <small>{html.escape(ws_note)}</small>
             </div>
           </div>
@@ -2758,14 +2848,14 @@ def render_live_open_positions_panel(settings) -> None:
             label_visibility="collapsed",
         )
 
-        @st.fragment(run_every=15)
+        @st.fragment(run_every=5)
         def _render_live_open_positions_fragment() -> None:
             if view_mode == "보유 포지션":
                 current_positions = load_monitor_open_positions(settings)
                 if current_positions.empty:
                     st.caption("현재 보유 중인 포지션이 없습니다.")
                     return
-                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 5)
                 live_view = build_live_open_positions_view(current_positions, refresh_token=refresh_token)
                 metric_cols = st.columns(3, gap="small")
                 metric_cols[0].metric("보유 종목 수", f"{len(current_positions)}", border=True)
@@ -3408,7 +3498,7 @@ def render_operations_monitor(
                 if selected_open_positions.empty:
                     st.caption("현재 보유 중인 포지션이 없습니다.")
                     return
-                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 5)
                 live_view = build_live_open_positions_view(selected_open_positions, refresh_token=refresh_token)
                 metric_cols = st.columns(3, gap="small")
                 metric_cols[0].metric("보유 종목 수", f"{len(selected_open_positions)}", border=True)
@@ -3442,106 +3532,146 @@ def render_operations_monitor(
             )
             st.dataframe(order_view, width="stretch", hide_index=True, height=260)
 
-    if str(MONITOR_UI_VARIANT or "polished").lower() == "polished":
-        st.markdown(
-            _build_operations_overview_strip_html(
-                auto_trading_status=auto_trading_status,
-                runtime_profile=runtime_profile,
-                account_snapshot=selected_snapshot,
-            ),
-            unsafe_allow_html=True,
+    @st.fragment(run_every=5)
+    def _render_live_monitor_overview() -> None:
+        quote_snapshots: Dict[str, Dict[str, Any]] = {}
+        quote_symbols: List[str] = []
+        if not open_positions.empty and "symbol" in open_positions.columns:
+            quote_symbols.extend(open_positions["symbol"].dropna().astype(str).tolist())
+        if any(
+            str((accounts_overview.get(account_id) or {}).get("currency") or "").upper() == "USD"
+            for account_id in (ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO)
+        ):
+            quote_symbols.append("KRW=X")
+        if quote_symbols:
+            symbols = tuple(dict.fromkeys(quote_symbols))
+            refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 5)
+            quote_snapshots.update(fetch_quote_snapshots(symbols=symbols, refresh_token=refresh_token))
+
+        live_accounts_overview = build_live_accounts_overview(accounts_overview, open_positions, quote_snapshots)
+        live_total_portfolio_overview = build_live_total_portfolio_overview(live_accounts_overview)
+        live_total_portfolio_overview["trade_performance"] = total_portfolio_overview.get("trade_performance", data["trade_performance"])
+        live_selected_account = dict(live_accounts_overview.get(selected_scope_value) or {}) if selected_scope_value != "__total__" else {}
+        live_selected_snapshot = (
+            dict(live_selected_account.get("latest_snapshot") or {})
+            if live_selected_account
+            else {
+                "created_at": live_total_portfolio_overview.get("last_sync_time") or summary.get("latest_job_at"),
+                "equity": live_total_portfolio_overview.get("equity"),
+                "cash": live_total_portfolio_overview.get("cash"),
+                "gross_exposure": np.nan,
+                "net_exposure": np.nan,
+                "drawdown_pct": live_total_portfolio_overview.get("drawdown_pct"),
+            }
+        )
+        live_selected_trade_performance = live_selected_account.get(
+            "trade_performance",
+            live_total_portfolio_overview.get("trade_performance", data["trade_performance"]),
         )
 
-    st.caption("계좌별 운영 현황")
-    overview_cols = st.columns(4, gap="small")
-    account_card_specs = [
-        ("한국주식(KIS)", accounts_overview.get(ACCOUNT_KIS_KR_PAPER, {}), False),
-        ("미국주식(SIM)", accounts_overview.get(ACCOUNT_SIM_US_EQUITY, {}), False),
-        ("코인(SIM)", accounts_overview.get(ACCOUNT_SIM_CRYPTO, {}), False),
-        ("전체(참고용)", total_portfolio_overview, True),
-    ]
-    for column, (label, payload, is_total) in zip(overview_cols, account_card_specs):
-        with column:
-            with st.container(border=True):
-                st.caption(label)
-                if is_total:
-                    st.metric("평가 자산", _format_currency_totals(payload.get("equity_by_currency", {})), border=True)
-                    st.caption("주문 가능 잔고 기준이 아닙니다.")
-                    st.caption(f"보유 포지션 {int(payload.get('open_positions', 0))} · 대기 주문 {int(payload.get('pending_orders', 0))}")
-                    st.caption(format_display_timestamp(payload.get("last_sync_time")) or "최근 동기화 기록 없음")
-                else:
-                    currency = str(payload.get("currency") or "KRW")
-                    st.metric("평가 자산", f"{format_price_value(float(payload.get('equity', 0.0) or 0.0))} {currency}", border=True)
-                    st.caption(f"예수금 {format_price_value(float(payload.get('cash', 0.0) or 0.0))} {currency}")
-                    st.caption(
-                        f"낙폭 {format_pct_value(float(payload.get('drawdown_pct', 0.0) or 0.0))} · 포지션 {int(payload.get('open_positions', 0))} · 주문 {int(payload.get('pending_orders', 0))}"
-                    )
-                    st.caption(
-                        f"마지막 동기화 {format_display_timestamp(payload.get('last_sync_time')) or '기록 없음'} · {_sync_status_label(str(payload.get('last_sync_status') or 'never'))}"
-                    )
-
-    if selected_scope_value == "__total__":
-        st.warning(str(total_portfolio_overview.get("warning") or "전체 합산 뷰는 참고용입니다."))
-    else:
-        st.info(
-            f"현재 보기 기준: {selected_scope_label} · 브로커 {selected_account.get('broker_mode', '-')}"
-            f" · 기준 통화 {selected_account.get('currency', '-')}"
-            " · RiskEngine과 주문 가능 잔고 판단은 이 계좌만 사용합니다."
-        )
-    if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER}:
-        st.caption(
-            f"현재 KR 기본 전략 · {str(runtime_profile.get('kr_default_strategy_label') or runtime_profile.get('kr_default_strategy_id') or '-')}"
-            f" · 활성 전략 {str(runtime_profile.get('kr_active_strategy_labels') or runtime_profile.get('kr_active_strategies') or '-')}"
-        )
-
-    hero_cols = st.columns([1.15, 1.0], gap="large")
-    with hero_cols[0]:
-        if selected_scope_value == "__total__":
-            with st.container(border=True):
-                st.caption("전체 포트폴리오 합산")
-                top_metrics = st.columns(3, gap="small")
-                top_metrics[0].metric("평가 자산", _format_currency_totals(total_portfolio_overview.get("equity_by_currency", {})), border=True)
-                total_current_pnl = {
-                    currency: float(total_portfolio_overview.get("realized_pnl_by_currency", {}).get(currency, 0.0))
-                    + float(total_portfolio_overview.get("unrealized_pnl_by_currency", {}).get(currency, 0.0))
-                    for currency in set(total_portfolio_overview.get("realized_pnl_by_currency", {}))
-                    | set(total_portfolio_overview.get("unrealized_pnl_by_currency", {}))
-                }
-                top_metrics[1].metric("현재 손익", _format_currency_totals(total_current_pnl), border=True)
-                top_metrics[2].metric("총 익스포저", _format_currency_totals(total_portfolio_overview.get("gross_exposure_by_currency", {})), border=True)
-                st.caption(f"열린 포지션 {int(total_portfolio_overview.get('open_positions', 0))} · 대기 주문 {int(total_portfolio_overview.get('pending_orders', 0))}")
-                st.caption(
-                    f"최근 동기화 {format_display_timestamp(total_portfolio_overview.get('last_sync_time')) or '기록 없음'}"
-                    f" · {str(runtime_profile.get('name') or settings.profile_name)}"
-                )
-        else:
+        if str(MONITOR_UI_VARIANT or "polished").lower() == "polished":
             st.markdown(
-                _build_operations_balance_card_html(
-                    account_snapshot=selected_snapshot,
-                    trade_performance=selected_trade_performance,
+                _build_operations_overview_strip_html(
+                    auto_trading_status=auto_trading_status,
+                    runtime_profile=runtime_profile,
+                    account_snapshot=live_selected_snapshot,
+                ),
+                unsafe_allow_html=True,
+            )
+
+        st.caption("계좌별 운영 현황")
+        overview_cols = st.columns(4, gap="small")
+        account_card_specs = [
+            ("한국주식(KIS)", live_accounts_overview.get(ACCOUNT_KIS_KR_PAPER, {}), False),
+            ("미국주식(SIM)", live_accounts_overview.get(ACCOUNT_SIM_US_EQUITY, {}), False),
+            ("코인(SIM)", live_accounts_overview.get(ACCOUNT_SIM_CRYPTO, {}), False),
+            ("전체(참고용)", live_total_portfolio_overview, True),
+        ]
+        for column, (label, payload, is_total) in zip(overview_cols, account_card_specs):
+            with column:
+                with st.container(border=True):
+                    st.caption(label)
+                    if is_total:
+                        st.metric("평가 자산", _format_currency_totals(payload.get("equity_by_currency", {})), border=True)
+                        st.caption("주문 가능 잔고 기준이 아닙니다.")
+                        st.caption(f"보유 포지션 {int(payload.get('open_positions', 0))} · 대기 주문 {int(payload.get('pending_orders', 0))}")
+                        st.caption(format_display_timestamp(payload.get("last_sync_time")) or "최근 동기화 기록 없음")
+                    else:
+                        currency = str(payload.get("currency") or "KRW")
+                        st.metric("평가 자산", f"{format_price_value(float(payload.get('equity', 0.0) or 0.0))} {currency}", border=True)
+                        st.caption(f"예수금 {format_price_value(float(payload.get('cash', 0.0) or 0.0))} {currency}")
+                        st.caption(
+                            f"낙폭 {format_pct_value(float(payload.get('drawdown_pct', 0.0) or 0.0))} · 포지션 {int(payload.get('open_positions', 0))} · 주문 {int(payload.get('pending_orders', 0))}"
+                        )
+                        st.caption(
+                            f"마지막 동기화 {format_display_timestamp(payload.get('last_sync_time')) or '기록 없음'} · {_sync_status_label(str(payload.get('last_sync_status') or 'never'))}"
+                        )
+
+        if selected_scope_value == "__total__":
+            st.warning(str(live_total_portfolio_overview.get("warning") or "전체 합산 뷰는 참고용입니다."))
+        else:
+            st.info(
+                f"현재 보기 기준: {selected_scope_label} · 브로커 {live_selected_account.get('broker_mode', '-')}"
+                f" · 기준 통화 {live_selected_account.get('currency', '-')}"
+                " · RiskEngine과 주문 가능 잔고 판단은 이 계좌만 사용합니다."
+            )
+        if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER}:
+            st.caption(
+                f"현재 KR 기본 전략 · {str(runtime_profile.get('kr_default_strategy_label') or runtime_profile.get('kr_default_strategy_id') or '-')}"
+                f" · 세션 {str(runtime_profile.get('kr_default_strategy_session_mode') or '-')}"
+                f" · 활성 전략 {str(runtime_profile.get('kr_active_strategy_labels') or runtime_profile.get('kr_active_strategies') or '-')}"
+            )
+
+        hero_cols = st.columns([1.15, 1.0], gap="large")
+        with hero_cols[0]:
+            if selected_scope_value == "__total__":
+                with st.container(border=True):
+                    st.caption("전체 포트폴리오 합산")
+                    top_metrics = st.columns(3, gap="small")
+                    top_metrics[0].metric("평가 자산", _format_currency_totals(live_total_portfolio_overview.get("equity_by_currency", {})), border=True)
+                    total_current_pnl = {
+                        currency: float(live_total_portfolio_overview.get("realized_pnl_by_currency", {}).get(currency, 0.0))
+                        + float(live_total_portfolio_overview.get("unrealized_pnl_by_currency", {}).get(currency, 0.0))
+                        for currency in set(live_total_portfolio_overview.get("realized_pnl_by_currency", {}))
+                        | set(live_total_portfolio_overview.get("unrealized_pnl_by_currency", {}))
+                    }
+                    top_metrics[1].metric("현재 손익", _format_currency_totals(total_current_pnl), border=True)
+                    top_metrics[2].metric("총 익스포저", _format_currency_totals(live_total_portfolio_overview.get("gross_exposure_by_currency", {})), border=True)
+                    st.caption(f"열린 포지션 {int(live_total_portfolio_overview.get('open_positions', 0))} · 대기 주문 {int(live_total_portfolio_overview.get('pending_orders', 0))}")
+                    st.caption(
+                        f"최근 동기화 {format_display_timestamp(live_total_portfolio_overview.get('last_sync_time')) or '기록 없음'}"
+                        f" · {str(runtime_profile.get('name') or settings.profile_name)}"
+                    )
+            else:
+                st.markdown(
+                    _build_operations_balance_card_html(
+                        account_snapshot=live_selected_snapshot,
+                        trade_performance=live_selected_trade_performance,
+                        runtime_profile=runtime_profile,
+                    ),
+                    unsafe_allow_html=True,
+                )
+            st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+            _render_scoped_live_panel()
+        with hero_cols[1]:
+            if selected_scope_value != "__total__":
+                st.caption(
+                    f"선택 계좌 마지막 동기화 {format_display_timestamp(live_selected_account.get('last_sync_time')) or '기록 없음'}"
+                    f" · {_sync_status_label(str(live_selected_account.get('last_sync_status') or 'never'))}"
+                )
+            else:
+                st.caption("브로커 동기화 잡 상태는 계좌 공통 런타임 기준입니다.")
+            st.markdown(
+                _build_operations_runtime_card_html(
+                    auto_trading_status=auto_trading_status,
+                    broker_sync_rows=sync_rows,
+                    kis_runtime=kis_runtime,
                     runtime_profile=runtime_profile,
                 ),
                 unsafe_allow_html=True,
             )
-        st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
-        _render_scoped_live_panel()
-    with hero_cols[1]:
-        if selected_scope_value != "__total__":
-            st.caption(
-                f"선택 계좌 마지막 동기화 {format_display_timestamp(selected_account.get('last_sync_time')) or '기록 없음'}"
-                f" · {_sync_status_label(str(selected_account.get('last_sync_status') or 'never'))}"
-            )
-        else:
-            st.caption("브로커 동기화 잡 상태는 계좌 공통 런타임 기준입니다.")
-        st.markdown(
-            _build_operations_runtime_card_html(
-                auto_trading_status=auto_trading_status,
-                broker_sync_rows=sync_rows,
-                kis_runtime=kis_runtime,
-                runtime_profile=runtime_profile,
-            ),
-            unsafe_allow_html=True,
-        )
+
+    _render_live_monitor_overview()
 
     st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
 
@@ -3598,41 +3728,53 @@ def render_operations_monitor(
         st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
         with st.container(border=True):
             st.caption("KR 전략 상태")
-            st.caption("기본 추천 전략은 1시간봉이며, 15분 전략은 experimental/off-by-default 입니다.")
+            st.caption("기본 추천 전략은 1시간봉이며, KR 15분 family는 regular / 장후종가 / 시간외단일가 세션으로 분리된 experimental 전략입니다.")
             strategy_view = kr_strategy_overview.rename(
                 columns={
                     "label": "전략",
+                    "session_mode": "세션 모드",
                     "timeframe": "타임프레임",
                     "enabled": "활성",
                     "experimental": "실험",
                     "today_candidate_count": "후보",
                     "today_entry_allowed_count": "허용",
                     "today_entry_rejected_count": "거절",
+                    "today_submit_requested_count": "제출 요청",
                     "today_submitted_count": "제출",
+                    "today_acknowledged_count": "접수",
+                    "today_pending_fill_count": "대기체결",
                     "today_filled_count": "체결",
+                    "today_rejected_count": "브로커거절",
+                    "today_cancelled_count": "취소",
                     "today_noop_count": "미실행",
                     "open_positions": "보유 포지션",
                     "pending_orders": "대기 주문",
-                    "today_noop_top_reason": "주요 미실행 사유",
-                    "today_reject_top_reason": "주요 거절 사유",
+                    "today_noop_breakdown": "미실행 사유 요약",
+                    "today_reject_breakdown": "거절 사유 요약",
                     "last_event_at": "최근 이벤트",
                 }
             )
             strategy_cols = [
                 "전략",
+                "세션 모드",
                 "타임프레임",
                 "활성",
                 "실험",
                 "후보",
                 "허용",
                 "거절",
+                "제출 요청",
                 "제출",
+                "접수",
+                "대기체결",
                 "체결",
+                "브로커거절",
+                "취소",
                 "미실행",
                 "보유 포지션",
                 "대기 주문",
-                "주요 미실행 사유",
-                "주요 거절 사유",
+                "미실행 사유 요약",
+                "거절 사유 요약",
                 "최근 이벤트",
             ]
             strategy_cols = [column for column in strategy_cols if column in strategy_view.columns]
@@ -3755,28 +3897,42 @@ def render_operations_monitor(
             strategy_exec_view = kr_strategy_overview.rename(
                 columns={
                     "label": "전략",
+                    "session_mode": "세션 모드",
                     "today_candidate_count": "후보",
                     "today_entry_allowed_count": "허용",
                     "today_entry_rejected_count": "거절",
                     "today_submit_requested_count": "제출 요청",
                     "today_submitted_count": "제출",
+                    "today_acknowledged_count": "접수",
+                    "today_pending_fill_count": "대기체결",
                     "today_filled_count": "체결",
+                    "today_rejected_count": "브로커거절",
+                    "today_cancelled_count": "취소",
                     "today_noop_count": "미실행",
                     "open_positions": "보유 포지션",
                     "pending_orders": "대기 주문",
+                    "today_noop_breakdown": "미실행 사유 요약",
+                    "today_reject_breakdown": "거절 사유 요약",
                 }
             )
             strategy_exec_cols = [
                 "전략",
+                "세션 모드",
                 "후보",
                 "허용",
                 "거절",
                 "제출 요청",
                 "제출",
+                "접수",
+                "대기체결",
                 "체결",
+                "브로커거절",
+                "취소",
                 "미실행",
                 "보유 포지션",
                 "대기 주문",
+                "미실행 사유 요약",
+                "거절 사유 요약",
             ]
             strategy_exec_cols = [column for column in strategy_exec_cols if column in strategy_exec_view.columns]
             st.dataframe(build_monitor_table_view(strategy_exec_view[strategy_exec_cols]), width="stretch", hide_index=True)
@@ -5661,7 +5817,7 @@ def render_beta_monitor_page() -> None:
         with st.container(border=True):
             st.markdown(
                 '<div class="beta-card-head"><div class="beta-card-title">실시간 포지션 / 주문 활동</div>'
-                '<div class="beta-card-meta">15초 간격 갱신</div></div>',
+                '<div class="beta-card-meta">5초 간격 갱신</div></div>',
                 unsafe_allow_html=True,
             )
             view_mode = st.radio(
@@ -5672,14 +5828,14 @@ def render_beta_monitor_page() -> None:
                 label_visibility="collapsed",
             )
 
-            @st.fragment(run_every=15)
+            @st.fragment(run_every=5)
             def _render_beta_live_fragment() -> None:
                 if view_mode == "보유 포지션":
                     current_positions = load_monitor_open_positions(settings)
                     if current_positions.empty:
                         st.caption("현재 보유 중인 포지션이 없습니다.")
                         return
-                    refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
+                    refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 5)
                     live_view = build_live_open_positions_view(current_positions, refresh_token=refresh_token)
                     metric_cols = st.columns(3, gap="small")
                     metric_cols[0].metric("보유 종목 수", f"{len(current_positions)}", border=True)
@@ -6024,8 +6180,6 @@ def _render_beta_monitor_clone_page() -> None:
     current_candidate_tab = _beta_query_value("beta_cand_tab", "")
     jobs_expanded = _beta_query_value("beta_jobs", "") == "all"
     signals_expanded = _beta_query_value("beta_signals", "") == "all"
-    repository = TradingRepository(settings.storage.db_path)
-    repository.initialize()
     st.markdown(
         """
         <style>
@@ -6059,47 +6213,75 @@ def _render_beta_monitor_clone_page() -> None:
         """,
         unsafe_allow_html=True,
     )
+    initial_anchor = _beta_query_value("beta_anchor", "")
 
-    data = load_dashboard_data(settings)
+    def _load_beta_live_state() -> tuple[Dict[str, Any], pd.DataFrame, Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, Dict[str, Any]], set[str]]:
+        data = load_dashboard_data(settings)
+        open_positions = data.get("open_positions", pd.DataFrame())
+        accounts_overview = build_live_accounts_overview(
+            data.get("accounts_overview", {}),
+            open_positions,
+            {},
+        )
+        kr_asset_types = {
+            asset_type
+            for asset_type, schedule in settings.asset_schedules.items()
+            if str(getattr(schedule, "timezone", "")) == "Asia/Seoul"
+        }
+        quote_snapshots: Dict[str, Dict[str, Any]] = {}
+        quote_symbols: List[str] = []
+        if not open_positions.empty and "symbol" in open_positions.columns:
+            quote_symbols.extend(open_positions["symbol"].dropna().astype(str).tolist())
+        if any(
+            str((accounts_overview.get(account_id) or {}).get("currency") or "").upper() == "USD"
+            for account_id in (ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO)
+        ):
+            quote_symbols.append("KRW=X")
+        if quote_symbols:
+            symbols = tuple(dict.fromkeys(quote_symbols))
+            if symbols:
+                refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 5)
+                quote_snapshots = fetch_quote_snapshots(symbols=symbols, refresh_token=refresh_token)
+        live_accounts_overview = build_live_accounts_overview(
+            data.get("accounts_overview", {}),
+            open_positions,
+            quote_snapshots,
+        )
+        live_total_portfolio_overview = build_live_total_portfolio_overview(live_accounts_overview)
+        return data, open_positions, live_accounts_overview, live_total_portfolio_overview, quote_snapshots, kr_asset_types
+
+    data, _open_positions, live_accounts_overview, live_total_portfolio_overview, quote_snapshots, kr_asset_types = _load_beta_live_state()
     recent_orders = load_monitor_recent_orders(settings, limit=40)
-    open_positions = data.get("open_positions", pd.DataFrame())
-    accounts_overview = data.get("accounts_overview", {})
-    total_portfolio_overview = data.get("total_portfolio_overview", {})
-    kr_asset_types = {
-        asset_type
-        for asset_type, schedule in settings.asset_schedules.items()
-        if str(getattr(schedule, "timezone", "")) == "Asia/Seoul"
-    }
-    quote_snapshots: Dict[str, Dict[str, Any]] = {}
-    quote_symbols: List[str] = []
-    if not open_positions.empty and "symbol" in open_positions.columns:
-        quote_symbols.extend(open_positions["symbol"].dropna().astype(str).tolist())
-    if any(
-        str((accounts_overview.get(account_id) or {}).get("currency") or "").upper() == "USD"
-        for account_id in (ACCOUNT_SIM_US_EQUITY, ACCOUNT_SIM_CRYPTO)
-    ):
-        quote_symbols.append("KRW=X")
-    if quote_symbols:
-        symbols = tuple(dict.fromkeys(quote_symbols))
-        if symbols:
-            refresh_token = int(pd.Timestamp.now(tz="UTC").timestamp() // 15)
-            quote_snapshots = fetch_quote_snapshots(symbols=symbols, refresh_token=refresh_token)
-
+    krx_name_map = load_krx_name_map()
     render_beta_overview_component(
         data=data,
         theme_mode=theme_mode,
-        initial_anchor=_beta_query_value("beta_anchor", "beta-overview"),
+        initial_anchor=initial_anchor,
         feedback=st.session_state.get("beta_action_feedback") if isinstance(st.session_state.get("beta_action_feedback"), dict) else None,
-        accounts_overview=accounts_overview,
-        total_portfolio_overview=total_portfolio_overview,
+        accounts_overview=live_accounts_overview,
+        total_portfolio_overview=live_total_portfolio_overview,
         quote_snapshots=quote_snapshots,
         kr_asset_types=kr_asset_types,
         recent_orders=recent_orders,
-        krx_name_map=load_krx_name_map(),
+        krx_name_map=krx_name_map,
         current_candidate_tab=current_candidate_tab,
         jobs_expanded=jobs_expanded,
         signals_expanded=signals_expanded,
     )
+
+    @st.fragment(run_every=5)
+    def _render_beta_live_payload_fragment() -> None:
+        payload_data, _open_positions, payload_accounts_overview, _total_portfolio_overview, payload_quotes, payload_kr_asset_types = _load_beta_live_state()
+        payload = build_beta_live_payload(
+            data=payload_data,
+            accounts_overview=payload_accounts_overview,
+            quote_snapshots=payload_quotes,
+            kr_asset_types=payload_kr_asset_types,
+            krx_name_map=krx_name_map,
+        )
+        st.markdown(render_beta_live_payload_host(payload), unsafe_allow_html=True)
+
+    _render_beta_live_payload_fragment()
 
 def render_dashboard_page() -> None:
     st.subheader(f"{asset_type} 대시보드")

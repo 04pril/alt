@@ -14,6 +14,8 @@ from kr_strategy import (
     get_kr_strategy,
     strategy_label,
     strategy_schedule,
+    strategy_session_is_open,
+    strategy_session_label,
 )
 from runtime_accounts import account_scope_for_asset_type, resolve_execution_account
 from services.broker_router import BrokerRouter
@@ -82,6 +84,11 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
     repository.set_control_flag(
         "kr_default_strategy_id",
         str((default_kr_strategy(settings).strategy_id if default_kr_strategy(settings) is not None else settings.kr_default_strategy_id) or ""),
+        "task_context",
+    )
+    repository.set_control_flag(
+        "kr_default_strategy_session_mode",
+        str(strategy_session_label(default_kr_strategy(settings))),
         "task_context",
     )
     return TaskContext(
@@ -223,6 +230,7 @@ def scan_job(
                     "account_id": account_id,
                     "strategy_version": strategy.strategy_id,
                     "strategy_family": strategy.strategy_family,
+                    "session_mode": strategy_session_label(strategy),
                     "experimental": bool(strategy.experimental),
                 },
                 account_id=account_id,
@@ -263,12 +271,19 @@ def entry_decision_job(
                 continue
             asset_type = "한국주식"
             schedule = strategy_schedule(context.settings, strategy.strategy_id)
-            market_is_open = context.market_data_service.is_market_open(asset_type)
+            regular_market_open = context.market_data_service.is_market_open(asset_type)
+            current_time = _market_current_time(context.market_data_service, asset_type)
+            session_open = strategy_session_is_open(
+                context.settings,
+                strategy.strategy_id,
+                when=current_time,
+                market_is_open=regular_market_open,
+            )
             gate_reason = entry_gate_reason(
                 context.settings,
                 strategy.strategy_id,
-                when=_market_current_time(context.market_data_service, asset_type),
-                market_is_open=market_is_open,
+                when=current_time,
+                market_is_open=regular_market_open,
             )
             if gate_reason:
                 entered[strategy.strategy_id] = 0
@@ -279,6 +294,8 @@ def entry_decision_job(
                     {
                         "market_phase": context.market_data_service.market_phase(asset_type),
                         "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
                         "experimental": bool(strategy.experimental),
                     },
                 )
@@ -292,14 +309,33 @@ def entry_decision_job(
             )
             if latest.empty:
                 entered[strategy.strategy_id] = 0
-                _record_noop(context, asset_type, "no_candidate", {"strategy_version": strategy.strategy_id})
+                _record_noop(
+                    context,
+                    asset_type,
+                    "no_candidate",
+                    {
+                        "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
+                    },
+                )
                 continue
 
             latest = latest.sort_values(["created_at", "rank"], ascending=[False, True]).drop_duplicates(subset=["symbol", "strategy_version"], keep="first")
             latest = latest[(latest["status"] == "candidate") & (latest["is_holding"] == 0)]
             if latest.empty:
                 entered[strategy.strategy_id] = 0
-                _record_noop(context, asset_type, "no_candidate", {"filtered": True, "strategy_version": strategy.strategy_id})
+                _record_noop(
+                    context,
+                    asset_type,
+                    "no_candidate",
+                    {
+                        "filtered": True,
+                        "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
+                    },
+                )
                 continue
 
             count = 0
@@ -321,6 +357,8 @@ def entry_decision_job(
                         "rank": int(candidate["rank"]),
                         "score": float(candidate["score"]),
                         "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
                         "experimental": bool(strategy.experimental),
                     },
                 )
@@ -337,6 +375,8 @@ def entry_decision_job(
                             "scan_id": str(candidate["scan_id"]),
                             "account_id": str(candidate.get("execution_account_id") or ""),
                             "strategy_version": strategy.strategy_id,
+                            "strategy_family": strategy.strategy_family,
+                            "session_mode": strategy_session_label(strategy),
                         },
                     )
                     continue
@@ -353,7 +393,7 @@ def entry_decision_job(
                     if corr_symbols
                     else pd.DataFrame()
                 )
-                risk_decision = context.risk_engine.evaluate_entry(signal, correlation_matrix=correlation_matrix, market_is_open=market_is_open)
+                risk_decision = context.risk_engine.evaluate_entry(signal, correlation_matrix=correlation_matrix, market_is_open=session_open)
                 if not risk_decision.allowed:
                     detailed_no_trade_reason_logged = True
                     _execution_event(
@@ -367,6 +407,8 @@ def entry_decision_job(
                             "scan_id": signal.scan_id,
                             "account_id": account_id,
                             "strategy_version": strategy.strategy_id,
+                            "strategy_family": strategy.strategy_family,
+                            "session_mode": strategy_session_label(strategy),
                         },
                     )
                     continue
@@ -382,6 +424,8 @@ def entry_decision_job(
                         "scan_id": signal.scan_id,
                         "account_id": account_id,
                         "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
                     },
                 )
                 submit = context.paper_broker.submit_entry_order_result(
@@ -403,6 +447,8 @@ def entry_decision_job(
                             "scan_id": signal.scan_id,
                             "account_id": account_id,
                             "strategy_version": strategy.strategy_id,
+                            "strategy_family": strategy.strategy_family,
+                            "session_mode": strategy_session_label(strategy),
                         },
                     )
                     continue
@@ -410,7 +456,16 @@ def entry_decision_job(
             entered[strategy.strategy_id] = count
             if count == 0:
                 if not detailed_no_trade_reason_logged:
-                    _record_noop(context, asset_type, "no_submit", {"strategy_version": strategy.strategy_id})
+                    _record_noop(
+                        context,
+                        asset_type,
+                        "no_submit",
+                        {
+                            "strategy_version": strategy.strategy_id,
+                            "strategy_family": strategy.strategy_family,
+                            "session_mode": strategy_session_label(strategy),
+                        },
+                    )
             else:
                 account_id = _account_scope_for_asset(asset_type)
                 context.repository.log_event(
@@ -424,6 +479,7 @@ def entry_decision_job(
                         "account_id": account_id,
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
+                        "session_mode": strategy_session_label(strategy),
                         "experimental": bool(strategy.experimental),
                     },
                     account_id=account_id,

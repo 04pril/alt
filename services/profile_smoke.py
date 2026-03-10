@@ -879,10 +879,26 @@ def run_profile_smoke(profile_path: str | Path) -> Dict[str, Any]:
         "us_pre_close_buffer_minutes": int(settings.asset_schedules[asset_types["us"]].pre_close_buffer_minutes),
     }
     kr_default = default_kr_strategy(settings)
+    experimental_family_ids = [
+        str(strategy_id)
+        for strategy_id in (
+            "kr_intraday_15m_v1",
+            "kr_intraday_15m_v1_after_close_close",
+            "kr_intraday_15m_v1_after_close_single",
+        )
+        if strategy_id in settings.kr_strategies
+    ]
     merged["kr_strategy"] = {
         "default_strategy_id": str(kr_default.strategy_id if kr_default is not None else ""),
         "active_strategy_ids": [str(strategy_id) for strategy_id, strategy in settings.kr_strategies.items() if bool(strategy.enabled)],
+        "experimental_15m_family_ids": experimental_family_ids,
         "experimental_15m_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1"].enabled),
+        "experimental_15m_after_close_close_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_close"].enabled),
+        "experimental_15m_after_close_single_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_single"].enabled),
+        "experimental_15m_session_modes": {
+            strategy_id: str(settings.kr_strategies[strategy_id].session_mode)
+            for strategy_id in experimental_family_ids
+        },
     }
     merged["bootstrap"] = _run_bootstrap(profile_path)
     return merged

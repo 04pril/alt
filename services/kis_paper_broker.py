@@ -9,7 +9,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from kis_paper import KISPaperClient, extract_kis_code
-from kr_strategy import entry_gate_reason, get_kr_strategy
+from kr_strategy import entry_gate_reason, get_kr_strategy, strategy_session_is_open, strategy_session_label, strategy_session_mode
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, BROKER_MODE_KIS
 from services.market_data_service import MarketDataService
 from services.paper_broker import PaperBroker
@@ -120,6 +120,73 @@ class KISPaperBroker:
         value = float(quote.get("current_price", np.nan))
         return value if np.isfinite(value) and value > 0 else float("nan")
 
+    def _strategy_context(self, strategy_version: str) -> Dict[str, Any]:
+        strategy = get_kr_strategy(self.settings, str(strategy_version or ""))
+        return {
+            "strategy": strategy,
+            "session_mode": strategy_session_mode(strategy),
+            "session_label": strategy_session_label(strategy),
+            "order_division": str(strategy.order_division) if strategy is not None else ("01" if self.settings.broker.default_order_type == "market" else "00"),
+        }
+
+    def _resolve_quote_bundle(self, client: KISPaperClient, symbol: str, side: str, *, strategy_version: str) -> Dict[str, Any]:
+        strategy_ctx = self._strategy_context(strategy_version)
+        session_mode = str(strategy_ctx["session_mode"])
+        market_status = client.get_market_status(symbol)
+        if session_mode == "after_close_close_price":
+            quote = client.get_overtime_price(symbol)
+            orderbook = client.get_overtime_asking_price(symbol)
+            close_price = float(quote.get("close_price", np.nan))
+            execution_price = close_price if np.isfinite(close_price) and close_price > 0 else float("nan")
+            return {
+                "quote": quote,
+                "orderbook": orderbook,
+                "market_status": market_status,
+                "execution_price": execution_price,
+                "price_error_reason": "after_close_price_unavailable",
+                "order_division": "06",
+                "order_type": "after_close_close",
+            }
+        if session_mode == "after_close_single_price":
+            quote = client.get_overtime_price(symbol)
+            orderbook = client.get_overtime_asking_price(symbol)
+            execution_price = self._pick_execution_price(quote, orderbook, side)
+            lower_limit = float(quote.get("lower_limit", np.nan))
+            upper_limit = float(quote.get("upper_limit", np.nan))
+            if np.isfinite(execution_price) and execution_price > 0 and np.isfinite(lower_limit) and np.isfinite(upper_limit):
+                if execution_price < lower_limit or execution_price > upper_limit:
+                    execution_price = float("nan")
+            return {
+                "quote": quote,
+                "orderbook": orderbook,
+                "market_status": market_status,
+                "execution_price": execution_price,
+                "price_error_reason": "after_close_single_quote_unavailable",
+                "order_division": "07",
+                "order_type": "after_close_single",
+            }
+        quote = client.get_quote(symbol)
+        orderbook = client.get_orderbook(symbol)
+        return {
+            "quote": quote,
+            "orderbook": orderbook,
+            "market_status": market_status,
+            "execution_price": self._pick_execution_price(quote, orderbook, side),
+            "price_error_reason": "no_quote",
+            "order_division": str(strategy_ctx["order_division"]),
+            "order_type": self.settings.broker.default_order_type,
+        }
+
+    def _max_holding_until_iso(self, *, strategy_version: str, timeframe: str) -> str:
+        strategy = get_kr_strategy(self.settings, str(strategy_version or ""))
+        bar_delta = self.sim_broker._timeframe_delta(timeframe)
+        if strategy is None:
+            return (pd.Timestamp.now(tz="UTC") + bar_delta * int(self.settings.strategy.max_holding_bars)).isoformat()
+        if strategy_session_mode(strategy) == "regular":
+            return (pd.Timestamp.now(tz="UTC") + bar_delta * int(strategy.max_holding_bars)).isoformat()
+        next_session = pd.Timestamp.now(tz="Asia/Seoul").normalize() + pd.Timedelta(days=1, hours=9)
+        return (next_session.tz_convert("UTC") + bar_delta * int(strategy.max_holding_bars)).isoformat()
+
     def _insert_submitted_order(
         self,
         *,
@@ -131,6 +198,7 @@ class KISPaperBroker:
         scan_id: str | None,
         side: str,
         quantity: int,
+        order_type: str,
         requested_price: float,
         strategy_version: str,
         reason: str,
@@ -149,7 +217,7 @@ class KISPaperBroker:
                 asset_type=asset_type,
                 timeframe=timeframe,
                 side=side,
-                order_type=self.settings.broker.default_order_type,
+                order_type=str(order_type),
                 requested_qty=int(quantity),
                 filled_qty=0,
                 remaining_qty=int(quantity),
@@ -178,28 +246,59 @@ class KISPaperBroker:
         asset_type = str(signal.asset_type)
         if not self.is_enabled():
             return {"allowed": False, "reason": "kis_disabled", "broker": BROKER_MODE_KIS, "account_id": account_id}
-        if not market_data_service.is_market_open(asset_type):
-            return {"allowed": False, "reason": "market_closed", "broker": BROKER_MODE_KIS, "account_id": account_id}
+        current_time = (
+            market_data_service.current_time(asset_type)
+            if market_data_service is not None and callable(getattr(market_data_service, "current_time", None))
+            else None
+        )
+        regular_market_open = bool(market_data_service.is_market_open(asset_type)) if market_data_service is not None else False
+        session_open = strategy_session_is_open(
+            self.settings,
+            str(signal.strategy_version or ""),
+            when=current_time,
+            market_is_open=regular_market_open,
+        )
+        if not session_open:
+            gate_reason = entry_gate_reason(
+                self.settings,
+                str(signal.strategy_version or ""),
+                when=current_time,
+                market_is_open=regular_market_open,
+            )
+            return {
+                "allowed": False,
+                "reason": str(gate_reason or "market_closed"),
+                "broker": BROKER_MODE_KIS,
+                "account_id": account_id,
+            }
         gate_reason = entry_gate_reason(
             self.settings,
             str(signal.strategy_version or ""),
-            when=(market_data_service.current_time(asset_type) if market_data_service is not None and callable(getattr(market_data_service, "current_time", None)) else None),
-            market_is_open=True,
+            when=current_time,
+            market_is_open=regular_market_open,
         )
         if gate_reason:
             return {"allowed": False, "reason": gate_reason, "broker": BROKER_MODE_KIS, "account_id": account_id}
 
         client = self._client()
-        quote = client.get_quote(signal.symbol)
-        orderbook = client.get_orderbook(signal.symbol)
-        market_status = client.get_market_status(signal.symbol)
+        side = "buy" if signal.signal == "LONG" else "sell"
+        quote_bundle = self._resolve_quote_bundle(client, signal.symbol, side, strategy_version=str(signal.strategy_version or ""))
+        quote = dict(quote_bundle["quote"])
+        orderbook = dict(quote_bundle["orderbook"])
+        market_status = dict(quote_bundle["market_status"])
         if bool(market_status.get("is_halted")):
             return {"allowed": False, "reason": "market_halted", "broker": BROKER_MODE_KIS, "market_status": market_status, "account_id": account_id}
 
-        side = "buy" if signal.signal == "LONG" else "sell"
-        exec_price = self._pick_execution_price(quote, orderbook, side)
+        exec_price = float(quote_bundle.get("execution_price", np.nan))
         if not np.isfinite(exec_price) or exec_price <= 0:
-            return {"allowed": False, "reason": "no_quote", "broker": BROKER_MODE_KIS, "quote": quote, "orderbook": orderbook, "account_id": account_id}
+            return {
+                "allowed": False,
+                "reason": str(quote_bundle.get("price_error_reason") or "no_quote"),
+                "broker": BROKER_MODE_KIS,
+                "quote": quote,
+                "orderbook": orderbook,
+                "account_id": account_id,
+            }
 
         if not self.repository.active_entry_orders(symbol=signal.symbol, timeframe=signal.timeframe, asset_type=asset_type, account_id=account_id).empty:
             return {"allowed": False, "reason": "duplicate_pending_entry", "broker": BROKER_MODE_KIS, "account_id": account_id}
@@ -207,10 +306,13 @@ class KISPaperBroker:
         if not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open":
             return {"allowed": False, "reason": "already_holding_symbol", "broker": BROKER_MODE_KIS, "account_id": account_id}
 
-        buying_power = client.get_buying_power(signal.symbol, order_price=exec_price)
+        order_division = str(quote_bundle.get("order_division") or "01")
+        buying_power = client.get_buying_power(signal.symbol, order_price=exec_price, order_division=order_division)
         max_buy_qty = int(buying_power.get("cash_buy_qty") or buying_power.get("max_buy_qty") or 0)
         if max_buy_qty < int(quantity):
-            return {"allowed": False, "reason": "insufficient_buying_power", "broker": BROKER_MODE_KIS, "buying_power": buying_power, "account_id": account_id}
+            strategy_ctx = self._strategy_context(str(signal.strategy_version or ""))
+            insufficient_reason = "after_close_buying_power_insufficient" if str(strategy_ctx["session_mode"]).startswith("after_close_") else "insufficient_buying_power"
+            return {"allowed": False, "reason": insufficient_reason, "broker": BROKER_MODE_KIS, "buying_power": buying_power, "account_id": account_id}
 
         return {
             "allowed": True,
@@ -219,6 +321,9 @@ class KISPaperBroker:
             "account_id": account_id,
             "symbol_code": extract_kis_code(signal.symbol),
             "execution_price": float(exec_price),
+            "order_division": order_division,
+            "order_type": str(quote_bundle.get("order_type") or self.settings.broker.default_order_type),
+            "session_mode": str(self._strategy_context(str(signal.strategy_version or ""))["session_mode"]),
             "quote": quote,
             "orderbook": orderbook,
             "market_status": market_status,
@@ -236,18 +341,42 @@ class KISPaperBroker:
         asset_type = str(position["asset_type"])
         if not self.is_enabled():
             return {"allowed": False, "reason": "kis_disabled", "broker": BROKER_MODE_KIS, "account_id": account_id}
-        if not market_data_service.is_market_open(asset_type):
+        current_time = (
+            market_data_service.current_time(asset_type)
+            if market_data_service is not None and callable(getattr(market_data_service, "current_time", None))
+            else None
+        )
+        regular_market_open = bool(market_data_service.is_market_open(asset_type)) if market_data_service is not None else False
+        strategy_version = str(position.get("strategy_version") or "")
+        session_open = strategy_session_is_open(
+            self.settings,
+            strategy_version,
+            when=current_time,
+            market_is_open=regular_market_open,
+        )
+        if not session_open and not regular_market_open:
             return {"allowed": False, "reason": "market_closed", "broker": BROKER_MODE_KIS, "account_id": account_id}
         client = self._client()
-        quote = client.get_quote(str(position["symbol"]))
-        orderbook = client.get_orderbook(str(position["symbol"]))
-        exec_price = self._pick_execution_price(quote, orderbook, "sell")
+        side = "sell" if str(position["side"]) == "LONG" else "buy"
+        quote_bundle = self._resolve_quote_bundle(client, str(position["symbol"]), side, strategy_version=strategy_version)
+        quote = dict(quote_bundle["quote"])
+        orderbook = dict(quote_bundle["orderbook"])
+        exec_price = float(quote_bundle.get("execution_price", np.nan))
         if not np.isfinite(exec_price) or exec_price <= 0:
-            return {"allowed": False, "reason": "no_quote", "broker": BROKER_MODE_KIS, "account_id": account_id}
+            return {"allowed": False, "reason": str(quote_bundle.get("price_error_reason") or "no_quote"), "broker": BROKER_MODE_KIS, "account_id": account_id}
         sellable = client.get_sellable_quantity(str(position["symbol"]))
         if str(position["side"]) == "LONG" and int(sellable.get("sellable_qty", 0)) < int(position["quantity"]):
             return {"allowed": False, "reason": "no_sellable_qty", "broker": BROKER_MODE_KIS, "sellable": sellable, "account_id": account_id}
-        return {"allowed": True, "reason": "ok", "broker": BROKER_MODE_KIS, "execution_price": float(exec_price), "sellable": sellable, "account_id": account_id}
+        return {
+            "allowed": True,
+            "reason": "ok",
+            "broker": BROKER_MODE_KIS,
+            "execution_price": float(exec_price),
+            "sellable": sellable,
+            "account_id": account_id,
+            "order_division": str(quote_bundle.get("order_division") or "01"),
+            "order_type": str(quote_bundle.get("order_type") or self.settings.broker.default_order_type),
+        }
 
     def submit_entry_order_result(
         self,
@@ -277,6 +406,8 @@ class KISPaperBroker:
         symbol_code = str(preflight.get("symbol_code") or extract_kis_code(signal.symbol))
         baseline = self._holding_baseline(client, symbol_code)
         requested_price = float(preflight.get("execution_price") or signal.current_price)
+        requested_order_type = str(preflight.get("order_type") or self.settings.broker.default_order_type)
+        requested_order_division = str(preflight.get("order_division") or "01")
         order_id = self._insert_submitted_order(
             account_id=account_id,
             symbol=signal.symbol,
@@ -286,6 +417,7 @@ class KISPaperBroker:
             scan_id=scan_id or signal.scan_id,
             side="buy" if signal.signal == "LONG" else "sell",
             quantity=int(quantity),
+            order_type=requested_order_type,
             requested_price=requested_price,
             strategy_version=signal.strategy_version,
             reason="entry",
@@ -297,14 +429,13 @@ class KISPaperBroker:
                 "baseline_avg_price": baseline["avg_price"],
                 "last_seen_broker_qty": baseline["quantity"],
                 "last_seen_broker_avg_price": baseline["avg_price"],
+                "session_mode": str(preflight.get("session_mode") or self._strategy_context(str(signal.strategy_version or ""))["session_mode"]),
+                "order_division": requested_order_division,
+                "order_type": requested_order_type,
                 "expected_risk": signal.expected_risk,
                 "stop_level": signal.stop_level,
                 "take_level": signal.take_level,
-                "max_holding_until": (
-                    pd.Timestamp.now(tz="UTC")
-                    + self.sim_broker._timeframe_delta(signal.timeframe)
-                    * int(get_kr_strategy(self.settings, str(signal.strategy_version or "")).max_holding_bars if get_kr_strategy(self.settings, str(signal.strategy_version or "")) is not None else self.settings.strategy.max_holding_bars)
-                ).isoformat(),
+                "max_holding_until": self._max_holding_until_iso(strategy_version=str(signal.strategy_version or ""), timeframe=signal.timeframe),
                 "strategy_version": signal.strategy_version,
                 "broker_state": "submit_requested",
                 "preflight": preflight,
@@ -322,10 +453,13 @@ class KISPaperBroker:
                 symbol_or_code=signal.symbol,
                 side="buy" if signal.signal == "LONG" else "sell",
                 quantity=int(quantity),
-                order_type=self.settings.broker.default_order_type,
+                order_type=requested_order_type,
                 price=requested_price,
+                order_division=requested_order_division,
             )
         except Exception as exc:
+            strategy_ctx = self._strategy_context(str(signal.strategy_version or ""))
+            rejected_reason = "after_close_order_rejected" if str(strategy_ctx["session_mode"]) == "after_close_close_price" else "after_close_single_order_rejected" if str(strategy_ctx["session_mode"]) == "after_close_single_price" else "broker_rejected"
             self.repository.update_order(
                 order_id,
                 status="rejected",
@@ -335,11 +469,11 @@ class KISPaperBroker:
             self._log_state(
                 "rejected",
                 "KIS broker rejected entry",
-                {"order_id": order_id, "symbol": signal.symbol, "reason": "broker_rejected", "error": str(exc)},
+                {"order_id": order_id, "symbol": signal.symbol, "reason": rejected_reason, "error": str(exc)},
                 account_id=account_id,
                 level="ERROR",
             )
-            return {"submitted": False, "status": "rejected", "reason": "broker_rejected", "broker": BROKER_MODE_KIS, "order_id": order_id, "account_id": account_id}
+            return {"submitted": False, "status": "rejected", "reason": rejected_reason, "broker": BROKER_MODE_KIS, "order_id": order_id, "account_id": account_id}
 
         status = "acknowledged" if result.get("order_no") else "submitted"
         self.repository.update_order(
@@ -350,6 +484,8 @@ class KISPaperBroker:
                 "broker": BROKER_MODE_KIS,
                 "account_id": account_id,
                 "broker_state": status,
+                "order_division": requested_order_division,
+                "order_type": requested_order_type,
                 "broker_message": str(result.get("message") or ""),
                 "submitted_at": str(result.get("requested_at") or utc_now_iso()),
             },
@@ -382,6 +518,8 @@ class KISPaperBroker:
         symbol = str(position["symbol"])
         symbol_code = extract_kis_code(symbol)
         baseline = self._holding_baseline(client, symbol_code)
+        requested_order_type = str(preflight.get("order_type") or self.settings.broker.default_order_type)
+        requested_order_division = str(preflight.get("order_division") or "01")
         order_id = self._insert_submitted_order(
             account_id=account_id,
             symbol=symbol,
@@ -391,6 +529,7 @@ class KISPaperBroker:
             scan_id=None,
             side="sell" if str(position["side"]) == "LONG" else "buy",
             quantity=int(position["quantity"]),
+            order_type=requested_order_type,
             requested_price=float(preflight.get("execution_price") or position["mark_price"]),
             strategy_version=str(position["strategy_version"]),
             reason=reason,
@@ -402,6 +541,8 @@ class KISPaperBroker:
                 "baseline_avg_price": baseline["avg_price"],
                 "last_seen_broker_qty": baseline["quantity"],
                 "last_seen_broker_avg_price": baseline["avg_price"],
+                "order_division": requested_order_division,
+                "order_type": requested_order_type,
                 "position_id": str(position.get("position_id") or ""),
                 "broker_state": "submit_requested",
                 "preflight": preflight,
@@ -414,8 +555,9 @@ class KISPaperBroker:
                 symbol_or_code=symbol,
                 side="sell" if str(position["side"]) == "LONG" else "buy",
                 quantity=int(position["quantity"]),
-                order_type=self.settings.broker.default_order_type,
+                order_type=requested_order_type,
                 price=float(preflight.get("execution_price") or position["mark_price"]),
+                order_division=requested_order_division,
             )
         except Exception as exc:
             self.repository.update_order(
@@ -436,6 +578,8 @@ class KISPaperBroker:
                 "broker": BROKER_MODE_KIS,
                 "account_id": account_id,
                 "broker_state": status,
+                "order_division": requested_order_division,
+                "order_type": requested_order_type,
                 "broker_message": str(result.get("message") or ""),
                 "submitted_at": str(result.get("requested_at") or utc_now_iso()),
             },

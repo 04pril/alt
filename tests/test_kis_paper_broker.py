@@ -43,6 +43,7 @@ class _FakeKISClient:
         self.config = SimpleNamespace(is_paper=True, hts_id="demo-user")
         self.order_no = 0
         self.place_calls = 0
+        self.place_orders: list[dict[str, object]] = []
         self.holdings = pd.DataFrame(columns=["symbol_code", "quantity", "avg_price"])
         self.buying_power = {"cash_buy_qty": 10, "max_buy_qty": 10, "cash_buy_amount": 1_000_000.0}
         self.sellable = {"sellable_qty": 10}
@@ -70,6 +71,22 @@ class _FakeKISClient:
     def get_orderbook(self, symbol: str):
         return {"expected_price": 70000.0, "best_ask": 70000.0, "best_bid": 69900.0}
 
+    def get_overtime_price(self, symbol: str):
+        return {
+            "symbol_code": "005930",
+            "current_price": 70000.0,
+            "expected_price": 70100.0,
+            "close_price": 70000.0,
+            "upper_limit": 77000.0,
+            "lower_limit": 63000.0,
+            "best_bid": 70000.0,
+            "best_ask": 70000.0,
+            "raw": {},
+        }
+
+    def get_overtime_asking_price(self, symbol: str):
+        return {"expected_price": 70100.0, "best_ask": 70100.0, "best_bid": 70000.0}
+
     def get_market_status(self, symbol: str):
         return {"is_halted": False, "phase_code": "open"}
 
@@ -85,9 +102,19 @@ class _FakeKISClient:
     def get_websocket_approval_key(self) -> str:
         return "approval"
 
-    def place_cash_order(self, symbol_or_code: str, side: str, quantity: int, order_type: str = "market", price: float | None = None):
+    def place_cash_order(self, symbol_or_code: str, side: str, quantity: int, order_type: str = "market", price: float | None = None, order_division: str | None = None):
         self.place_calls += 1
         self.order_no += 1
+        self.place_orders.append(
+            {
+                "symbol_or_code": symbol_or_code,
+                "side": side,
+                "quantity": quantity,
+                "order_type": order_type,
+                "price": price,
+                "order_division": order_division,
+            }
+        )
         return {
             "order_no": f"ODR{self.order_no}",
             "requested_at": utc_now_iso(),
@@ -175,6 +202,34 @@ class KISPaperBrokerTest(unittest.TestCase):
         result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)
         self.assertFalse(result["submitted"])
         self.assertEqual(result["reason"], "insufficient_buying_power")
+
+    def test_after_close_close_preflight_uses_close_price_order_division(self) -> None:
+        self.settings.kr_strategies["kr_intraday_15m_v1_after_close_close"].enabled = True
+        signal = self._signal()
+        signal = SignalDecision(**{**signal.__dict__, "timeframe": "15m", "strategy_version": "kr_intraday_15m_v1_after_close_close"})
+        self.market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 15, 45, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        result = self.broker.submit_entry_order_result(signal, quantity=1, market_data_service=self.market)
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(self.client.place_orders[-1]["order_division"], "06")
+        self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_close")
+
+    def test_after_close_single_gate_and_order_division(self) -> None:
+        self.settings.kr_strategies["kr_intraday_15m_v1_after_close_single"].enabled = True
+        signal = self._signal()
+        signal = SignalDecision(**{**signal.__dict__, "timeframe": "15m", "strategy_version": "kr_intraday_15m_v1_after_close_single"})
+        self.market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 16, 5, tzinfo=ZoneInfo("Asia/Seoul"))
+
+        waiting = self.broker.submit_entry_order_result(signal, quantity=1, market_data_service=self.market)
+        self.assertFalse(waiting["submitted"])
+        self.assertEqual(waiting["reason"], "after_close_single_waiting_auction")
+
+        self.market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 16, 10, tzinfo=ZoneInfo("Asia/Seoul"))
+        submitted = self.broker.submit_entry_order_result(signal, quantity=1, market_data_service=self.market)
+        self.assertTrue(submitted["submitted"])
+        self.assertEqual(self.client.place_orders[-1]["order_division"], "07")
+        self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_single")
 
     def test_duplicate_pending_entry_does_not_submit(self) -> None:
         self.repo.insert_order(

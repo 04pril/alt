@@ -12,6 +12,14 @@
     "kr_intraday_15m_v1": {
       "enabled": false,
       "experimental": true
+    },
+    "kr_intraday_15m_v1_after_close_close": {
+      "enabled": false,
+      "experimental": true
+    },
+    "kr_intraday_15m_v1_after_close_single": {
+      "enabled": false,
+      "experimental": true
     }
   },
   "strategy": {

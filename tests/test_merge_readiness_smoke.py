@@ -21,7 +21,7 @@ from jobs.tasks import (
     broker_position_sync_job,
     entry_decision_job,
 )
-from kr_strategy import default_kr_strategy, strategy_schedule
+from kr_strategy import default_kr_strategy, get_kr_strategy, strategy_schedule
 from kis_paper import KISPaperSnapshot
 from monitoring.dashboard_hooks import build_asset_overview, load_dashboard_data
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
@@ -82,6 +82,7 @@ class _FakeKISClient:
         self.market_halted = False
         self.order_no = 0
         self.place_calls = 0
+        self.place_orders: list[dict[str, object]] = []
         self.holdings = pd.DataFrame(columns=["symbol_code", "quantity", "avg_price", "current_price", "unrealized_pnl", "market_value"])
         self.buying_power = {"cash_buy_qty": 1_000, "max_buy_qty": 1_000, "cash_buy_amount": 100_000_000.0}
         self.sellable = {"sellable_qty": 10}
@@ -110,6 +111,25 @@ class _FakeKISClient:
         price = self.current_price if self.quote_available else float("nan")
         return {"expected_price": price, "best_ask": price, "best_bid": price - 100.0 if self.quote_available else float("nan")}
 
+    def get_overtime_price(self, symbol: str):
+        price = self.current_price if self.quote_available else float("nan")
+        return {
+            "symbol_code": "005930",
+            "current_price": price,
+            "close_price": price,
+            "upper_limit": price * 1.1 if self.quote_available else float("nan"),
+            "lower_limit": price * 0.9 if self.quote_available else float("nan"),
+            "raw": {},
+        }
+
+    def get_overtime_asking_price(self, symbol: str):
+        price = self.current_price if self.quote_available else float("nan")
+        return {
+            "expected_price": price,
+            "best_ask": price,
+            "best_bid": price - 100.0 if self.quote_available else float("nan"),
+        }
+
     def get_market_status(self, symbol: str):
         return {"is_halted": self.market_halted, "phase_code": "halted" if self.market_halted else "open"}
 
@@ -125,9 +145,27 @@ class _FakeKISClient:
     def get_websocket_approval_key(self) -> str:
         return "approval"
 
-    def place_cash_order(self, symbol_or_code: str, side: str, quantity: int, order_type: str = "market", price: float | None = None):
+    def place_cash_order(
+        self,
+        symbol_or_code: str,
+        side: str,
+        quantity: int,
+        order_type: str = "market",
+        price: float | None = None,
+        order_division: str | None = None,
+    ):
         self.place_calls += 1
         self.order_no += 1
+        self.place_orders.append(
+            {
+                "symbol": symbol_or_code,
+                "side": side,
+                "quantity": quantity,
+                "order_type": order_type,
+                "price": price,
+                "order_division": order_division,
+            }
+        )
         return {
             "order_no": f"ODR{self.order_no}",
             "requested_at": utc_now_iso(),
@@ -226,7 +264,16 @@ class MergeReadinessSmokeTest(unittest.TestCase):
     def _kr_timeframe(self) -> str:
         return str(strategy_schedule(self.fixture.settings, self._kr_strategy_id()).timeframe)
 
-    def _insert_candidate_prediction(self, *, symbol: str, asset_type: str, timeframe: str, scan_id: str, prediction_id: str | None = None) -> None:
+    def _insert_candidate_prediction(
+        self,
+        *,
+        symbol: str,
+        asset_type: str,
+        timeframe: str,
+        scan_id: str,
+        prediction_id: str | None = None,
+        strategy_id: str | None = None,
+    ) -> None:
         now_iso = utc_now_iso()
         prediction_id = prediction_id or make_id("pred")
         strategy_version = "s1"
@@ -235,7 +282,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         validation_mode = "holdout"
         notes_payload = {"stop_level": 68_000.0, "take_level": 73_000.0}
         if asset_type == self.fixture.kr_asset_type:
-            strategy = default_kr_strategy(self.fixture.settings)
+            strategy = get_kr_strategy(self.fixture.settings, str(strategy_id or "")) if strategy_id else default_kr_strategy(self.fixture.settings)
             self.assertIsNotNone(strategy)
             timeframe = str(strategy_schedule(self.fixture.settings, str(strategy.strategy_id)).timeframe)
             strategy_version = str(strategy.strategy_id)
@@ -245,6 +292,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
             notes_payload.update(
                 {
                     "strategy_family": str(strategy.strategy_family),
+                    "session_mode": str(strategy.session_mode),
                     "decision_horizon_bars": int(strategy.decision_horizon_bars),
                     "primary_target": str(strategy.primary_target),
                     "secondary_target": str(strategy.secondary_target),
@@ -421,6 +469,62 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_submitted_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_acknowledged_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_filled_count"], 1)
+
+    def test_kr_15m_after_close_close_smoke_submit_requested_and_session_split(self) -> None:
+        strategy_id = "kr_intraday_15m_v1_after_close_close"
+        self.fixture.settings.kr_strategies[strategy_id].enabled = True
+        self.fixture.market.market_open = False
+        self.fixture.market.current_times[self.fixture.kr_asset_type] = datetime(2026, 3, 9, 15, 45, tzinfo=ZoneInfo("Asia/Seoul"))
+        self._insert_candidate_prediction(
+            symbol="005930.KS",
+            asset_type=self.fixture.kr_asset_type,
+            timeframe="15m",
+            scan_id="scan-kr-after-close-close",
+            strategy_id=strategy_id,
+        )
+
+        entered = entry_decision_job(self.fixture.context, strategy_ids=[strategy_id])
+        orders = self.fixture.repository.open_orders(
+            statuses=("submitted", "acknowledged", "pending_fill", "partially_filled", "filled"),
+            account_id=ACCOUNT_KIS_KR_PAPER,
+        )
+        self.assertEqual(entered[strategy_id], 1)
+        self.assertEqual(len(orders), 1)
+        self.assertEqual(str(orders.iloc[0]["strategy_version"]), strategy_id)
+        raw_payload = json.loads(str(orders.iloc[0]["raw_json"] or "{}"))
+        self.assertEqual(str(orders.iloc[0]["order_type"]), "after_close_close")
+        self.assertEqual(str(raw_payload.get("order_division") or ""), "06")
+        self.assertEqual(str(raw_payload.get("session_mode") or ""), "after_close_close_price")
+        self.assertEqual(self.fixture.client.place_orders[-1]["order_division"], "06")
+        self.assertEqual(self.fixture.client.place_orders[-1]["order_type"], "after_close_close")
+
+    def test_kr_15m_after_close_single_smoke_submit_requested_on_auction_boundary(self) -> None:
+        strategy_id = "kr_intraday_15m_v1_after_close_single"
+        self.fixture.settings.kr_strategies[strategy_id].enabled = True
+        self.fixture.market.market_open = False
+        self.fixture.market.current_times[self.fixture.kr_asset_type] = datetime(2026, 3, 9, 16, 10, tzinfo=ZoneInfo("Asia/Seoul"))
+        self._insert_candidate_prediction(
+            symbol="000660.KS",
+            asset_type=self.fixture.kr_asset_type,
+            timeframe="15m",
+            scan_id="scan-kr-after-close-single",
+            strategy_id=strategy_id,
+        )
+
+        entered = entry_decision_job(self.fixture.context, strategy_ids=[strategy_id])
+        orders = self.fixture.repository.open_orders(
+            statuses=("submitted", "acknowledged", "pending_fill", "partially_filled", "filled"),
+            account_id=ACCOUNT_KIS_KR_PAPER,
+        )
+        matched = orders.loc[orders["strategy_version"].astype(str) == strategy_id]
+        self.assertEqual(entered[strategy_id], 1)
+        self.assertEqual(len(matched), 1)
+        raw_payload = json.loads(str(matched.iloc[0]["raw_json"] or "{}"))
+        self.assertEqual(str(matched.iloc[0]["order_type"]), "after_close_single")
+        self.assertEqual(str(raw_payload.get("order_division") or ""), "07")
+        self.assertEqual(str(raw_payload.get("session_mode") or ""), "after_close_single_price")
+        self.assertEqual(self.fixture.client.place_orders[-1]["order_division"], "07")
+        self.assertEqual(self.fixture.client.place_orders[-1]["order_type"], "after_close_single")
 
     def test_kr_noop_and_rejection_reasons_are_explicit(self) -> None:
         self.fixture.market.market_open = False
@@ -626,6 +730,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertTrue({"last_broker_account_sync", "last_broker_order_sync", "last_websocket_execution_event", "pending_submitted_orders", "broker_rejects_today"} <= set(data["kis_runtime"].keys()))
         self.assertGreaterEqual(data["execution_summary"]["today_candidate_count"], 1)
         self.assertIn("kr_intraday_1h_v1", set(data["kr_strategy_overview"]["strategy_id"].astype(str)))
+        self.assertIn("session_mode", set(data["kr_strategy_overview"].columns))
 
     def test_account_scoped_sync_events_exist_for_all_execution_accounts(self) -> None:
         self._run_job("broker_market_status", lambda: broker_market_status_job(self.fixture.context))

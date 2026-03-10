@@ -195,6 +195,8 @@ class UniverseScanner:
                                 "prediction_id": signal.prediction_id,
                                 "market_phase": self.market_data_service.market_phase(asset_type),
                                 "strategy_version": signal.strategy_version,
+                                "strategy_family": signal.strategy_family,
+                                "session_mode": str(strategy.session_mode if strategy is not None else ""),
                                 "decision_horizon_bars": int(signal.decision_horizon_bars),
                                 "primary_target": signal.primary_target_type,
                                 "secondary_target": signal.secondary_target_type,

@@ -141,6 +141,7 @@ class SignalEngine:
                         {
                             "timeframe": timeframe,
                             "strategy_family": str(strategy_cfg.strategy_family if strategy_cfg is not None else ""),
+                            "session_mode": str(strategy_cfg.session_mode if strategy_cfg is not None else ""),
                             "decision_horizon_bars": int(decision_horizon),
                             "primary_target": str(strategy_cfg.primary_target if strategy_cfg is not None else target_type),
                             "secondary_target": str(strategy_cfg.secondary_target if strategy_cfg is not None else ""),

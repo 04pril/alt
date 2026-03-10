@@ -184,6 +184,54 @@ class RiskEngineTest(unittest.TestCase):
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "kr_strategy_conflict_active")
 
+    def test_after_close_strategy_conflicts_with_regular_15m_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.upsert_position(
+                PositionRecord(
+                    position_id="pos_kr_regular_open",
+                    created_at="2026-03-08T09:00:00Z",
+                    updated_at="2026-03-08T09:05:00Z",
+                    closed_at=None,
+                    prediction_id="pred-existing",
+                    symbol="005930.KS",
+                    asset_type="한국주식",
+                    timeframe="15m",
+                    side="LONG",
+                    status="open",
+                    quantity=1,
+                    entry_price=70000.0,
+                    mark_price=70500.0,
+                    stop_loss=68000.0,
+                    take_profit=73000.0,
+                    trailing_stop=69000.0,
+                    highest_price=70500.0,
+                    lowest_price=70000.0,
+                    unrealized_pnl=500.0,
+                    realized_pnl=0.0,
+                    expected_risk=0.01,
+                    exposure_value=70500.0,
+                    max_holding_until="2026-03-09T12:00:00Z",
+                    strategy_version="kr_intraday_15m_v1",
+                    cooldown_until=None,
+                    notes="open",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            signal = replace(
+                self._build_signal(symbol="005930.KS", asset_type="한국주식", timeframe="15m"),
+                strategy_version="kr_intraday_15m_v1_after_close_close",
+            )
+
+            decision = engine.evaluate_entry(signal, correlation_matrix=pd.DataFrame(), market_is_open=True)
+
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "kr_strategy_conflict_active")
+
     def test_partially_filled_entry_blocks_until_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = RuntimeSettings()

@@ -208,6 +208,23 @@ class BrokerAccountRecord:
 
 
 @dataclass(frozen=True)
+class LiveMarketQuoteRecord:
+    symbol_code: str
+    symbol: str
+    asset_type: str
+    currency: str
+    source: str
+    current_price: float
+    previous_close: float
+    change_pct: float
+    ask_price: float
+    bid_price: float
+    volume: float
+    updated_at: str
+    raw_json: str = '{}'
+
+
+@dataclass(frozen=True)
 class JobRunRecord:
     job_run_id: str
     job_name: str

@@ -74,6 +74,24 @@ class ProfileSmokeTest(unittest.TestCase):
             self.assertIn("kr_intraday_1h_v1", result["kr_strategy"]["active_strategy_ids"])
             self.assertNotIn("kr_intraday_15m_v1", result["kr_strategy"]["active_strategy_ids"])
             self.assertFalse(bool(result["kr_strategy"]["experimental_15m_enabled"]))
+            self.assertFalse(bool(result["kr_strategy"]["experimental_15m_after_close_close_enabled"]))
+            self.assertFalse(bool(result["kr_strategy"]["experimental_15m_after_close_single_enabled"]))
+            self.assertEqual(
+                result["kr_strategy"]["experimental_15m_family_ids"],
+                [
+                    "kr_intraday_15m_v1",
+                    "kr_intraday_15m_v1_after_close_close",
+                    "kr_intraday_15m_v1_after_close_single",
+                ],
+            )
+            self.assertEqual(
+                result["kr_strategy"]["experimental_15m_session_modes"],
+                {
+                    "kr_intraday_15m_v1": "regular",
+                    "kr_intraday_15m_v1_after_close_close": "after_close_close_price",
+                    "kr_intraday_15m_v1_after_close_single": "after_close_single_price",
+                },
+            )
 
 
 if __name__ == "__main__":

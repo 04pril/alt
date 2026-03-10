@@ -339,6 +339,33 @@ class KISPaperClient:
             "raw": output,
         }
 
+    def get_overtime_price(self, symbol_or_code: str) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-overtime-price",
+            "FHPST02300000",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+            },
+        )
+        output = payload.get("output") or {}
+        return {
+            "symbol_code": code,
+            "market_name": str(output.get("rprs_mrkt_kor_name") or "KRX"),
+            "name": str(output.get("bstp_kor_isnm") or ""),
+            "current_price": _pick_numeric(output, ["ovtm_untp_prpr", "ovtm_untp_antc_cnpr"]),
+            "expected_price": _pick_numeric(output, ["ovtm_untp_antc_cnpr"]),
+            "close_price": _pick_numeric(output, ["stck_clpr", "ovtm_untp_sdpr"]),
+            "upper_limit": _pick_numeric(output, ["ovtm_untp_mxpr"]),
+            "lower_limit": _pick_numeric(output, ["ovtm_untp_llam"]),
+            "best_bid": _pick_numeric(output, ["bidp"]),
+            "best_ask": _pick_numeric(output, ["askp"]),
+            "volume": _pick_numeric(output, ["ovtm_untp_vol"], default=0.0),
+            "raw": output,
+        }
+
     def get_orderbook(self, symbol_or_code: str) -> Dict[str, Any]:
         code = extract_kis_code(symbol_or_code)
         payload, _ = self._request(
@@ -362,6 +389,28 @@ class KISPaperClient:
             "bid_size": _pick_numeric(output1, ["bidp_rsqn1"], default=0.0),
             "raw_quote": output1,
             "raw_expected": output2,
+        }
+
+    def get_overtime_asking_price(self, symbol_or_code: str) -> Dict[str, Any]:
+        code = extract_kis_code(symbol_or_code)
+        payload, _ = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-overtime-asking-price",
+            "FHPST02300400",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+            },
+        )
+        output = payload.get("output") or {}
+        return {
+            "symbol_code": code,
+            "best_ask": _pick_numeric(output, ["ovtm_untp_askp1", "askp1"]),
+            "best_bid": _pick_numeric(output, ["ovtm_untp_bidp1", "bidp1"]),
+            "expected_price": _pick_numeric(output, ["antc_cnpr"]),
+            "total_ask_size": _pick_numeric(output, ["ovtm_untp_total_askp_rsqn", "ovtm_total_askp_rsqn"], default=0.0),
+            "total_bid_size": _pick_numeric(output, ["ovtm_untp_total_bidp_rsqn", "ovtm_total_bidp_rsqn"], default=0.0),
+            "raw": output,
         }
 
     def get_market_status(self, symbol_or_code: str) -> Dict[str, Any]:
@@ -683,6 +732,7 @@ class KISPaperClient:
         quantity: int,
         order_type: str = "market",
         price: float | None = None,
+        order_division: str | None = None,
     ) -> Dict[str, Any]:
         code = extract_kis_code(symbol_or_code)
         if quantity <= 0:
@@ -691,16 +741,26 @@ class KISPaperClient:
         if side not in {"buy", "sell"}:
             raise KISPaperError("주문 방향은 buy 또는 sell 이어야 합니다.")
         order_type = order_type.lower().strip()
-        if order_type not in {"market", "limit"}:
-            raise KISPaperError("주문 유형은 market 또는 limit 이어야 합니다.")
+        if order_type not in {"market", "limit", "after_close_close", "after_close_single"}:
+            raise KISPaperError("주문 유형은 market, limit, after_close_close 또는 after_close_single 이어야 합니다.")
+        resolved_order_division = str(
+            order_division
+            or {
+                "market": "01",
+                "limit": "00",
+                "after_close_close": "06",
+                "after_close_single": "07",
+            }[order_type]
+        )
+        resolved_price = 0.0 if resolved_order_division in {"01", "05", "06"} else float(price or 0.0)
 
         body = {
             "CANO": self.config.account_no,
             "ACNT_PRDT_CD": self.config.product_code,
             "PDNO": code,
-            "ORD_DVSN": "01" if order_type == "market" else "00",
+            "ORD_DVSN": resolved_order_division,
             "ORD_QTY": str(int(quantity)),
-            "ORD_UNPR": "0" if order_type == "market" else str(int(round(float(price or 0.0)))),
+            "ORD_UNPR": "0" if resolved_order_division in {"01", "05", "06"} else str(int(round(resolved_price))),
             "EXCG_ID_DVSN_CD": "KRX",
             "SLL_TYPE": "01" if side == "sell" else "",
             "CNDT_PRIC": "",
@@ -720,7 +780,8 @@ class KISPaperClient:
             "side": side,
             "quantity": int(quantity),
             "order_type": order_type,
-            "price": None if order_type == "market" else float(price or 0.0),
+            "order_division": resolved_order_division,
+            "price": None if resolved_order_division in {"01", "05", "06"} else resolved_price,
             "order_no": str(output.get("ODNO") or output.get("odno") or ""),
             "parent_order_no": str(output.get("KRX_FWDG_ORD_ORGNO") or output.get("krx_fwdg_ord_orgno") or ""),
             "message": str(payload.get("msg1") or ""),

@@ -5,11 +5,17 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from app import build_live_open_positions_view, build_recent_order_activity_view
+from app import (
+    build_live_open_positions_view,
+    build_monitor_table_view,
+    build_recent_order_activity_view,
+    build_recent_realized_trades_view,
+)
 
 
 class OperationsMonitorTest(unittest.TestCase):
-    def test_build_live_open_positions_view_formats_long_and_short_pnl(self) -> None:
+    @patch("app.load_krx_symbol_name_map", return_value={"005930": "삼성전자", "005930.KS": "삼성전자"})
+    def test_build_live_open_positions_view_formats_long_and_short_pnl(self, _mock_names) -> None:
         positions = pd.DataFrame(
             [
                 {
@@ -43,9 +49,11 @@ class OperationsMonitorTest(unittest.TestCase):
         ):
             view = build_live_open_positions_view(positions, refresh_token=1)
 
+        self.assertEqual(view.loc[0, "종목"], "삼성전자 (005930)")
         self.assertEqual(view.loc[0, "현재가"], "71,000 KRW")
         self.assertEqual(view.loc[0, "평가손익"], "10,000 KRW")
         self.assertEqual(view.loc[0, "수익률"], "+1.43%")
+        self.assertEqual(view.loc[1, "종목"], "BTC-USD")
         self.assertEqual(view.loc[1, "현재가"], "90.00 USD")
         self.assertEqual(view.loc[1, "평가손익"], "20.00 USD")
         self.assertEqual(view.loc[1, "수익률"], "+10.00%")
@@ -54,7 +62,8 @@ class OperationsMonitorTest(unittest.TestCase):
         view = build_live_open_positions_view(pd.DataFrame(), refresh_token=1)
         self.assertTrue(view.empty)
 
-    def test_build_recent_order_activity_view_formats_buy_and_sell_history(self) -> None:
+    @patch("app.load_krx_symbol_name_map", return_value={"005930": "삼성전자", "005930.KS": "삼성전자"})
+    def test_build_recent_order_activity_view_formats_buy_and_sell_history(self, _mock_names) -> None:
         orders = pd.DataFrame(
             [
                 {
@@ -84,10 +93,12 @@ class OperationsMonitorTest(unittest.TestCase):
 
         view = build_recent_order_activity_view(orders)
 
+        self.assertEqual(view.loc[0, "종목"], "삼성전자 (005930)")
         self.assertEqual(view.loc[0, "주문"], "매수")
         self.assertEqual(view.loc[0, "상태"], "체결완료")
         self.assertEqual(view.loc[0, "사유"], "신규진입")
         self.assertEqual(view.loc[0, "주문가"], "70,000 KRW")
+        self.assertEqual(view.loc[1, "종목"], "BTC-USD")
         self.assertEqual(view.loc[1, "주문"], "매도")
         self.assertEqual(view.loc[1, "상태"], "체결대기")
         self.assertEqual(view.loc[1, "사유"], "익절")
@@ -96,6 +107,44 @@ class OperationsMonitorTest(unittest.TestCase):
     def test_build_recent_order_activity_view_returns_empty_when_no_orders(self) -> None:
         view = build_recent_order_activity_view(pd.DataFrame())
         self.assertTrue(view.empty)
+
+    @patch("app.load_krx_symbol_name_map", return_value={"005930": "삼성전자", "005930.KS": "삼성전자"})
+    def test_build_recent_realized_trades_view_formats_kr_display_name(self, _mock_names) -> None:
+        trades = pd.DataFrame(
+            [
+                {
+                    "closed_at": "2026-03-09T01:15:00Z",
+                    "created_at": "2026-03-09T01:00:00Z",
+                    "account_id": "kis_kr_paper",
+                    "symbol": "005930",
+                    "asset_type": "한국주식",
+                    "side": "LONG",
+                    "entry_price": 70000.0,
+                    "mark_price": 71000.0,
+                    "realized_pnl": 1000.0,
+                    "notes": "closed_by_take_profit",
+                }
+            ]
+        )
+
+        view = build_recent_realized_trades_view(trades)
+
+        self.assertEqual(view.loc[0, "종목"], "삼성전자 (005930)")
+        self.assertEqual(view.loc[0, "실현손익"], "1,000 KRW")
+
+    @patch("app.load_krx_symbol_name_map", return_value={"373220": "LG에너지솔루션", "373220.KS": "LG에너지솔루션"})
+    def test_build_monitor_table_view_formats_kr_symbol_column(self, _mock_names) -> None:
+        frame = pd.DataFrame(
+            [
+                {"symbol": "373220.KS", "asset_type": "한국주식", "status": "filled"},
+                {"symbol": "AAPL", "asset_type": "미국주식", "status": "filled"},
+            ]
+        )
+
+        view = build_monitor_table_view(frame)
+
+        self.assertEqual(view.loc[0, "종목"], "LG에너지솔루션 (373220)")
+        self.assertEqual(view.loc[1, "종목"], "AAPL")
 
 
 if __name__ == "__main__":
