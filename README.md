@@ -150,6 +150,16 @@ KR strategies:
 
 The `15m` path is intentionally a separate strategy family instead of a timeframe toggle on the `1h` strategy. Regular and after-hours modes share the completed-bar signal base, but keep separate session windows, price policies, order intents, no-op reasons, conflict handling, and monitoring rows.
 
+### KR strategy family matrix
+
+| strategy_id | timeframe | session_mode | enabled_by_default | experimental | execution_account | intended use |
+| --- | --- | --- | --- | --- | --- | --- |
+| `kr_daily_preclose_v1` | `1d` | `pre_close` | `false` | `false` | `kis_kr_paper` | legacy |
+| `kr_intraday_1h_v1` | `1h` | `regular` | `true` | `false` | `kis_kr_paper` | recommended default |
+| `kr_intraday_15m_v1` | `15m` | `regular` | `false` | `true` | `kis_kr_paper` | experimental |
+| `kr_intraday_15m_v1_after_close_close` | `15m family` | `after_close_close_price` | `false` | `true` | `kis_kr_paper` | post-close fixed close |
+| `kr_intraday_15m_v1_after_close_single` | `15m family` | `after_close_single_price` | `false` | `true` | `kis_kr_paper` | 10-minute single-price auction |
+
 Current default KR execution policy:
 
 - recommended default: `kr_intraday_1h_v1`
@@ -161,16 +171,47 @@ Current default KR execution policy:
 
 Current KR execution order:
 
-1. schedule gate and market phase check
-2. pre-close gate
-3. KIS quote and expected/ask-bid price lookup
-4. KIS buying power or sellable quantity lookup
-5. repository checks for pending entry, holding state, cooldown, and risk budget
-6. broker submit
+1. choose active KR strategy and session mode
+2. apply the matching session gate
+   - `kr_daily_preclose_v1` -> daily pre-close gate
+   - `kr_intraday_1h_v1` / `kr_intraday_15m_v1` -> regular intraday session gate
+   - `kr_intraday_15m_v1_after_close_close` -> `15:40~16:00`
+   - `kr_intraday_15m_v1_after_close_single` -> `16:00~18:00`
+3. fetch the matching KIS quote / orderbook context for that session
+4. check KIS buying power or sellable quantity
+5. run repository checks for pending entry, holding state, cooldown, and risk budget
+6. submit with the session-specific order intent
 7. broker order sync via:
    - websocket execution event if available
    - REST daily order/fill query
    - holdings/account fallback only as last resort
+
+### Session-mode differences
+
+- `kr_intraday_1h_v1`
+  - allowed time: regular intraday window
+  - price policy: market best-effort / orderbook-based
+  - execution policy: regular-session submit + regular broker sync
+  - typical no-op / reject: `market_closed`, `outside_intraday_entry_window`, `insufficient_buying_power`
+  - why recommended: operationally simplest KR strategy and least fragile runtime behavior
+- `kr_intraday_15m_v1`
+  - allowed time: `09:15~14:45`
+  - price policy: market best-effort / orderbook-based
+  - execution policy: completed `15m` bar only, opening bar blocked, flatten near close
+  - typical no-op / reject: `opening_bar_blocked`, `outside_intraday_entry_window`, `kr_strategy_conflict_pending`
+  - why experimental: more frequent intraday entries and tighter cadence than the default `1h`
+- `kr_intraday_15m_v1_after_close_close`
+  - allowed time: `15:40~16:00`
+  - price policy: same-day close price
+  - execution policy: session-specific `after_close_close_price` submit on KIS mock
+  - typical no-op / reject: `outside_after_close_close_session`, `after_close_price_unavailable`, `after_close_buying_power_insufficient`
+  - why recommended first among after-hours modes: simpler than auction mode and easier to reason about operationally
+- `kr_intraday_15m_v1_after_close_single`
+  - allowed time: `16:00~18:00`
+  - price policy: after-hours single-price expected / auction quote
+  - execution policy: `10분` 단일가 경매 cadence, while signals still come from completed `15m` bars
+  - typical no-op / reject: `outside_after_close_single_session`, `after_close_single_waiting_auction`, `after_close_single_quote_unavailable`
+  - why experimental: signal cadence (`15m`) and execution cadence (`10m`) differ, so it is materially harder to reason about than regular or after-close close mode
 
 KR strategy rules:
 
@@ -260,6 +301,8 @@ KR strategy policy inside all profiles:
   - `kr_intraday_15m_v1_after_close_single`
 - `kr_daily_preclose_v1`: legacy fallback, disabled unless explicitly opted in
 
+For KR operations, the default recommendation remains `kr_intraday_1h_v1`. The `15m` family exists for opt-in experimentation, and `kr_intraday_15m_v1_after_close_single` should be treated as the highest-risk KR mode in this repository.
+
 This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
 
 When trades are too sparse, inspect these breakdowns first:
@@ -306,6 +349,7 @@ It exposes:
 - last websocket execution timestamp
 - `kr_strategy_overview`
   - strategy id / label / timeframe / session mode / enabled / experimental
+  - broker mode / execution account / session window / price policy / execution cadence / intended use
   - candidate / allowed / submit requested / submitted / acknowledged / pending fill / filled / rejected / cancelled
   - no-op reason breakdown / reject reason breakdown
   - today candidate / allowed / rejected / submitted / filled / noop counts

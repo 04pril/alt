@@ -3728,14 +3728,27 @@ def render_operations_monitor(
         st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
         with st.container(border=True):
             st.caption("KR 전략 상태")
-            st.caption("기본 추천 전략은 1시간봉이며, KR 15분 family는 regular / 장후종가 / 시간외단일가 세션으로 분리된 experimental 전략입니다.")
+            st.caption("기본 추천 전략은 1시간봉입니다. KR 15분 family는 regular / 장후종가 / 시간외단일가 세션으로 분리된 experimental 전략입니다.")
+            st.info(
+                f"현재 KR 기본 전략: {str(runtime_profile.get('kr_default_strategy_label') or runtime_profile.get('kr_default_strategy_id') or '-')}"
+                f" · 현재 세션 모드: {str(runtime_profile.get('kr_default_strategy_session_mode') or '-')}"
+                f" · 기본 추천: {str(runtime_profile.get('kr_recommended_strategy_label') or 'kr_intraday_1h_v1')}"
+                " · after_close_single은 10분 단일가 경매라 가장 실험적입니다."
+            )
             strategy_view = kr_strategy_overview.rename(
                 columns={
                     "label": "전략",
+                    "strategy_id": "전략 ID",
                     "session_mode": "세션 모드",
                     "timeframe": "타임프레임",
                     "enabled": "활성",
                     "experimental": "실험",
+                    "broker_mode": "브로커",
+                    "execution_account_id": "실행 계좌",
+                    "session_window": "허용 시간",
+                    "price_policy": "가격 정책",
+                    "execution_cadence": "체결 cadence",
+                    "intended_use": "용도",
                     "today_candidate_count": "후보",
                     "today_entry_allowed_count": "허용",
                     "today_entry_rejected_count": "거절",
@@ -3756,10 +3769,17 @@ def render_operations_monitor(
             )
             strategy_cols = [
                 "전략",
+                "전략 ID",
                 "세션 모드",
                 "타임프레임",
                 "활성",
                 "실험",
+                "브로커",
+                "실행 계좌",
+                "허용 시간",
+                "가격 정책",
+                "체결 cadence",
+                "용도",
                 "후보",
                 "허용",
                 "거절",
@@ -3897,7 +3917,14 @@ def render_operations_monitor(
             strategy_exec_view = kr_strategy_overview.rename(
                 columns={
                     "label": "전략",
+                    "strategy_id": "전략 ID",
                     "session_mode": "세션 모드",
+                    "broker_mode": "브로커",
+                    "execution_account_id": "실행 계좌",
+                    "session_window": "허용 시간",
+                    "price_policy": "가격 정책",
+                    "execution_cadence": "체결 cadence",
+                    "intended_use": "용도",
                     "today_candidate_count": "후보",
                     "today_entry_allowed_count": "허용",
                     "today_entry_rejected_count": "거절",
@@ -3917,7 +3944,14 @@ def render_operations_monitor(
             )
             strategy_exec_cols = [
                 "전략",
+                "전략 ID",
                 "세션 모드",
+                "브로커",
+                "실행 계좌",
+                "허용 시간",
+                "가격 정책",
+                "체결 cadence",
+                "용도",
                 "후보",
                 "허용",
                 "거절",

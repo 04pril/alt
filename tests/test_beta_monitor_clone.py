@@ -495,6 +495,8 @@ class BetaMonitorCloneTest(unittest.TestCase):
             "runtime_profile": {
                 "name": "balanced",
                 "kr_default_strategy_label": "KR Intraday 1h v1",
+                "kr_default_strategy_session_mode": "regular",
+                "kr_recommended_strategy_label": "KR Intraday 1h v1",
                 "kr_active_strategy_labels": "KR Intraday 1h v1",
             },
             "job_health": pd.DataFrame(),
@@ -514,9 +516,13 @@ class BetaMonitorCloneTest(unittest.TestCase):
                     {
                         "strategy_id": "kr_intraday_1h_v1",
                         "label": "KR Intraday 1h v1",
+                        "session_mode": "regular",
                         "timeframe": "1h",
                         "enabled": True,
                         "experimental": False,
+                        "broker_mode": "kis_mock",
+                        "execution_account_id": ACCOUNT_KIS_KR_PAPER,
+                        "execution_cadence": "1h 완성봉 기준",
                         "today_candidate_count": 3,
                         "today_submitted_count": 1,
                         "today_filled_count": 1,
@@ -524,9 +530,27 @@ class BetaMonitorCloneTest(unittest.TestCase):
                     {
                         "strategy_id": "kr_intraday_15m_v1",
                         "label": "KR Intraday 15m v1 Experimental",
+                        "session_mode": "regular",
                         "timeframe": "15m",
                         "enabled": False,
                         "experimental": True,
+                        "broker_mode": "kis_mock",
+                        "execution_account_id": ACCOUNT_KIS_KR_PAPER,
+                        "execution_cadence": "15m 완성봉 기준",
+                        "today_candidate_count": 0,
+                        "today_submitted_count": 0,
+                        "today_filled_count": 0,
+                    },
+                    {
+                        "strategy_id": "kr_intraday_15m_v1_after_close_single",
+                        "label": "KR 15m After-close Single v1 Experimental",
+                        "session_mode": "after_close_single",
+                        "timeframe": "15m",
+                        "enabled": False,
+                        "experimental": True,
+                        "broker_mode": "kis_mock",
+                        "execution_account_id": ACCOUNT_KIS_KR_PAPER,
+                        "execution_cadence": "10분 단일가 경매",
                         "today_candidate_count": 0,
                         "today_submitted_count": 0,
                         "today_filled_count": 0,
@@ -576,6 +600,10 @@ class BetaMonitorCloneTest(unittest.TestCase):
         markup = str(captured.get("html") or "")
         self.assertIn("KR Intraday 1h v1", markup)
         self.assertIn("KR Intraday 15m v1 Experimental", markup)
+        self.assertIn("기본 추천 KR Intraday 1h v1", markup)
+        self.assertIn("세션 regular", markup)
+        self.assertIn("10분 단일가 경매", markup)
+        self.assertIn("auction experimental", markup)
         self.assertIn("experimental", markup)
         self.assertIs(captured.get("scrolling"), False)
 

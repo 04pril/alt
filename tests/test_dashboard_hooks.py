@@ -196,6 +196,7 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(data["runtime_profile"]["experimental"], "false")
             self.assertEqual(data["runtime_profile"]["kr_default_strategy_id"], "kr_intraday_1h_v1")
             self.assertEqual(data["runtime_profile"]["kr_default_strategy_session_mode"], "regular")
+            self.assertEqual(data["runtime_profile"]["kr_recommended_strategy_id"], "kr_intraday_1h_v1")
             self.assertIn("kr_intraday_1h_v1", data["runtime_profile"]["kr_active_strategies"])
             self.assertIn("regular", data["runtime_profile"]["kr_active_strategy_session_modes"])
 
@@ -382,8 +383,17 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertFalse(bool(intraday_15m["enabled"]))
             self.assertTrue(bool(intraday_15m["experimental"]))
             self.assertEqual(str(intraday_15m["session_mode"]), "regular")
+            self.assertEqual(str(intraday_15m["broker_mode"]), "kis_mock")
+            self.assertEqual(str(intraday_15m["execution_account_id"]), ACCOUNT_KIS_KR_PAPER)
+            self.assertEqual(str(intraday_15m["intended_use"]), "experimental regular intraday")
             after_close = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_after_close_close"].iloc[0]
             self.assertEqual(str(after_close["session_mode"]), "after_close_close")
+            self.assertEqual(str(after_close["session_window"]), "15:40~16:00")
+            after_close_single = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_after_close_single"].iloc[0]
+            self.assertEqual(str(after_close_single["session_mode"]), "after_close_single")
+            self.assertEqual(str(after_close_single["execution_cadence"]), "10분 단일가 경매")
+            self.assertEqual(str(after_close_single["price_policy"]), "시간외 단일가 예상체결")
+            self.assertEqual(str(after_close_single["intended_use"]), "10-minute single-price auction")
 
 
 if __name__ == "__main__":

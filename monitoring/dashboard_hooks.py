@@ -115,6 +115,7 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
         },
     )
     default_strategy = default_kr_strategy(settings)
+    recommended_strategy = next((strategy for strategy in iter_strategy_rows(settings) if str(strategy.strategy_id) == "kr_intraday_1h_v1"), None)
     active_ids = active_kr_strategy_ids(settings)
     active_labels = [
         strategy_label(strategy)
@@ -136,6 +137,8 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
         "kr_default_strategy_id": str((default_strategy.strategy_id if default_strategy is not None else settings.kr_default_strategy_id) or ""),
         "kr_default_strategy_label": str(strategy_label(default_strategy) if default_strategy is not None else settings.kr_default_strategy_id or ""),
         "kr_default_strategy_session_mode": str(strategy_session_label(default_strategy)),
+        "kr_recommended_strategy_id": str(recommended_strategy.strategy_id if recommended_strategy is not None else "kr_intraday_1h_v1"),
+        "kr_recommended_strategy_label": str(strategy_label(recommended_strategy) if recommended_strategy is not None else "kr_intraday_1h_v1"),
         "kr_active_strategies": ",".join(active_ids),
         "kr_active_strategy_labels": ", ".join(active_labels),
         "kr_active_strategy_session_modes": ", ".join(active_session_modes),
@@ -446,12 +449,61 @@ def _reason_breakdown(frame: pd.DataFrame, event_type: str, *, limit: int = 3) -
     return ", ".join(f"{idx}({int(value)})" for idx, value in series.items())
 
 
-def _build_kr_strategy_overview(repository: TradingRepository, settings: RuntimeSettings, today_events: pd.DataFrame) -> pd.DataFrame:
+def _kr_strategy_session_window(strategy) -> str:
+    start = str(strategy.entry_window_start or "").strip()
+    end = str(strategy.entry_window_end or "").strip()
+    if start and end:
+        return f"{start}~{end}"
+    return "-"
+
+
+def _kr_strategy_price_policy(strategy) -> str:
+    mode = str(strategy.session_mode or "regular")
+    return {
+        "regular": "시장가/호가 기반",
+        "pre_close": "종가 근접 pre-close",
+        "after_close_close_price": "당일 종가 고정",
+        "after_close_single_price": "시간외 단일가 예상체결",
+    }.get(mode, str(strategy.session_price_policy or "-"))
+
+
+def _kr_strategy_execution_cadence(strategy) -> str:
+    mode = str(strategy.session_mode or "regular")
+    if mode == "after_close_single_price":
+        return f"{int(strategy.auction_interval_minutes or 10)}분 단일가 경매"
+    if str(strategy.timeframe) == "1d":
+        return "종가 기준"
+    return f"{strategy.timeframe} 완성봉 기준"
+
+
+def _kr_strategy_intended_use(strategy) -> str:
+    strategy_id = str(strategy.strategy_id)
+    if strategy_id == "kr_daily_preclose_v1":
+        return "legacy"
+    if strategy_id == "kr_intraday_1h_v1":
+        return "recommended default"
+    if strategy_id == "kr_intraday_15m_v1":
+        return "experimental regular intraday"
+    if strategy_id == "kr_intraday_15m_v1_after_close_close":
+        return "post-close fixed close"
+    if strategy_id == "kr_intraday_15m_v1_after_close_single":
+        return "10-minute single-price auction"
+    return "custom"
+
+
+def _build_kr_strategy_overview(
+    repository: TradingRepository,
+    settings: RuntimeSettings,
+    today_events: pd.DataFrame,
+    *,
+    kis_enabled: bool,
+) -> pd.DataFrame:
     created_date = str(pd.Timestamp.utcnow().date())
     rows: list[dict[str, Any]] = []
     for strategy in iter_strategy_rows(settings):
         strategy_id = str(strategy.strategy_id)
         account_id = str(strategy.execution_account_id or "")
+        broker_mode = resolve_broker_mode(symbol="005930.KS", asset_type="한국주식", kis_enabled=kis_enabled)
         candidate_frame = repository.candidate_scans_by_date(
             created_date,
             asset_type="한국주식",
@@ -494,7 +546,12 @@ def _build_kr_strategy_overview(repository: TradingRepository, settings: Runtime
                 "timeframe": str(strategy.timeframe),
                 "enabled": bool(strategy.enabled),
                 "experimental": bool(strategy.experimental),
+                "broker_mode": broker_mode,
                 "execution_account_id": account_id,
+                "session_window": _kr_strategy_session_window(strategy),
+                "price_policy": _kr_strategy_price_policy(strategy),
+                "execution_cadence": _kr_strategy_execution_cadence(strategy),
+                "intended_use": _kr_strategy_intended_use(strategy),
                 "primary_target": str(strategy.primary_target),
                 "secondary_target": str(strategy.secondary_target),
                 "analysis_target": str(strategy.analysis_target),
@@ -566,7 +623,7 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     recent_events = _localize_timestamp_columns(repository.recent_system_events(limit=200))
     today_events = _parse_details(repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=2000))
     execution_summary = _execution_summary(today_events)
-    kr_strategy_overview = _build_kr_strategy_overview(repository, settings, today_events)
+    kr_strategy_overview = _build_kr_strategy_overview(repository, settings, today_events, kis_enabled=kis_enabled)
     kr_strategy_recent_events = _localize_timestamp_columns(_build_kr_strategy_recent_events(settings, today_events))
     broker_sync_status = _localize_timestamp_columns(_broker_sync_status(job_health))
     broker_error_mask = (
