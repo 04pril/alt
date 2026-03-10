@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from dataclasses import dataclass
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -19,6 +21,7 @@ from jobs.tasks import (
     broker_position_sync_job,
     entry_decision_job,
 )
+from kr_strategy import default_kr_strategy, strategy_schedule
 from kis_paper import KISPaperSnapshot
 from monitoring.dashboard_hooks import build_asset_overview, load_dashboard_data
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
@@ -41,6 +44,16 @@ class _FakeMarketDataService:
         self.market_open = market_open
         self.pre_close = pre_close
         self.latest_price = float(latest_price)
+        self.current_times: dict[str, datetime] = {}
+
+    def current_time(self, asset_type: str) -> datetime:
+        if asset_type in self.current_times:
+            return self.current_times[asset_type]
+        if asset_type == "한국주식":
+            return datetime(2026, 3, 9, 14, 10, tzinfo=ZoneInfo("Asia/Seoul"))
+        if asset_type == "미국주식":
+            return datetime(2026, 3, 9, 15, 40, tzinfo=ZoneInfo("America/New_York"))
+        return datetime(2026, 3, 9, 12, 0, tzinfo=ZoneInfo("UTC"))
 
     def is_market_open(self, asset_type: str, when=None) -> bool:
         return self.market_open
@@ -205,10 +218,41 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         run_key = f"2026-03-09T15:{self.run_counter:02d}"
         return _run_guarded(self.fixture.context, job_name=job_name, run_key=run_key, fn=fn)
 
+    def _kr_strategy_id(self) -> str:
+        strategy = default_kr_strategy(self.fixture.settings)
+        self.assertIsNotNone(strategy)
+        return str(strategy.strategy_id)
+
+    def _kr_timeframe(self) -> str:
+        return str(strategy_schedule(self.fixture.settings, self._kr_strategy_id()).timeframe)
+
     def _insert_candidate_prediction(self, *, symbol: str, asset_type: str, timeframe: str, scan_id: str, prediction_id: str | None = None) -> None:
         now_iso = utc_now_iso()
         prediction_id = prediction_id or make_id("pred")
-        notes = json.dumps({"stop_level": 68_000.0, "take_level": 73_000.0}, ensure_ascii=False)
+        strategy_version = "s1"
+        target_type = "next_close_return"
+        forecast_horizon_bars = 1
+        validation_mode = "holdout"
+        notes_payload = {"stop_level": 68_000.0, "take_level": 73_000.0}
+        if asset_type == self.fixture.kr_asset_type:
+            strategy = default_kr_strategy(self.fixture.settings)
+            self.assertIsNotNone(strategy)
+            timeframe = str(strategy_schedule(self.fixture.settings, str(strategy.strategy_id)).timeframe)
+            strategy_version = str(strategy.strategy_id)
+            target_type = str(strategy.primary_target)
+            forecast_horizon_bars = int(strategy.forecast_horizon_bars)
+            validation_mode = str(strategy.validation_mode)
+            notes_payload.update(
+                {
+                    "strategy_family": str(strategy.strategy_family),
+                    "decision_horizon_bars": int(strategy.decision_horizon_bars),
+                    "primary_target": str(strategy.primary_target),
+                    "secondary_target": str(strategy.secondary_target),
+                    "analysis_target": str(strategy.analysis_target),
+                    "experimental": bool(strategy.experimental),
+                }
+            )
+        notes = json.dumps(notes_payload, ensure_ascii=False)
         self.fixture.repository.insert_predictions(
             [
                 PredictionRecord(
@@ -221,8 +265,8 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     market_timezone="Asia/Seoul",
                     data_cutoff_at=now_iso,
                     target_at=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat(),
-                    forecast_horizon_bars=1,
-                    target_type="next_close_return",
+                    forecast_horizon_bars=forecast_horizon_bars,
+                    target_type=target_type,
                     current_price=70_000.0,
                     predicted_price=71_400.0,
                     predicted_return=0.02,
@@ -236,12 +280,13 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     model_name="demo",
                     model_version="v1",
                     feature_version="f1",
-                    strategy_version="s1",
-                    validation_mode="holdout",
+                    strategy_version=strategy_version,
+                    validation_mode=validation_mode,
                     feature_hash="hash",
                     status="unresolved",
                     scan_id=scan_id,
                     notes=notes,
+                    execution_account_id=ACCOUNT_KIS_KR_PAPER if asset_type == self.fixture.kr_asset_type else "",
                 )
             ]
         )
@@ -268,9 +313,10 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     signal="LONG",
                     model_version="v1",
                     feature_version="f1",
-                    strategy_version="s1",
+                    strategy_version=strategy_version,
                     is_holding=0,
                     raw_json="{}",
+                    execution_account_id=ACCOUNT_KIS_KR_PAPER if asset_type == self.fixture.kr_asset_type else "",
                 )
             ]
         )
@@ -278,11 +324,14 @@ class MergeReadinessSmokeTest(unittest.TestCase):
     def _event_frame(self) -> pd.DataFrame:
         return self.fixture.repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=500)
 
-    def _assert_event_reason(self, *, event_type: str, reason: str) -> None:
+    def _assert_event_reason(self, *, event_type: str, reason: str, account_id: str | None = None) -> None:
         events = self._event_frame()
         self.assertFalse(events.empty)
         matched = events.loc[events["event_type"].astype(str) == event_type]
         self.assertFalse(matched.empty)
+        if account_id is not None:
+            matched = matched.loc[matched["account_id"].fillna("").astype(str) == str(account_id)]
+            self.assertFalse(matched.empty)
         reasons = matched["details_json"].fillna("{}").map(lambda payload: json.loads(str(payload or "{}")).get("reason"))
         self.assertIn(reason, set(reasons.tolist()))
 
@@ -329,7 +378,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
             statuses=("submitted", "acknowledged", "pending_fill", "partially_filled", "filled"),
             account_id=ACCOUNT_KIS_KR_PAPER,
         )
-        self.assertEqual(entered[self.fixture.kr_asset_type], 1)
+        self.assertEqual(entered[self._kr_strategy_id()], 1)
         self.assertEqual(len(orders), 1)
         order_id = str(orders.iloc[0]["order_id"])
         requested_qty = int(orders.iloc[0]["requested_qty"])
@@ -377,21 +426,21 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.fixture.market.market_open = False
         self._insert_candidate_prediction(symbol="005930.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-market-closed")
         entered_closed = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_closed[self.fixture.kr_asset_type], 0)
-        self._assert_event_reason(event_type="noop", reason="market_closed")
+        self.assertEqual(entered_closed[self._kr_strategy_id()], 0)
+        self._assert_event_reason(event_type="noop", reason="market_closed", account_id=ACCOUNT_KIS_KR_PAPER)
 
         self.fixture.market.market_open = True
-        self.fixture.market.pre_close = False
+        self.fixture.market.current_times[self.fixture.kr_asset_type] = datetime(2026, 3, 9, 15, 5, tzinfo=ZoneInfo("Asia/Seoul"))
         self._insert_candidate_prediction(symbol="005930.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-not-preclose")
         entered_preclose = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_preclose[self.fixture.kr_asset_type], 0)
-        self._assert_event_reason(event_type="noop", reason="outside_preclose_window")
+        self.assertEqual(entered_preclose[self._kr_strategy_id()], 0)
+        self._assert_event_reason(event_type="noop", reason="outside_intraday_entry_window", account_id=ACCOUNT_KIS_KR_PAPER)
 
-        self.fixture.market.pre_close = True
+        self.fixture.market.current_times[self.fixture.kr_asset_type] = datetime(2026, 3, 9, 14, 10, tzinfo=ZoneInfo("Asia/Seoul"))
         self.fixture.client.buying_power = {"cash_buy_qty": 0, "max_buy_qty": 0, "cash_buy_amount": 0.0}
         self._insert_candidate_prediction(symbol="005930.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-buying-power")
         entered_power = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_power[self.fixture.kr_asset_type], 0)
+        self.assertEqual(entered_power[self._kr_strategy_id()], 0)
         self._assert_event_reason(event_type="entry_rejected", reason="insufficient_buying_power")
 
         self.fixture.client.buying_power = {"cash_buy_qty": 1_000, "max_buy_qty": 1_000, "cash_buy_amount": 100_000_000.0}
@@ -404,7 +453,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 scan_id="scan-old",
                 symbol="005930.KS",
                 asset_type=self.fixture.kr_asset_type,
-                timeframe="1d",
+                timeframe=self._kr_timeframe(),
                 side="buy",
                 order_type="market",
                 requested_qty=1,
@@ -416,15 +465,16 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 fees_estimate=0.0,
                 slippage_bps=0.0,
                 retry_count=0,
-                strategy_version="s1",
+                strategy_version=self._kr_strategy_id(),
                 reason="entry",
                 raw_json='{"broker":"kis_mock"}',
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
         self._insert_candidate_prediction(symbol="005930.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-duplicate")
         entered_dup = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_dup[self.fixture.kr_asset_type], 0)
-        self._assert_event_reason(event_type="entry_rejected", reason="duplicate_pending_entry")
+        self.assertEqual(entered_dup[self._kr_strategy_id()], 0)
+        self._assert_event_reason(event_type="entry_rejected", reason="kr_strategy_conflict_pending")
 
         self.fixture.repository.upsert_position(
             PositionRecord(
@@ -435,7 +485,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 prediction_id="pred-old",
                 symbol="000660.KS",
                 asset_type=self.fixture.kr_asset_type,
-                timeframe="1d",
+                timeframe=self._kr_timeframe(),
                 side="LONG",
                 status="closed",
                 quantity=0,
@@ -451,19 +501,20 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                 expected_risk=0.01,
                 exposure_value=0.0,
                 max_holding_until=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat(),
-                strategy_version="s1",
+                strategy_version=self._kr_strategy_id(),
                 cooldown_until=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat(),
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
         self._insert_candidate_prediction(symbol="000660.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-cooldown")
         entered_cooldown = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_cooldown[self.fixture.kr_asset_type], 0)
+        self.assertEqual(entered_cooldown[self._kr_strategy_id()], 0)
         self._assert_event_reason(event_type="entry_rejected", reason="cooldown_active")
 
         self.fixture.client.quote_available = False
         self._insert_candidate_prediction(symbol="068270.KS", asset_type=self.fixture.kr_asset_type, timeframe="1d", scan_id="scan-no-quote")
         entered_no_quote = entry_decision_job(self.fixture.context, [self.fixture.kr_asset_type])
-        self.assertEqual(entered_no_quote[self.fixture.kr_asset_type], 0)
+        self.assertEqual(entered_no_quote[self._kr_strategy_id()], 0)
         self._assert_event_reason(event_type="entry_rejected", reason="no_quote")
 
     def test_us_crypto_isolation_smoke(self) -> None:
@@ -560,6 +611,8 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertIn("runtime_profile", data)
         self.assertIn("accounts_overview", data)
         self.assertIn("total_portfolio_overview", data)
+        self.assertIn("kr_strategy_overview", data)
+        self.assertIn("kr_strategy_recent_events", data)
         self.assertFalse(data["broker_sync_status"].empty)
         self.assertTrue(data["broker_sync_errors"].empty)
         self.assertEqual(set(data["broker_sync_status"]["job_name"]), {"broker_account_sync", "broker_order_sync", "broker_position_sync", "broker_market_status"})
@@ -572,6 +625,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertIn("warning", data["total_portfolio_overview"])
         self.assertTrue({"last_broker_account_sync", "last_broker_order_sync", "last_websocket_execution_event", "pending_submitted_orders", "broker_rejects_today"} <= set(data["kis_runtime"].keys()))
         self.assertGreaterEqual(data["execution_summary"]["today_candidate_count"], 1)
+        self.assertIn("kr_intraday_1h_v1", set(data["kr_strategy_overview"]["strategy_id"].astype(str)))
 
     def test_account_scoped_sync_events_exist_for_all_execution_accounts(self) -> None:
         self._run_job("broker_market_status", lambda: broker_market_status_job(self.fixture.context))

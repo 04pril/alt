@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from kr_strategy import active_kr_strategy_ids, default_kr_strategy, iter_strategy_rows, strategy_label
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -83,9 +84,53 @@ def _runtime_profile_read_model(repository: TradingRepository, settings: Runtime
         "runtime_profile_source",
         str(settings.profile_source or "embedded_defaults"),
     )
+    normalized_name = str(profile_name or "baseline")
+    profile_meta = {
+        "baseline": {
+            "mode": "baseline",
+            "recommended_default": "false",
+            "experimental": "false",
+            "note": "production-equivalent baseline profile",
+        },
+        "balanced": {
+            "mode": "recommended",
+            "recommended_default": "true",
+            "experimental": "false",
+            "note": "recommended default profile for steady paper trading",
+        },
+        "active": {
+            "mode": "experimental",
+            "recommended_default": "false",
+            "experimental": "true",
+            "note": "aggressive experimental profile with US 15m cadence",
+        },
+    }.get(
+        normalized_name,
+        {
+            "mode": "custom",
+            "recommended_default": "false",
+            "experimental": "false",
+            "note": "custom runtime profile",
+        },
+    )
+    default_strategy = default_kr_strategy(settings)
+    active_ids = active_kr_strategy_ids(settings)
+    active_labels = [
+        strategy_label(strategy)
+        for strategy in iter_strategy_rows(settings)
+        if str(strategy.strategy_id) in set(active_ids)
+    ]
     return {
-        "name": str(profile_name or "baseline"),
+        "name": normalized_name,
         "source": str(profile_source or "embedded_defaults"),
+        "mode": str(profile_meta["mode"]),
+        "recommended_default": str(profile_meta["recommended_default"]),
+        "experimental": str(profile_meta["experimental"]),
+        "note": str(profile_meta["note"]),
+        "kr_default_strategy_id": str((default_strategy.strategy_id if default_strategy is not None else settings.kr_default_strategy_id) or ""),
+        "kr_default_strategy_label": str(strategy_label(default_strategy) if default_strategy is not None else settings.kr_default_strategy_id or ""),
+        "kr_active_strategies": ",".join(active_ids),
+        "kr_active_strategy_labels": ", ".join(active_labels),
     }
 
 
@@ -330,6 +375,114 @@ def _broker_sync_status(job_health: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _strategy_event_mask(frame: pd.DataFrame, strategy_id: str) -> pd.Series:
+    if frame.empty or "details" not in frame.columns:
+        return pd.Series(dtype=bool)
+    return frame["details"].map(lambda item: str((item or {}).get("strategy_version") or "") == str(strategy_id))
+
+
+def _top_reason(frame: pd.DataFrame, event_type: str) -> str:
+    if frame.empty:
+        return ""
+    series = (
+        frame.loc[frame["event_type"].astype(str) == event_type, "details"]
+        .map(lambda item: str((item or {}).get("reason") or ""))
+        .loc[lambda values: values.astype(str).str.strip() != ""]
+        .value_counts()
+    )
+    if series.empty:
+        return ""
+    return str(series.index[0])
+
+
+def _build_kr_strategy_overview(repository: TradingRepository, settings: RuntimeSettings, today_events: pd.DataFrame) -> pd.DataFrame:
+    created_date = str(pd.Timestamp.utcnow().date())
+    rows: list[dict[str, Any]] = []
+    for strategy in iter_strategy_rows(settings):
+        strategy_id = str(strategy.strategy_id)
+        account_id = str(strategy.execution_account_id or "")
+        candidate_frame = repository.candidate_scans_by_date(
+            created_date,
+            asset_type="한국주식",
+            strategy_version=strategy_id,
+            execution_account_id=account_id,
+            limit=5000,
+        )
+        position_frame = repository.open_positions(account_id=account_id, strategy_version=strategy_id)
+        order_frame = repository.open_orders(account_id=account_id, strategy_version=strategy_id)
+        pending_orders = int(
+            len(
+                order_frame.loc[
+                    order_frame["status"].astype(str).isin({"new", "submitted", "acknowledged", "pending_fill", "partially_filled"})
+                ]
+            )
+        ) if not order_frame.empty else 0
+        strategy_events = today_events.loc[_strategy_event_mask(today_events, strategy_id)].copy() if not today_events.empty else pd.DataFrame()
+        event_counts = strategy_events["event_type"].astype(str).value_counts() if not strategy_events.empty else pd.Series(dtype=int)
+        last_event_at = ""
+        last_fill_at = ""
+        if not strategy_events.empty:
+            last_event_at = str(strategy_events.iloc[0].get("created_at") or "")
+            fill_rows = strategy_events.loc[strategy_events["event_type"].astype(str) == "filled"]
+            if not fill_rows.empty:
+                last_fill_at = str(fill_rows.iloc[0].get("created_at") or "")
+        rows.append(
+            {
+                "strategy_id": strategy_id,
+                "display_name": str(strategy.display_name),
+                "label": str(strategy_label(strategy)),
+                "strategy_family": str(strategy.strategy_family),
+                "timeframe": str(strategy.timeframe),
+                "enabled": bool(strategy.enabled),
+                "experimental": bool(strategy.experimental),
+                "execution_account_id": account_id,
+                "primary_target": str(strategy.primary_target),
+                "secondary_target": str(strategy.secondary_target),
+                "analysis_target": str(strategy.analysis_target),
+                "today_candidate_count": int(len(candidate_frame)),
+                "today_entry_allowed_count": int(event_counts.get("entry_allowed", 0)),
+                "today_entry_rejected_count": int(event_counts.get("entry_rejected", 0)),
+                "today_submit_requested_count": int(event_counts.get("submit_requested", 0)),
+                "today_submitted_count": int(event_counts.get("submitted", 0)),
+                "today_filled_count": int(event_counts.get("filled", 0)),
+                "today_noop_count": int(event_counts.get("noop", 0)),
+                "today_noop_top_reason": _top_reason(strategy_events, "noop"),
+                "today_reject_top_reason": _top_reason(strategy_events, "entry_rejected"),
+                "open_positions": int(len(position_frame)),
+                "pending_orders": pending_orders,
+                "last_event_at": last_event_at,
+                "last_fill_at": last_fill_at,
+            }
+        )
+    frame = pd.DataFrame(rows)
+    return frame.sort_values(["enabled", "experimental", "timeframe", "strategy_id"], ascending=[False, True, True, True]).reset_index(drop=True) if not frame.empty else frame
+
+
+def _build_kr_strategy_recent_events(settings: RuntimeSettings, today_events: pd.DataFrame, limit: int = 60) -> pd.DataFrame:
+    if today_events.empty:
+        return pd.DataFrame(columns=["created_at", "strategy_id", "account_id", "symbol", "event_type", "reason", "message"])
+    rows: list[dict[str, Any]] = []
+    valid_ids = {str(strategy.strategy_id) for strategy in iter_strategy_rows(settings)}
+    for _, row in today_events.iterrows():
+        details = row.get("details") or {}
+        strategy_id = str(details.get("strategy_version") or "").strip()
+        if not strategy_id or strategy_id not in valid_ids:
+            continue
+        rows.append(
+            {
+                "created_at": row.get("created_at"),
+                "strategy_id": strategy_id,
+                "account_id": row.get("account_id") or details.get("account_id") or details.get("execution_account_id") or "",
+                "symbol": details.get("symbol") or "",
+                "event_type": row.get("event_type") or "",
+                "reason": details.get("reason") or "",
+                "message": row.get("message") or "",
+            }
+        )
+    frame = pd.DataFrame(rows)
+    return frame.head(limit) if not frame.empty else frame
+
+
 def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
@@ -347,6 +500,8 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
     recent_events = _localize_timestamp_columns(repository.recent_system_events(limit=200))
     today_events = _parse_details(repository.system_events_by_date(str(pd.Timestamp.utcnow().date()), limit=2000))
     execution_summary = _execution_summary(today_events)
+    kr_strategy_overview = _build_kr_strategy_overview(repository, settings, today_events)
+    kr_strategy_recent_events = _localize_timestamp_columns(_build_kr_strategy_recent_events(settings, today_events))
     broker_sync_status = _localize_timestamp_columns(_broker_sync_status(job_health))
     broker_error_mask = (
         (today_events["level"].astype(str) == "ERROR")
@@ -388,6 +543,7 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "total_portfolio_overview": total_portfolio_overview,
         "prediction_report": _localize_timestamp_columns(repository.prediction_report(limit=200)),
         "open_positions": _localize_timestamp_columns(repository.open_positions()),
+        "recent_realized_trades": _localize_timestamp_columns(repository.recent_closed_positions(limit=100)),
         "open_orders": open_orders,
         "candidate_scans": _localize_timestamp_columns(repository.latest_candidates(limit=100)),
         "asset_overview": build_asset_overview(settings, kis_enabled=kis_enabled),
@@ -404,4 +560,6 @@ def load_dashboard_data(settings: RuntimeSettings) -> Dict[str, Any]:
         "today_execution_events": _localize_timestamp_columns(today_events),
         "kis_runtime": kis_runtime,
         "runtime_profile": runtime_profile,
+        "kr_strategy_overview": kr_strategy_overview,
+        "kr_strategy_recent_events": kr_strategy_recent_events,
     }

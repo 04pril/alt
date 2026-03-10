@@ -79,6 +79,64 @@ class StrategySettings:
 
 
 @dataclass
+class KRStrategyConfig:
+    strategy_id: str
+    strategy_family: str
+    display_name: str
+    enabled: bool
+    experimental: bool
+    execution_account_id: str
+    timeframe: str
+    feature_profile: str
+    validation_mode: str
+    target_mode: str
+    trade_mode: str
+    primary_target: str
+    secondary_target: str
+    analysis_target: str
+    decision_horizon_bars: int
+    forecast_horizon_bars: int
+    retrain_every_bars: int
+    test_bars: int
+    validation_bars: int
+    final_holdout_bars: int
+    purge_bars: int
+    embargo_bars: int
+    round_trip_cost_bps: float
+    min_signal_strength_pct: float
+    min_expected_return_pct: float
+    min_confidence: float
+    max_expected_risk_pct: float
+    max_cost_bps: float
+    score_decay_exit_threshold: float
+    trailing_stop_atr_mult: float
+    stop_loss_atr_mult: float
+    take_profit_atr_mult: float
+    max_holding_bars: int
+    time_stop_bars: int
+    allow_short: bool
+    target_daily_vol_pct: float
+    max_position_size: float
+    scan_score_weights: Dict[str, float]
+    scan_interval_minutes: int
+    entry_interval_minutes: int
+    exit_interval_minutes: int
+    outcome_interval_minutes: int
+    lookback_bars: int
+    min_history_bars: int
+    liquidity_min_score: float
+    liquidity_min_median_value: float
+    bar_close_only: bool
+    block_opening_bar: bool
+    entry_window_start: str
+    entry_window_end: str
+    flatten_window_start: str
+    flatten_window_end: str
+    max_daily_new_entries: int
+    cooldown_bars_after_exit: int
+
+
+@dataclass
 class RiskSettings:
     starting_cash: float = 30_000_000.0
     max_open_positions: int = 8
@@ -143,6 +201,197 @@ class RuntimeSettings:
     risk: RiskSettings = field(default_factory=RiskSettings)
     broker: BrokerSettings = field(default_factory=BrokerSettings)
     retraining: RetrainingSettings = field(default_factory=RetrainingSettings)
+    kr_default_strategy_id: str = "kr_intraday_1h_v1"
+    kr_strategies: Dict[str, KRStrategyConfig] = field(
+        default_factory=lambda: {
+            "kr_daily_preclose_v1": KRStrategyConfig(
+                strategy_id="kr_daily_preclose_v1",
+                strategy_family="kr_daily",
+                display_name="KR Daily Pre-close v1",
+                enabled=False,
+                experimental=False,
+                execution_account_id="kis_kr_paper",
+                timeframe="1d",
+                feature_profile="default",
+                validation_mode="holdout",
+                target_mode="return",
+                trade_mode="close_to_close",
+                primary_target="next_close_return",
+                secondary_target="session_close_return",
+                analysis_target="session_close_return",
+                decision_horizon_bars=1,
+                forecast_horizon_bars=1,
+                retrain_every_bars=5,
+                test_bars=60,
+                validation_bars=40,
+                final_holdout_bars=40,
+                purge_bars=2,
+                embargo_bars=1,
+                round_trip_cost_bps=8.0,
+                min_signal_strength_pct=0.40,
+                min_expected_return_pct=0.80,
+                min_confidence=0.55,
+                max_expected_risk_pct=4.0,
+                max_cost_bps=25.0,
+                score_decay_exit_threshold=0.20,
+                trailing_stop_atr_mult=1.0,
+                stop_loss_atr_mult=1.5,
+                take_profit_atr_mult=3.0,
+                max_holding_bars=1,
+                time_stop_bars=1,
+                allow_short=False,
+                target_daily_vol_pct=1.0,
+                max_position_size=1.0,
+                scan_score_weights={
+                    "expected_return": 0.40,
+                    "confidence": 0.25,
+                    "cost": -0.10,
+                    "volatility": -0.10,
+                    "recent_performance": 0.15,
+                },
+                scan_interval_minutes=60,
+                entry_interval_minutes=15,
+                exit_interval_minutes=15,
+                outcome_interval_minutes=60,
+                lookback_bars=520,
+                min_history_bars=320,
+                liquidity_min_score=0.30,
+                liquidity_min_median_value=0.0,
+                bar_close_only=False,
+                block_opening_bar=False,
+                entry_window_start="15:10",
+                entry_window_end="15:30",
+                flatten_window_start="15:20",
+                flatten_window_end="15:30",
+                max_daily_new_entries=4,
+                cooldown_bars_after_exit=2,
+            ),
+            "kr_intraday_1h_v1": KRStrategyConfig(
+                strategy_id="kr_intraday_1h_v1",
+                strategy_family="kr_intraday",
+                display_name="KR Intraday 1h v1",
+                enabled=True,
+                experimental=False,
+                execution_account_id="kis_kr_paper",
+                timeframe="1h",
+                feature_profile="kr_intraday",
+                validation_mode="holdout",
+                target_mode="return",
+                trade_mode="close_to_close",
+                primary_target="next_1_bar_return",
+                secondary_target="next_2_bar_return",
+                analysis_target="session_close_return",
+                decision_horizon_bars=1,
+                forecast_horizon_bars=2,
+                retrain_every_bars=8,
+                test_bars=80,
+                validation_bars=60,
+                final_holdout_bars=60,
+                purge_bars=2,
+                embargo_bars=1,
+                round_trip_cost_bps=8.0,
+                min_signal_strength_pct=0.16,
+                min_expected_return_pct=0.22,
+                min_confidence=0.54,
+                max_expected_risk_pct=2.8,
+                max_cost_bps=18.0,
+                score_decay_exit_threshold=0.18,
+                trailing_stop_atr_mult=0.9,
+                stop_loss_atr_mult=1.0,
+                take_profit_atr_mult=1.4,
+                max_holding_bars=3,
+                time_stop_bars=3,
+                allow_short=False,
+                target_daily_vol_pct=0.9,
+                max_position_size=0.8,
+                scan_score_weights={
+                    "expected_return": 0.44,
+                    "confidence": 0.24,
+                    "cost": -0.08,
+                    "volatility": -0.08,
+                    "recent_performance": 0.12,
+                },
+                scan_interval_minutes=60,
+                entry_interval_minutes=60,
+                exit_interval_minutes=15,
+                outcome_interval_minutes=60,
+                lookback_bars=420,
+                min_history_bars=260,
+                liquidity_min_score=0.42,
+                liquidity_min_median_value=2_500_000_000.0,
+                bar_close_only=True,
+                block_opening_bar=False,
+                entry_window_start="10:00",
+                entry_window_end="14:30",
+                flatten_window_start="15:10",
+                flatten_window_end="15:20",
+                max_daily_new_entries=6,
+                cooldown_bars_after_exit=1,
+            ),
+            "kr_intraday_15m_v1": KRStrategyConfig(
+                strategy_id="kr_intraday_15m_v1",
+                strategy_family="kr_intraday",
+                display_name="KR Intraday 15m v1",
+                enabled=False,
+                experimental=True,
+                execution_account_id="kis_kr_paper",
+                timeframe="15m",
+                feature_profile="kr_intraday",
+                validation_mode="walk_forward",
+                target_mode="return",
+                trade_mode="close_to_close",
+                primary_target="next_2_bar_return",
+                secondary_target="next_4_bar_return",
+                analysis_target="session_close_return",
+                decision_horizon_bars=2,
+                forecast_horizon_bars=4,
+                retrain_every_bars=12,
+                test_bars=120,
+                validation_bars=80,
+                final_holdout_bars=80,
+                purge_bars=2,
+                embargo_bars=1,
+                round_trip_cost_bps=8.0,
+                min_signal_strength_pct=0.12,
+                min_expected_return_pct=0.18,
+                min_confidence=0.53,
+                max_expected_risk_pct=2.2,
+                max_cost_bps=16.0,
+                score_decay_exit_threshold=0.16,
+                trailing_stop_atr_mult=0.7,
+                stop_loss_atr_mult=0.8,
+                take_profit_atr_mult=1.2,
+                max_holding_bars=4,
+                time_stop_bars=4,
+                allow_short=False,
+                target_daily_vol_pct=0.8,
+                max_position_size=0.65,
+                scan_score_weights={
+                    "expected_return": 0.46,
+                    "confidence": 0.24,
+                    "cost": -0.08,
+                    "volatility": -0.10,
+                    "recent_performance": 0.12,
+                },
+                scan_interval_minutes=15,
+                entry_interval_minutes=15,
+                exit_interval_minutes=15,
+                outcome_interval_minutes=15,
+                lookback_bars=480,
+                min_history_bars=320,
+                liquidity_min_score=0.55,
+                liquidity_min_median_value=4_000_000_000.0,
+                bar_close_only=True,
+                block_opening_bar=True,
+                entry_window_start="09:15",
+                entry_window_end="14:45",
+                flatten_window_start="15:15",
+                flatten_window_end="15:20",
+                max_daily_new_entries=8,
+                cooldown_bars_after_exit=2,
+            ),
+        }
+    )
     asset_schedules: Dict[str, AssetScheduleConfig] = field(
         default_factory=lambda: {
             # Assumption: crypto uses 1h bars and can trade on each bar close 24/7.

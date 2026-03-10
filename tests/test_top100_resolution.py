@@ -78,6 +78,10 @@ class Top100ResolutionTest(unittest.TestCase):
         self.assertEqual(app.resolve_kr_name_to_symbol("현대차"), "005380.KS")
         self.assertEqual(app.resolve_kr_name_to_symbol("삼천당제약"), "000250.KQ")
 
+    def test_bare_kr_code_uses_kr_quote_and_currency_defaults(self) -> None:
+        self.assertTrue(app.is_korean_stock_symbol("005930"))
+        self.assertEqual(app.default_currency_from_symbol("005930"), "KRW")
+
 
 if __name__ == "__main__":
     unittest.main()

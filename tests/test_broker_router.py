@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pandas as pd
 
-from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY, account_scope_for_asset_type
 from services.broker_router import BrokerRouter, resolve_broker_mode
 
 
@@ -153,9 +153,14 @@ class BrokerRouterTest(unittest.TestCase):
         self.assertEqual(order_id, "kis-entry")
         self.assertEqual(self.kis.entry_calls, 1)
 
-    def test_blank_symbol_with_kr_asset_type_defaults_to_kis(self) -> None:
-        self.assertEqual(resolve_broker_mode(symbol="", asset_type="한국주식", kis_enabled=True), "kis_mock")
-        self.assertEqual(self.router.resolve_execution_account_id("", "한국주식"), ACCOUNT_KIS_KR_PAPER)
+    def test_blank_symbol_with_kr_asset_type_does_not_route_to_kis(self) -> None:
+        self.assertEqual(resolve_broker_mode(symbol="", asset_type="한국주식", kis_enabled=True), "sim")
+        self.assertEqual(self.router.resolve_execution_account_id("", "한국주식"), ACCOUNT_SIM_US_EQUITY)
+
+    def test_asset_scope_helper_keeps_kr_runtime_events_on_kis_account(self) -> None:
+        self.assertEqual(account_scope_for_asset_type("한국주식"), ACCOUNT_KIS_KR_PAPER)
+        self.assertEqual(account_scope_for_asset_type("미국주식"), ACCOUNT_SIM_US_EQUITY)
+        self.assertEqual(account_scope_for_asset_type("코인"), ACCOUNT_SIM_CRYPTO)
 
     def test_blank_asset_type_with_non_kr_symbol_stays_sim(self) -> None:
         self.assertEqual(resolve_broker_mode(symbol="AAPL", asset_type="", kis_enabled=True), "sim")

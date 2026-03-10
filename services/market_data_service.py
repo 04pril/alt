@@ -10,6 +10,7 @@ import pandas as pd
 import yfinance as yf
 
 from config.settings import AssetScheduleConfig, RuntimeSettings
+from kr_strategy import latest_completed_bar_close
 from predictor import download_kr_price_data
 
 try:  # optional but recommended
@@ -40,6 +41,9 @@ class MarketDataService:
 
     def now(self, asset_type: str) -> datetime:
         return datetime.now(ZoneInfo(self.schedule(asset_type).timezone))
+
+    def current_time(self, asset_type: str) -> datetime:
+        return self.now(asset_type)
 
     def _country_holidays(self, country: str, year: int):
         if not country or holidays is None:
@@ -109,6 +113,21 @@ class MarketDataService:
         out.index = pd.to_datetime(out.index)
         return out.dropna().sort_index()
 
+    def _trim_incomplete_intraday_bars(self, frame: pd.DataFrame, asset_type: str, timeframe: str) -> pd.DataFrame:
+        if frame.empty or timeframe not in {"15m", "1h"}:
+            return frame
+        schedule = self.schedule(asset_type)
+        bar_minutes = 60 if timeframe == "1h" else 15
+        cutoff = latest_completed_bar_close(schedule, timeframe)
+        if cutoff is None:
+            return frame.iloc[0:0].copy()
+        index = pd.to_datetime(frame.index, errors="coerce")
+        localized = index.tz_localize(schedule.timezone) if getattr(index, "tz", None) is None else index.tz_convert(schedule.timezone)
+        bar_end = localized + pd.Timedelta(minutes=bar_minutes)
+        trimmed = frame.loc[bar_end <= cutoff].copy()
+        trimmed.index = localized[bar_end <= cutoff]
+        return trimmed
+
     def get_bars(self, symbol: str, asset_type: str, timeframe: str, lookback_bars: int) -> pd.DataFrame:
         if asset_type == "한국주식" and timeframe == "1d":
             years = max(2, int(np.ceil(lookback_bars / 252.0)) + 1)
@@ -124,6 +143,7 @@ class MarketDataService:
             threads=False,
         )
         frame = self._normalize_frame(frame)
+        frame = self._trim_incomplete_intraday_bars(frame, asset_type=asset_type, timeframe=timeframe)
         if frame.empty:
             raise ValueError(f"시세 데이터가 비어 있습니다: {symbol} {timeframe}")
         return frame.tail(lookback_bars + 5)

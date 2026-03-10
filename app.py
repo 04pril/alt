@@ -510,7 +510,7 @@ def first_valid_float(*values: object, default: float = float("nan")) -> float:
 
 def default_currency_from_symbol(symbol: str) -> str:
     upper = symbol.upper()
-    if upper.endswith(".KS") or upper.endswith(".KQ"):
+    if upper.endswith(".KS") or upper.endswith(".KQ") or (upper.isdigit() and len(upper) == 6):
         return "KRW"
     if upper.endswith("-USD"):
         return "USD"
@@ -1833,6 +1833,68 @@ def build_recent_order_activity_view(recent_orders: pd.DataFrame) -> pd.DataFram
                 "상태": OPERATIONS_ORDER_STATUS_LABELS.get(status, status or "-"),
                 "사유": OPERATIONS_ORDER_REASON_LABELS.get(reason, reason or "-"),
                 "갱신시각": format_display_timestamp(row.get("updated_at")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _recent_trade_reason_label(notes: object) -> str:
+    text = str(notes or "").strip().lower()
+    if text.startswith("closed_by_"):
+        text = text[len("closed_by_") :]
+    mapping = {
+        "manual_exit": "수동청산",
+        "stop_loss": "손절",
+        "take_profit": "익절",
+        "trailing_stop": "추적손절",
+        "time_stop": "시간청산",
+        "opposite_signal": "반대신호",
+        "score_decay": "점수약화",
+    }
+    return mapping.get(text, text.replace("_", " ").strip() or "-")
+
+
+def _format_holding_duration(started_at: object, closed_at: object) -> str:
+    opened = pd.to_datetime(started_at, errors="coerce", utc=True)
+    closed = pd.to_datetime(closed_at, errors="coerce", utc=True)
+    if pd.isna(opened) or pd.isna(closed):
+        return "-"
+    seconds = max(int((closed - opened).total_seconds()), 0)
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, _ = divmod(remainder, 60)
+    if days > 0:
+        return f"{days}일 {hours}시간"
+    if hours > 0:
+        return f"{hours}시간 {minutes}분"
+    return f"{minutes}분"
+
+
+def build_recent_realized_trades_view(recent_realized_trades: pd.DataFrame) -> pd.DataFrame:
+    if recent_realized_trades.empty or "symbol" not in recent_realized_trades.columns:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    account_labels = {
+        ACCOUNT_KIS_KR_PAPER: "KIS 한국주식 계좌",
+        ACCOUNT_SIM_US_EQUITY: "SIM 미국주식 계좌",
+        ACCOUNT_SIM_CRYPTO: "SIM 코인 계좌",
+    }
+    for _, row in recent_realized_trades.iterrows():
+        symbol = str(row.get("symbol") or "")
+        currency = default_currency_from_symbol(symbol)
+        side = str(row.get("side") or "")
+        rows.append(
+            {
+                "종료시각": format_display_timestamp(row.get("closed_at")),
+                "계좌": account_labels.get(str(row.get("account_id") or ""), str(row.get("account_id") or "-")),
+                "종목": symbol,
+                "자산": str(row.get("asset_type") or ""),
+                "방향": side,
+                "보유기간": _format_holding_duration(row.get("created_at"), row.get("closed_at")),
+                "진입가": format_live_price(first_valid_float(row.get("entry_price")), currency),
+                "청산가": format_live_price(first_valid_float(row.get("mark_price")), currency),
+                "실현손익": format_live_price(first_valid_float(row.get("realized_pnl")), currency),
+                "청산사유": _recent_trade_reason_label(row.get("notes")),
             }
         )
     return pd.DataFrame(rows)
@@ -3194,7 +3256,10 @@ def render_operations_monitor(
     equity_curve = data["equity_curve"]
     equity_curves_by_account = data.get("equity_curves_by_account", {})
     today_execution_events = data.get("today_execution_events", pd.DataFrame())
+    recent_realized_trades = data.get("recent_realized_trades", pd.DataFrame())
     recent_orders = load_monitor_recent_orders(settings, limit=30)
+    kr_strategy_overview = data.get("kr_strategy_overview", pd.DataFrame())
+    kr_strategy_recent_events = data.get("kr_strategy_recent_events", pd.DataFrame())
     noop_breakdown = execution_summary.get("today_noop_breakdown", pd.DataFrame())
 
     sync_rows: Dict[str, Dict[str, Any]] = {}
@@ -3287,12 +3352,18 @@ def render_operations_monitor(
     selected_open_positions = _scoped_frame(open_positions, "account_id")
     selected_open_orders = _scoped_frame(open_orders, "account_id")
     selected_recent_orders = _scoped_frame(recent_orders, "account_id")
+    selected_recent_realized_trades = _scoped_frame(recent_realized_trades, "account_id")
     selected_prediction_report = _scoped_frame(prediction_report, "execution_account_id")
     selected_candidate_scans = _scoped_frame(candidate_scans, "execution_account_id")
     selected_execution_events = _scoped_frame(today_execution_events, "account_id")
     selected_recent_events = _scoped_frame(recent_events, "account_id")
     selected_recent_errors = _scoped_frame(recent_errors, "account_id")
     selected_broker_sync_errors = _scoped_frame(broker_sync_errors, "account_id")
+    selected_kr_strategy_recent_events = (
+        kr_strategy_recent_events.copy()
+        if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER}
+        else pd.DataFrame(columns=list(kr_strategy_recent_events.columns))
+    )
     selected_equity_curve = (
         equity_curve
         if selected_scope_value == "__total__"
@@ -3417,6 +3488,11 @@ def render_operations_monitor(
             f" · 기준 통화 {selected_account.get('currency', '-')}"
             " · RiskEngine과 주문 가능 잔고 판단은 이 계좌만 사용합니다."
         )
+    if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER}:
+        st.caption(
+            f"현재 KR 기본 전략 · {str(runtime_profile.get('kr_default_strategy_label') or runtime_profile.get('kr_default_strategy_id') or '-')}"
+            f" · 활성 전략 {str(runtime_profile.get('kr_active_strategy_labels') or runtime_profile.get('kr_active_strategies') or '-')}"
+        )
 
     hero_cols = st.columns([1.15, 1.0], gap="large")
     with hero_cols[0]:
@@ -3518,6 +3594,50 @@ def render_operations_monitor(
                 unsafe_allow_html=True,
             )
 
+    if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER} and not kr_strategy_overview.empty:
+        st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.caption("KR 전략 상태")
+            st.caption("기본 추천 전략은 1시간봉이며, 15분 전략은 experimental/off-by-default 입니다.")
+            strategy_view = kr_strategy_overview.rename(
+                columns={
+                    "label": "전략",
+                    "timeframe": "타임프레임",
+                    "enabled": "활성",
+                    "experimental": "실험",
+                    "today_candidate_count": "후보",
+                    "today_entry_allowed_count": "허용",
+                    "today_entry_rejected_count": "거절",
+                    "today_submitted_count": "제출",
+                    "today_filled_count": "체결",
+                    "today_noop_count": "미실행",
+                    "open_positions": "보유 포지션",
+                    "pending_orders": "대기 주문",
+                    "today_noop_top_reason": "주요 미실행 사유",
+                    "today_reject_top_reason": "주요 거절 사유",
+                    "last_event_at": "최근 이벤트",
+                }
+            )
+            strategy_cols = [
+                "전략",
+                "타임프레임",
+                "활성",
+                "실험",
+                "후보",
+                "허용",
+                "거절",
+                "제출",
+                "체결",
+                "미실행",
+                "보유 포지션",
+                "대기 주문",
+                "주요 미실행 사유",
+                "주요 거절 사유",
+                "최근 이벤트",
+            ]
+            strategy_cols = [column for column in strategy_cols if column in strategy_view.columns]
+            st.dataframe(build_monitor_table_view(strategy_view[strategy_cols]), width="stretch", hide_index=True)
+
     st.markdown('<div class="alt-ops-section-gap"></div>', unsafe_allow_html=True)
 
     primary_metrics = st.columns(3, gap="small")
@@ -3600,8 +3720,8 @@ def render_operations_monitor(
             st.dataframe(build_monitor_table_view(job_health), width="stretch", hide_index=True)
 
     with tab_positions:
-        if selected_open_positions.empty and selected_open_orders.empty:
-            st.caption("보유 포지션이나 대기 주문이 없습니다.")
+        if selected_open_positions.empty and selected_open_orders.empty and selected_recent_realized_trades.empty:
+            st.caption("보유 포지션, 대기 주문, 최근 거래 손익 기록이 없습니다.")
         else:
             if not selected_open_positions.empty:
                 st.caption("보유 포지션")
@@ -3609,6 +3729,13 @@ def render_operations_monitor(
             if not selected_open_orders.empty:
                 st.caption("대기 주문")
                 st.dataframe(build_monitor_table_view(selected_open_orders), width="stretch", hide_index=True)
+            if not selected_recent_realized_trades.empty:
+                st.caption("최근 거래 손익")
+                st.dataframe(
+                    build_recent_realized_trades_view(selected_recent_realized_trades.head(30)),
+                    width="stretch",
+                    hide_index=True,
+                )
 
     with tab_predictions:
         if selected_prediction_report.empty:
@@ -3623,10 +3750,43 @@ def render_operations_monitor(
             st.dataframe(build_monitor_table_view(selected_candidate_scans, limit=200), width="stretch", hide_index=True)
 
     with tab_execution:
+        if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER} and not kr_strategy_overview.empty:
+            st.caption("KR 전략별 집계")
+            strategy_exec_view = kr_strategy_overview.rename(
+                columns={
+                    "label": "전략",
+                    "today_candidate_count": "후보",
+                    "today_entry_allowed_count": "허용",
+                    "today_entry_rejected_count": "거절",
+                    "today_submit_requested_count": "제출 요청",
+                    "today_submitted_count": "제출",
+                    "today_filled_count": "체결",
+                    "today_noop_count": "미실행",
+                    "open_positions": "보유 포지션",
+                    "pending_orders": "대기 주문",
+                }
+            )
+            strategy_exec_cols = [
+                "전략",
+                "후보",
+                "허용",
+                "거절",
+                "제출 요청",
+                "제출",
+                "체결",
+                "미실행",
+                "보유 포지션",
+                "대기 주문",
+            ]
+            strategy_exec_cols = [column for column in strategy_exec_cols if column in strategy_exec_view.columns]
+            st.dataframe(build_monitor_table_view(strategy_exec_view[strategy_exec_cols]), width="stretch", hide_index=True)
         if not noop_breakdown.empty:
             noop_view = noop_breakdown.rename(columns={"reason": "사유", "count": "건수"})
             st.caption("미실행 사유 요약")
             st.dataframe(noop_view, width="stretch", hide_index=True)
+        if selected_scope_value in {"__total__", ACCOUNT_KIS_KR_PAPER} and not selected_kr_strategy_recent_events.empty:
+            st.caption("KR 전략 최근 이벤트")
+            st.dataframe(build_monitor_table_view(selected_kr_strategy_recent_events, limit=80), width="stretch", hide_index=True)
         if selected_execution_events.empty:
             st.caption("오늘 실행 이벤트가 없습니다.")
         else:
@@ -5863,6 +6023,7 @@ def _render_beta_monitor_clone_page() -> None:
     theme_mode = get_active_theme_mode(_beta_query_value("beta_theme", ""))
     current_candidate_tab = _beta_query_value("beta_cand_tab", "")
     jobs_expanded = _beta_query_value("beta_jobs", "") == "all"
+    signals_expanded = _beta_query_value("beta_signals", "") == "all"
     repository = TradingRepository(settings.storage.db_path)
     repository.initialize()
     st.markdown(
@@ -5937,6 +6098,7 @@ def _render_beta_monitor_clone_page() -> None:
         krx_name_map=load_krx_name_map(),
         current_candidate_tab=current_candidate_tab,
         jobs_expanded=jobs_expanded,
+        signals_expanded=signals_expanded,
     )
 
 def render_dashboard_page() -> None:

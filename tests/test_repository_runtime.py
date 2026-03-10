@@ -5,7 +5,7 @@ import threading
 import time
 import unittest
 
-from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_LEGACY_MIXED, ACCOUNT_SIM_US_EQUITY
 from storage.models import AccountSnapshotRecord, OrderRecord, PositionRecord
 from storage.repository import TradingRepository, make_id, utc_now_iso
 
@@ -380,6 +380,113 @@ class RepositoryRuntimeTest(unittest.TestCase):
         row = self.repo.get_job_run(canonical_id)
         self.assertIsNotNone(row)
         self.assertEqual(row["status"], "completed")
+
+    def test_generic_scheduler_failure_event_does_not_get_forced_account_id(self) -> None:
+        with self.repo.connect() as conn:
+            conn.execute(
+                "INSERT INTO system_events(event_id, created_at, level, component, event_type, message, details_json, account_id) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "evt_scheduler_generic",
+                    "2026-03-08T10:00:00Z",
+                    "ERROR",
+                    "scheduler",
+                    "job_failed",
+                    "broker_account_sync failed",
+                    '{"error":"dns failed"}',
+                    ACCOUNT_SIM_US_EQUITY,
+                ),
+            )
+            self.repo._migrate_schema(conn)
+
+        row = self.repo.latest_system_event("job_failed")
+        self.assertIsNotNone(row)
+        self.assertEqual(str(row.get("account_id") or ""), "")
+
+    def test_new_snapshot_write_does_not_fall_back_to_legacy_mixed(self) -> None:
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_new_runtime",
+                created_at="2026-03-08T10:05:00Z",
+                cash=100.0,
+                equity=100.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+                raw_json="{}",
+                account_id="",
+            )
+        )
+
+        row = self.repo.latest_account_snapshot()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(str(row.get("account_id") or ""), ACCOUNT_SIM_LEGACY_MIXED)
+
+    def test_recent_closed_positions_orders_by_closed_at_and_filters_account(self) -> None:
+        base = {
+            "prediction_id": None,
+            "timeframe": "1d",
+            "quantity": 0,
+            "stop_loss": 0.0,
+            "take_profit": 0.0,
+            "trailing_stop": 0.0,
+            "highest_price": 0.0,
+            "lowest_price": 0.0,
+            "unrealized_pnl": 0.0,
+            "expected_risk": 0.01,
+            "exposure_value": 0.0,
+            "max_holding_until": "2026-03-09T00:00:00Z",
+            "strategy_version": "s1",
+            "cooldown_until": None,
+        }
+        self.repo.upsert_position(
+            PositionRecord(
+                position_id="pos_us_old",
+                created_at="2026-03-08T09:00:00Z",
+                updated_at="2026-03-08T10:00:00Z",
+                closed_at="2026-03-08T10:00:00Z",
+                symbol="AAPL",
+                asset_type="미국주식",
+                side="LONG",
+                status="closed",
+                entry_price=100.0,
+                mark_price=102.0,
+                realized_pnl=2.0,
+                notes="closed_by_take_profit",
+                account_id=ACCOUNT_SIM_US_EQUITY,
+                **base,
+            )
+        )
+        self.repo.upsert_position(
+            PositionRecord(
+                position_id="pos_crypto_new",
+                created_at="2026-03-08T09:10:00Z",
+                updated_at="2026-03-08T10:30:00Z",
+                closed_at="2026-03-08T10:30:00Z",
+                symbol="BTC-USD",
+                asset_type="코인",
+                side="SHORT",
+                status="closed",
+                entry_price=100.0,
+                mark_price=98.0,
+                realized_pnl=2.0,
+                notes="closed_by_score_decay",
+                account_id=ACCOUNT_SIM_CRYPTO,
+                **base,
+            )
+        )
+
+        all_rows = self.repo.recent_closed_positions(limit=10)
+        us_rows = self.repo.recent_closed_positions(limit=10, account_id=ACCOUNT_SIM_US_EQUITY)
+
+        self.assertEqual(list(all_rows["position_id"]), ["pos_crypto_new", "pos_us_old"])
+        self.assertEqual(list(us_rows["position_id"]), ["pos_us_old"])
 
     def test_begin_job_run_retry_waits_for_backoff_and_preserves_retry_count(self) -> None:
         lease = self.repo.begin_job_run(

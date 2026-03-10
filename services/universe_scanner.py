@@ -6,6 +6,7 @@ from typing import Dict, List
 import numpy as np
 
 from config.settings import RuntimeSettings
+from kr_strategy import get_kr_strategy, strategy_schedule
 from services.market_data_service import MarketDataService
 from services.signal_engine import SignalDecision, SignalEngine
 from runtime_accounts import resolve_execution_account
@@ -36,13 +37,36 @@ class UniverseScanner:
                 seen.add(symbol)
         return ordered
 
+    def _passes_intraday_liquidity(self, *, metrics: Dict[str, float], bars, strategy_id: str | None) -> tuple[bool, str]:
+        strategy = get_kr_strategy(self.settings, strategy_id or "")
+        if strategy is None:
+            return True, "ok"
+        liquidity_score = float(metrics.get("liquidity_score", 0.0) or 0.0)
+        if liquidity_score < float(strategy.liquidity_min_score):
+            return False, "low_intraday_liquidity"
+        closes = np.asarray(bars.get("Close"), dtype=float)
+        volumes = np.asarray(bars.get("Volume"), dtype=float)
+        if closes.size and volumes.size:
+            median_value = float(np.nanmedian(closes[-min(len(closes), 40):] * volumes[-min(len(volumes), 40):]))
+            if np.isfinite(median_value) and median_value < float(strategy.liquidity_min_median_value):
+                return False, "low_intraday_turnover"
+        return True, "ok"
+
     def scan_asset(self, asset_type: str, touch=None) -> List[CandidateScanRecord]:
-        schedule = self.settings.asset_schedules[asset_type]
+        return self._scan(asset_type=asset_type, strategy_id=None, touch=touch)
+
+    def scan_strategy(self, strategy_id: str, touch=None) -> List[CandidateScanRecord]:
+        return self._scan(asset_type="한국주식", strategy_id=strategy_id, touch=touch)
+
+    def _scan(self, *, asset_type: str, strategy_id: str | None, touch=None) -> List[CandidateScanRecord]:
+        schedule = strategy_schedule(self.settings, strategy_id) if strategy_id else self.settings.asset_schedules[asset_type]
+        strategy = get_kr_strategy(self.settings, strategy_id or "") if strategy_id else None
+        strategy_version = str(strategy.strategy_id if strategy is not None else self.settings.strategy.strategy_version)
         candidates: List[CandidateScanRecord] = []
         for symbol in self._universe(asset_type):
             execution_account_id = resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
             if callable(touch):
-                touch("scan_symbol", {"asset_type": asset_type, "symbol": symbol})
+                touch("scan_symbol", {"asset_type": asset_type, "symbol": symbol, "strategy_version": strategy_version})
             scan_id = make_id("scan")
             created_at = utc_now_iso()
             try:
@@ -79,8 +103,38 @@ class UniverseScanner:
                             signal="FLAT",
                             model_version="",
                             feature_version="",
-                            strategy_version=self.settings.strategy.strategy_version,
+                            strategy_version=strategy_version,
                             raw_json=json.dumps(metrics, ensure_ascii=False),
+                            execution_account_id=execution_account_id,
+                        )
+                    )
+                    continue
+                passes_liquidity, liquidity_reason = self._passes_intraday_liquidity(metrics=metrics, bars=bars, strategy_id=strategy_id)
+                if not passes_liquidity:
+                    candidates.append(
+                        CandidateScanRecord(
+                            scan_id=scan_id,
+                            created_at=created_at,
+                            symbol=symbol,
+                            asset_type=asset_type,
+                            timeframe=schedule.timeframe,
+                            score=-998.0,
+                            rank=9998,
+                            status="rejected",
+                            reason=liquidity_reason,
+                            expected_return=np.nan,
+                            expected_risk=np.nan,
+                            confidence=0.0,
+                            threshold=np.nan,
+                            volatility=float(metrics.get("volatility", np.nan)),
+                            liquidity_score=float(metrics.get("liquidity_score", 0.0)),
+                            cost_bps=float(strategy.round_trip_cost_bps if strategy is not None else self.settings.strategy.round_trip_cost_bps),
+                            recent_performance=0.0,
+                            signal="FLAT",
+                            model_version="",
+                            feature_version="",
+                            strategy_version=strategy_version,
+                            raw_json=json.dumps({**metrics, "strategy_version": strategy_version}, ensure_ascii=False),
                             execution_account_id=execution_account_id,
                         )
                     )
@@ -89,9 +143,10 @@ class UniverseScanner:
                     symbol=symbol,
                     asset_type=asset_type,
                     timeframe=schedule.timeframe,
+                    strategy_id=strategy_id,
                     bars=bars,
                     scan_id=scan_id,
-                    cost_bps=self.settings.strategy.round_trip_cost_bps,
+                    cost_bps=float(strategy.round_trip_cost_bps if strategy is not None else self.settings.strategy.round_trip_cost_bps),
                     volatility=float(metrics.get("volatility", np.nan)),
                 )
                 latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe, account_id=execution_account_id)
@@ -101,6 +156,9 @@ class UniverseScanner:
                     asset_type=asset_type,
                     account_id=execution_account_id,
                 )
+                if strategy is not None and latest_position.empty:
+                    latest_position = self.repository.open_positions(account_id=execution_account_id)
+                    latest_position = latest_position.loc[latest_position["symbol"].astype(str) == str(symbol)].head(1)
                 is_holding = int(
                     (not latest_position.empty and str(latest_position.iloc[0].get("status")) == "open")
                     or not pending_entry.empty
@@ -123,7 +181,7 @@ class UniverseScanner:
                         threshold=float(signal.threshold),
                         volatility=float(metrics.get("volatility", np.nan)),
                         liquidity_score=float(metrics.get("liquidity_score", 0.0)),
-                        cost_bps=self.settings.strategy.round_trip_cost_bps,
+                        cost_bps=float(strategy.round_trip_cost_bps if strategy is not None else self.settings.strategy.round_trip_cost_bps),
                         recent_performance=self.repository.recent_prediction_performance(symbol=symbol)["paper_trade_return"],
                         signal=signal.signal,
                         model_version=signal.model_version,
@@ -136,6 +194,12 @@ class UniverseScanner:
                                 "bars": int(metrics.get("bars", 0)),
                                 "prediction_id": signal.prediction_id,
                                 "market_phase": self.market_data_service.market_phase(asset_type),
+                                "strategy_version": signal.strategy_version,
+                                "decision_horizon_bars": int(signal.decision_horizon_bars),
+                                "primary_target": signal.primary_target_type,
+                                "secondary_target": signal.secondary_target_type,
+                                "analysis_target": signal.analysis_target_type,
+                                "experimental": bool(signal.experimental),
                             },
                             ensure_ascii=False,
                         ),
@@ -160,12 +224,12 @@ class UniverseScanner:
                         threshold=np.nan,
                         volatility=np.nan,
                         liquidity_score=0.0,
-                        cost_bps=self.settings.strategy.round_trip_cost_bps,
+                        cost_bps=float(strategy.round_trip_cost_bps if strategy is not None else self.settings.strategy.round_trip_cost_bps),
                         recent_performance=0.0,
                         signal="FLAT",
                         model_version="",
                         feature_version="",
-                        strategy_version=self.settings.strategy.strategy_version,
+                        strategy_version=strategy_version,
                         raw_json="{}",
                         execution_account_id=execution_account_id,
                     )

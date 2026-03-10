@@ -16,6 +16,7 @@ KR-only routing rule:
 
 - `한국주식` + KR symbol (`.KS` / `.KQ`) or bare 6-digit KR stock code only: `kis_mock`
 - `미국주식` and `코인`: always `sim`
+- blank symbol never routes to KIS; asset-only runtime/monitoring events use an explicit asset-scope helper instead of execution routing
 - if `asset_type` is blank or ambiguous, KR suffix / bare 6-digit KR code is the fallback safety check
 - non-KR symbols never route to KIS, even if a wrong `한국주식` label is passed in
 
@@ -44,6 +45,9 @@ Execution accounts:
 - `kis_kr_paper`
 - `sim_us_equity`
 - `sim_crypto`
+- `sim_legacy_mixed`
+  - migration/backfill-only legacy bucket for very old mixed sim rows without asset hints
+  - not used by new runtime writes
 
 Account policy:
 
@@ -114,7 +118,31 @@ These jobs are:
 
 ## KR Execution Path
 
-KR daily entries keep pre-close gating. The system does not submit KR daily entry orders outside the allowed pre-close window unless a separate reservation policy is added later.
+KR execution now has an explicit strategy layer instead of treating all KR trades as one schedule.
+
+KR strategies:
+
+- `kr_daily_preclose_v1`
+  - legacy daily strategy
+  - pre-close gated
+  - disabled by default
+- `kr_intraday_1h_v1`
+  - current recommended default KR strategy
+  - `1h` bars
+  - KIS mock only
+- `kr_intraday_15m_v1`
+  - separate experimental KR intraday strategy
+  - `15m` bars
+  - disabled by default
+  - complete-bar only, opening bar blocked, no overnight, session flatten near the close
+
+The `15m` path is intentionally a separate strategy instead of a timeframe toggle on the `1h` strategy. It has its own target horizon, feature profile, gating window, conflict rules, and monitoring rows.
+
+Current default KR execution policy:
+
+- recommended default: `kr_intraday_1h_v1`
+- experimental opt-in only: `kr_intraday_15m_v1`
+- legacy only: `kr_daily_preclose_v1`
 
 Current KR execution order:
 
@@ -128,6 +156,15 @@ Current KR execution order:
    - websocket execution event if available
    - REST daily order/fill query
    - holdings/account fallback only as last resort
+
+KR strategy rules:
+
+- only `kis_kr_paper` is allowed as the execution account
+- `kr_intraday_15m_v1` uses completed `15m` bars only
+- `09:00~09:15` opening bar is blocked for the `15m` strategy
+- new `15m` entries are allowed only from `09:15` to `14:45`
+- intraday KR strategies flatten between `15:15` and `15:20`
+- duplicate pending entry, active strategy conflict, and cross-strategy same-symbol overlap are blocked inside the same KIS account
 
 Source-of-truth priorities for KR mock execution:
 
@@ -189,6 +226,12 @@ Gate tuning is tracked as explicit runtime profiles instead of editing the embed
 - `balanced`: recommended default for live paper trading; relaxes stock entry gates enough to reduce `outside_preclose_window`, `expected_return_too_low`, and `confidence_too_low` pressure without changing the core loss-budget controls
 - `active`: higher-submission experimental profile; keeps the same drawdown and daily-loss ceilings but further lowers stock entry thresholds, expands daily entry capacity, and runs US equities on a `15m` model / `15분` scan cadence
 
+KR strategy policy inside all profiles:
+
+- default KR strategy id: `kr_intraday_1h_v1`
+- `kr_intraday_15m_v1`: experimental, off-by-default
+- `kr_daily_preclose_v1`: legacy fallback, disabled unless explicitly opted in
+
 This round keeps the score formula unchanged. Only entry gates and pre-close cadence windows are tuned.
 
 When trades are too sparse, inspect these breakdowns first:
@@ -202,6 +245,7 @@ When trades are too sparse, inspect these breakdowns first:
 - `max_daily_entries`
 
 The worker writes the loaded runtime profile name/source into control flags, and the operations monitor reads that value back so operators can verify which profile is active. The recommended default profile is `balanced`.
+This workspace may still choose to run `active` intentionally, but that should be treated as an opt-in aggressive profile rather than the recommended default.
 
 ## Monitoring Read Model
 
@@ -232,6 +276,12 @@ It exposes:
 - pending submitted KR orders
 - broker rejects today
 - last websocket execution timestamp
+- `kr_strategy_overview`
+  - strategy id / label / timeframe / enabled / experimental
+  - today candidate / allowed / rejected / submitted / filled / noop counts
+  - per-strategy open positions / pending orders
+  - top noop / reject reason
+  - recent strategy event timestamps
 
 ## Accounting Definitions
 
@@ -295,8 +345,10 @@ python -m unittest discover -s tests -v
 Execution assurance coverage includes:
 
 - pending entry duplicate blocking
-- KR market closed / outside pre-close / insufficient buying power rejection
+- KR market closed / outside intraday entry window / insufficient buying power rejection
 - KR submit -> acknowledged -> pending_fill -> filled / rejected / cancelled
+- KR strategy conflict blocking across `kr_daily_preclose_v1`, `kr_intraday_1h_v1`, `kr_intraday_15m_v1`
+- KR `15m` complete-bar gate / opening bar block / session flatten
 - websocket execution event state transition
 - REST reconcile fallback when websocket is absent
 - scheduler retry/backoff and lease refresh
@@ -307,9 +359,12 @@ Execution assurance coverage includes:
 - KR websocket execution handling is implemented as an ingest path, but a persistent websocket manager is not auto-started by the worker yet.
 - If websocket events are unavailable, KR execution falls back to REST daily order/fill reconcile.
 - Reservation orders are not wired into the worker yet.
-- KR daily pre-close gating is still schedule-based, not exchange-calendar-perfect.
+- KR daily pre-close and intraday flatten windows are still schedule-based, not exchange-calendar-perfect.
+- KR intraday history currently depends on the configured market data provider for `1h` / `15m` bars and trims incomplete bars locally before signal generation.
 - US equities and crypto still use the sim broker path.
 - legacy rows without `account_id` are backfilled during migration, but very old mixed sim snapshots can only be mapped conservatively to `sim_legacy_mixed` when asset type is unavailable.
+- `sim_legacy_mixed` is migration/backfill-only and must not appear in new runtime writes.
+- beta monitor depends on Streamlit DOM selectors for header/toolbar suppression and still needs visual regression checks after Streamlit upgrades.
 
 ## Final Merge Note
 

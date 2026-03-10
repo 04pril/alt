@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from kr_strategy import strategy_schedule
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -93,6 +95,94 @@ class RiskEngineTest(unittest.TestCase):
             decision = engine.evaluate_entry(self._build_signal(), correlation_matrix=pd.DataFrame(), market_is_open=True)
             self.assertFalse(decision.allowed)
             self.assertEqual(decision.reason, "duplicate_pending_entry")
+
+    def test_kr_strategy_conflict_blocks_cross_strategy_pending_entry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.insert_order(
+                OrderRecord(
+                    order_id="ord_kr_pending",
+                    created_at="2026-03-08T09:00:00Z",
+                    updated_at="2026-03-08T09:00:00Z",
+                    prediction_id="pred-existing",
+                    scan_id="scan-existing",
+                    symbol="005930.KS",
+                    asset_type="한국주식",
+                    timeframe=strategy_schedule(settings, "kr_intraday_1h_v1").timeframe,
+                    side="buy",
+                    order_type="market",
+                    requested_qty=1,
+                    filled_qty=0,
+                    remaining_qty=1,
+                    requested_price=70000.0,
+                    limit_price=0.0,
+                    status="submitted",
+                    fees_estimate=0.0,
+                    slippage_bps=0.0,
+                    retry_count=0,
+                    strategy_version="kr_intraday_1h_v1",
+                    reason="entry",
+                    raw_json='{"expected_risk": 0.01}',
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            signal = replace(
+                self._build_signal(symbol="005930.KS", asset_type="한국주식", timeframe="15m"),
+                strategy_version="kr_intraday_15m_v1",
+            )
+            decision = engine.evaluate_entry(signal, correlation_matrix=pd.DataFrame(), market_is_open=True)
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "kr_strategy_conflict_pending")
+
+    def test_kr_strategy_conflict_blocks_cross_strategy_open_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            repo.upsert_position(
+                PositionRecord(
+                    position_id="pos_kr_open",
+                    created_at="2026-03-08T09:00:00Z",
+                    updated_at="2026-03-08T09:05:00Z",
+                    closed_at=None,
+                    prediction_id="pred-existing",
+                    symbol="005930.KS",
+                    asset_type="한국주식",
+                    timeframe=strategy_schedule(settings, "kr_intraday_1h_v1").timeframe,
+                    side="LONG",
+                    status="open",
+                    quantity=1,
+                    entry_price=70000.0,
+                    mark_price=70500.0,
+                    stop_loss=68000.0,
+                    take_profit=73000.0,
+                    trailing_stop=69000.0,
+                    highest_price=70500.0,
+                    lowest_price=70000.0,
+                    unrealized_pnl=500.0,
+                    realized_pnl=0.0,
+                    expected_risk=0.01,
+                    exposure_value=70500.0,
+                    max_holding_until="2026-03-08T12:00:00Z",
+                    strategy_version="kr_intraday_1h_v1",
+                    cooldown_until=None,
+                    notes="open",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            engine = RiskEngine(settings, repo)
+            signal = replace(
+                self._build_signal(symbol="005930.KS", asset_type="한국주식", timeframe="15m"),
+                strategy_version="kr_intraday_15m_v1",
+            )
+            decision = engine.evaluate_entry(signal, correlation_matrix=pd.DataFrame(), market_is_open=True)
+            self.assertFalse(decision.allowed)
+            self.assertEqual(decision.reason, "kr_strategy_conflict_active")
 
     def test_partially_filled_entry_blocks_until_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

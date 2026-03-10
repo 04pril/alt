@@ -61,6 +61,19 @@ class ProfileSmokeTest(unittest.TestCase):
             monitoring = result["monitoring"]
             self.assertEqual(monitoring["runtime_profile"]["name"], profile_name)
             self.assertTrue(str(monitoring["runtime_profile"]["source"]).endswith(f"{profile_name}.json"))
+        self.assertEqual(self.by_name["balanced"]["monitoring"]["runtime_profile"]["mode"], "recommended")
+        self.assertEqual(self.by_name["balanced"]["monitoring"]["runtime_profile"]["recommended_default"], "true")
+        self.assertEqual(self.by_name["active"]["monitoring"]["runtime_profile"]["mode"], "experimental")
+        self.assertEqual(self.by_name["active"]["monitoring"]["runtime_profile"]["experimental"], "true")
+        self.assertEqual(self.by_name["balanced"]["monitoring"]["runtime_profile"]["kr_default_strategy_id"], "kr_intraday_1h_v1")
+        self.assertIn("kr_intraday_1h_v1", self.by_name["balanced"]["monitoring"]["runtime_profile"]["kr_active_strategies"])
+
+    def test_kr_default_strategy_remains_1h_and_15m_is_opt_in(self) -> None:
+        for result in self.by_name.values():
+            self.assertEqual(result["kr_strategy"]["default_strategy_id"], "kr_intraday_1h_v1")
+            self.assertIn("kr_intraday_1h_v1", result["kr_strategy"]["active_strategy_ids"])
+            self.assertNotIn("kr_intraday_15m_v1", result["kr_strategy"]["active_strategy_ids"])
+            self.assertFalse(bool(result["kr_strategy"]["experimental_15m_enabled"]))
 
 
 if __name__ == "__main__":

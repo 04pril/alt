@@ -7,7 +7,7 @@ import unittest
 import pandas as pd
 
 from config.settings import RuntimeSettings
-from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO
+from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_LEGACY_MIXED, ACCOUNT_SIM_US_EQUITY
 from services.market_data_service import MarketQuote
 from services.paper_broker import PaperBroker
 from services.signal_engine import SignalDecision
@@ -274,6 +274,27 @@ class PaperBrokerTest(unittest.TestCase):
 
         self.assertIsNotNone(order)
         self.assertEqual(str(order["account_id"]), ACCOUNT_SIM_CRYPTO)
+
+    def test_submit_entry_order_records_us_equity_account_id(self) -> None:
+        signal = SignalDecision(
+            **{
+                **self._signal().__dict__,
+                "symbol": "AAPL",
+                "asset_type": "미국주식",
+                "timeframe": "15m",
+            }
+        )
+        order_id = self.broker.submit_entry_order(signal, quantity=1)
+        order = self.repo.get_order(order_id)
+
+        self.assertIsNotNone(order)
+        self.assertEqual(str(order["account_id"]), ACCOUNT_SIM_US_EQUITY)
+
+    def test_snapshot_account_never_creates_legacy_mixed_runtime_rows(self) -> None:
+        self.broker.snapshot_account()
+        snapshots = self.repo.load_account_snapshots(limit=20)
+        self.assertFalse(snapshots.empty)
+        self.assertNotIn(ACCOUNT_SIM_LEGACY_MIXED, set(snapshots["account_id"].astype(str)))
 
     def test_allow_partial_fills_false_keeps_order_open(self) -> None:
         self.settings.broker.allow_partial_fills = False

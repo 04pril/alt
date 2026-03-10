@@ -12,7 +12,7 @@ from monitoring.dashboard_hooks import (
     load_monitor_open_positions,
 )
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
-from storage.models import AccountSnapshotRecord
+from storage.models import AccountSnapshotRecord, PositionRecord
 from storage.repository import TradingRepository
 
 
@@ -58,6 +58,9 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertIn("kis_runtime", data)
             self.assertIn("accounts_overview", data)
             self.assertIn("total_portfolio_overview", data)
+            self.assertIn("recent_realized_trades", data)
+            self.assertIn("kr_strategy_overview", data)
+            self.assertIn("kr_strategy_recent_events", data)
 
     def test_asset_overview_contains_expected_broker_modes(self) -> None:
         settings = RuntimeSettings()
@@ -150,6 +153,11 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(data["kis_runtime"]["last_broker_order_sync"], "2026-03-09T06:20:00Z")
             self.assertEqual(data["runtime_profile"]["name"], "balanced")
             self.assertEqual(data["runtime_profile"]["source"], "config/runtime_settings.balanced.json")
+            self.assertEqual(data["runtime_profile"]["mode"], "recommended")
+            self.assertEqual(data["runtime_profile"]["recommended_default"], "true")
+            self.assertEqual(data["runtime_profile"]["experimental"], "false")
+            self.assertEqual(data["runtime_profile"]["kr_default_strategy_id"], "kr_intraday_1h_v1")
+            self.assertIn("kr_intraday_1h_v1", data["runtime_profile"]["kr_active_strategies"])
 
     def test_broker_sync_errors_filters_out_healthy_info_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -272,6 +280,37 @@ class DashboardHooksTest(unittest.TestCase):
             ]
             for row in rows:
                 repo.insert_account_snapshot(row)
+            repo.upsert_position(
+                PositionRecord(
+                    position_id="pos_us_closed",
+                    created_at="2026-03-09T08:00:00Z",
+                    updated_at="2026-03-09T09:05:00Z",
+                    closed_at="2026-03-09T09:05:00Z",
+                    prediction_id=None,
+                    symbol="AAPL",
+                    asset_type="미국주식",
+                    timeframe="1d",
+                    side="LONG",
+                    status="closed",
+                    quantity=0,
+                    entry_price=180.0,
+                    mark_price=185.0,
+                    stop_loss=0.0,
+                    take_profit=0.0,
+                    trailing_stop=0.0,
+                    highest_price=185.0,
+                    lowest_price=180.0,
+                    unrealized_pnl=0.0,
+                    realized_pnl=5.0,
+                    expected_risk=0.01,
+                    exposure_value=0.0,
+                    max_holding_until="2026-03-10T00:00:00Z",
+                    strategy_version="test",
+                    cooldown_until=None,
+                    notes="closed_by_take_profit",
+                    account_id=ACCOUNT_SIM_US_EQUITY,
+                )
+            )
 
             data = load_dashboard_data(settings)
             accounts = data["accounts_overview"]
@@ -286,6 +325,13 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertTrue(str(total["display_currency"]) in {"", "KRW", "USD"})
             self.assertEqual(total["equity_by_currency"]["KRW"], 30_500_000.0)
             self.assertEqual(total["equity_by_currency"]["USD"], 15_750.0)
+            self.assertEqual(str(data["recent_realized_trades"].iloc[0]["position_id"]), "pos_us_closed")
+            self.assertFalse(data["kr_strategy_overview"].empty)
+            strategy_ids = set(data["kr_strategy_overview"]["strategy_id"].astype(str))
+            self.assertEqual(strategy_ids, {"kr_daily_preclose_v1", "kr_intraday_1h_v1", "kr_intraday_15m_v1"})
+            intraday_15m = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1"].iloc[0]
+            self.assertFalse(bool(intraday_15m["enabled"]))
+            self.assertTrue(bool(intraday_15m["experimental"]))
 
 
 if __name__ == "__main__":

@@ -92,7 +92,7 @@ def normalize_symbol(asset_type: str, raw_symbol: str, korea_market: str = "KOSP
 
 def is_korean_stock_symbol(symbol: str) -> bool:
     upper = symbol.strip().upper()
-    return upper.endswith(".KS") or upper.endswith(".KQ")
+    return upper.endswith(".KS") or upper.endswith(".KQ") or (upper.isdigit() and len(upper) == 6)
 
 
 def extract_korean_stock_code(symbol: str) -> str:
@@ -214,7 +214,7 @@ def _prepare_ohlcv(price_data: pd.DataFrame) -> pd.DataFrame:
     return raw
 
 
-def _build_feature_frame(raw: pd.DataFrame, lags: int) -> pd.DataFrame:
+def _build_default_feature_frame(raw: pd.DataFrame, lags: int) -> pd.DataFrame:
     close = raw["close"]
     open_ = raw["open"]
     high = raw["high"]
@@ -260,9 +260,83 @@ def _build_feature_frame(raw: pd.DataFrame, lags: int) -> pd.DataFrame:
     return feat
 
 
-def _build_dataset(price_data: pd.DataFrame, lags: int, target_mode: str) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
+def _intraday_localized_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    if getattr(index, "tz", None) is None:
+        return index.tz_localize("Asia/Seoul")
+    return index.tz_convert("Asia/Seoul")
+
+
+def _build_intraday_feature_frame(raw: pd.DataFrame, lags: int) -> pd.DataFrame:
+    close = raw["close"].astype(float)
+    open_ = raw["open"].astype(float)
+    high = raw["high"].astype(float)
+    low = raw["low"].astype(float)
+    volume = raw["volume"].astype(float)
+    localized_index = _intraday_localized_index(pd.DatetimeIndex(raw.index))
+    session_key = pd.Series(localized_index.date, index=raw.index)
+
+    feat = pd.DataFrame(index=raw.index)
+    feat["open"] = open_
+    feat["high"] = high
+    feat["low"] = low
+    feat["close"] = close
+    feat["volume"] = volume
+    feat["ret_1"] = close.pct_change()
+    feat["ret_2"] = close.pct_change(2)
+    feat["ret_3"] = close.pct_change(3)
+    feat["ret_4"] = close.pct_change(4)
+    feat["ema_3"] = close.ewm(span=3, adjust=False).mean()
+    feat["ema_8"] = close.ewm(span=8, adjust=False).mean()
+    feat["ema_16"] = close.ewm(span=16, adjust=False).mean()
+    feat["rsi_6"] = _compute_rsi(close, 6)
+    feat["rsi_12"] = _compute_rsi(close, 12)
+    feat["atr_14"] = _safe_series_div((high - low).rolling(14).mean(), close)
+
+    typical = (high + low + close) / 3.0
+    pv = typical * volume
+    cum_pv = pv.groupby(session_key).cumsum()
+    cum_vol = volume.groupby(session_key).cumsum().replace(0.0, np.nan)
+    feat["vwap"] = cum_pv / cum_vol
+    feat["vwap_dev"] = _safe_series_div(close - feat["vwap"], feat["vwap"])
+
+    opening_high = high.groupby(session_key).transform("first")
+    opening_low = low.groupby(session_key).transform("first")
+    feat["opening_range_breakout"] = _safe_series_div(close - opening_high, opening_high)
+    feat["opening_range_breakdown"] = _safe_series_div(close - opening_low, opening_low)
+
+    session_high = high.groupby(session_key).cummax()
+    session_low = low.groupby(session_key).cummin()
+    feat["distance_to_session_high"] = _safe_series_div(close - session_high, session_high)
+    feat["distance_to_session_low"] = _safe_series_div(close - session_low, session_low)
+
+    feat["volume_ratio_recent"] = _safe_series_div(volume, volume.rolling(12).mean())
+    feat["intraday_vol_regime"] = feat["ret_1"].rolling(12).std() / feat["ret_1"].rolling(48).std().replace(0.0, np.nan)
+
+    prior_session_close = close.groupby(session_key).transform("last").shift(1)
+    session_open = open_.groupby(session_key).transform("first")
+    feat["gap_open_pct"] = _safe_series_div(session_open, prior_session_close) - 1.0
+    feat["open_context_pct"] = _safe_series_div(close - session_open, session_open)
+    feat["prior_bar_momentum"] = close.pct_change()
+    feat["prior_bar_reversal"] = -close.diff().shift(1)
+    feat["bar_range_pct"] = _safe_series_div(high - low, close)
+    feat["bar_body_pct"] = _safe_series_div(close - open_, open_)
+
+    for lag in range(1, min(lags, 8) + 1):
+        feat[f"close_lag_{lag}"] = close.shift(lag)
+        feat[f"volume_lag_{lag}"] = volume.shift(lag)
+
+    return feat
+
+
+def _build_feature_frame(raw: pd.DataFrame, lags: int, feature_profile: str = "default") -> pd.DataFrame:
+    if str(feature_profile or "default") == "kr_intraday":
+        return _build_intraday_feature_frame(raw=raw, lags=lags)
+    return _build_default_feature_frame(raw=raw, lags=lags)
+
+
+def _build_dataset(price_data: pd.DataFrame, lags: int, target_mode: str, feature_profile: str = "default") -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
     raw = _prepare_ohlcv(price_data)
-    feat = _build_feature_frame(raw=raw, lags=lags)
+    feat = _build_feature_frame(raw=raw, lags=lags, feature_profile=feature_profile)
 
     next_close = raw["close"].shift(-1)
     if target_mode == "return":
@@ -281,14 +355,14 @@ def _build_dataset(price_data: pd.DataFrame, lags: int, target_mode: str) -> Tup
     return data, feature_cols, raw
 
 
-def _feature_hash(dataset: pd.DataFrame, feature_cols: List[str]) -> str:
+def _feature_hash(dataset: pd.DataFrame, feature_cols: List[str], feature_version: str) -> str:
     if dataset.empty or not feature_cols:
         return ""
     row = dataset.iloc[-1][feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     payload = {
         "feature_cols": feature_cols,
         "latest_row": {key: float(value) for key, value in row.items()},
-        "feature_version": FEATURE_VERSION,
+        "feature_version": feature_version,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
@@ -907,12 +981,12 @@ def _regime_breakdown_for_segment(
     return pd.DataFrame(rows)
 
 
-def _feature_row_from_history(history_raw: pd.DataFrame, lags: int, feature_cols: List[str]) -> pd.DataFrame:
-    min_len = max(26, 20, lags + 1, 11) + 1
+def _feature_row_from_history(history_raw: pd.DataFrame, lags: int, feature_cols: List[str], feature_profile: str = "default") -> pd.DataFrame:
+    min_len = max(60 if feature_profile == "kr_intraday" else 26, 20, lags + 1, 11) + 1
     if len(history_raw) < min_len:
         raise ValueError(f"history 길이가 부족합니다. 필요: {min_len}, 현재: {len(history_raw)}")
 
-    feat = _build_feature_frame(raw=history_raw, lags=lags)
+    feat = _build_feature_frame(raw=history_raw, lags=lags, feature_profile=feature_profile)
     row = feat.iloc[[-1]][feature_cols].replace([np.inf, -np.inf], np.nan)
     return row.fillna(0.0)
 
@@ -939,6 +1013,7 @@ def run_forecast_on_price_data(
     max_position_size: float = 1.0,
     stop_loss_atr_mult: float = 1.5,
     take_profit_atr_mult: float = 3.0,
+    feature_profile: str = "default",
 ) -> ForecastResult:
     if purge_days < 0 or embargo_days < 0:
         raise ValueError("purge_days / embargo_days는 0 이상이어야 합니다.")
@@ -956,7 +1031,12 @@ def run_forecast_on_price_data(
         raise ValueError("ATR 손절/익절 배수는 0 이상이어야 합니다.")
 
     gap_days = int(purge_days + embargo_days)
-    dataset, feature_cols, raw_ohlcv = _build_dataset(price_data=price_data, lags=lags, target_mode=target_mode)
+    dataset, feature_cols, raw_ohlcv = _build_dataset(
+        price_data=price_data,
+        lags=lags,
+        target_mode=target_mode,
+        feature_profile=feature_profile,
+    )
     if len(dataset) < 260:
         raise ValueError("데이터가 부족합니다. 조회 기간을 늘려 주세요.")
 
@@ -1177,7 +1257,12 @@ def run_forecast_on_price_data(
         q10, q90, sigma = -0.02, 0.02, 0.02
 
     for step, dt in enumerate(future_index, start=1):
-        row = _feature_row_from_history(history_raw=raw_history, lags=lags, feature_cols=feature_cols)
+        row = _feature_row_from_history(
+            history_raw=raw_history,
+            lags=lags,
+            feature_cols=feature_cols,
+            feature_profile=feature_profile,
+        )
         current_close = float(raw_history["close"].iloc[-1])
 
         model_pred_target: Dict[str, float] = {}
@@ -1281,7 +1366,8 @@ def run_forecast_on_price_data(
         ]
     )
 
-    feature_hash = _feature_hash(dataset=dataset, feature_cols=feature_cols)
+    feature_version = FEATURE_VERSION if feature_profile == "default" else f"{FEATURE_VERSION}_{feature_profile}"
+    feature_hash = _feature_hash(dataset=dataset, feature_cols=feature_cols, feature_version=feature_version)
 
     return ForecastResult(
         symbol=symbol,
@@ -1308,7 +1394,7 @@ def run_forecast_on_price_data(
         signal_threshold_pct=float(tuned_threshold),
         model_name=MODEL_NAME,
         model_version=MODEL_VERSION,
-        feature_version=FEATURE_VERSION,
+        feature_version=feature_version,
         feature_hash=feature_hash,
         data_cutoff_at=pd.Timestamp(price_data.index.max()),
     )

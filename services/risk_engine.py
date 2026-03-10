@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from kr_strategy import get_kr_strategy, strategy_conflict_ids
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_LEGACY_MIXED, ExecutionAccount, resolve_execution_account
 from services.signal_engine import SignalDecision
 from storage.repository import TradingRepository, parse_utc_timestamp
@@ -86,6 +87,7 @@ class RiskEngine:
         market_is_open: bool,
     ) -> RiskDecision:
         strategy = self.settings.strategy
+        strategy_cfg = get_kr_strategy(self.settings, str(signal.strategy_version or "")) if signal.asset_type == "한국주식" else None
         risk = self.settings.risk
         state = self._latest_account_state(asset_type=signal.asset_type, symbol=signal.symbol)
         account_id = str(state["account_id"])
@@ -96,41 +98,66 @@ class RiskEngine:
             return RiskDecision(False, "market_closed", 0, 0.0, 0.0)
         if signal.signal == "FLAT":
             return RiskDecision(False, "flat_signal", 0, 0.0, 0.0)
-        if signal.expected_return * 100.0 < strategy.min_expected_return_pct:
+        min_expected_return_pct = float(strategy_cfg.min_expected_return_pct if strategy_cfg is not None else strategy.min_expected_return_pct)
+        min_confidence = float(strategy_cfg.min_confidence if strategy_cfg is not None else strategy.min_confidence)
+        max_expected_risk_pct = float(strategy_cfg.max_expected_risk_pct if strategy_cfg is not None else strategy.max_expected_risk_pct)
+        max_cost_bps = float(strategy_cfg.max_cost_bps if strategy_cfg is not None else strategy.max_cost_bps)
+        strategy_daily_limit = int(strategy_cfg.max_daily_new_entries if strategy_cfg is not None else risk.max_daily_new_entries)
+        if signal.expected_return * 100.0 < min_expected_return_pct:
             return RiskDecision(False, "expected_return_too_low", 0, 0.0, 0.0)
-        if signal.confidence < strategy.min_confidence:
+        if signal.confidence < min_confidence:
             return RiskDecision(False, "confidence_too_low", 0, 0.0, 0.0)
-        if signal.expected_risk * 100.0 > strategy.max_expected_risk_pct:
+        if signal.expected_risk * 100.0 > max_expected_risk_pct:
             return RiskDecision(False, "risk_too_high", 0, 0.0, 0.0)
-        if strategy.round_trip_cost_bps > strategy.max_cost_bps:
+        if float(strategy_cfg.round_trip_cost_bps if strategy_cfg is not None else strategy.round_trip_cost_bps) > max_cost_bps:
             return RiskDecision(False, "cost_too_high", 0, 0.0, 0.0)
 
-        cooldown_until = self.repository.latest_cooldown_until(signal.symbol, signal.timeframe, account_id=account_id)
+        cooldown_until = self.repository.latest_cooldown_until(
+            signal.symbol,
+            signal.timeframe,
+            account_id=account_id,
+            strategy_version=str(signal.strategy_version or "") if strategy_cfg is not None else None,
+        )
         cooldown_dt = parse_utc_timestamp(cooldown_until)
         if cooldown_dt is not None and pd.Timestamp.now(tz="UTC").to_pydatetime() < cooldown_dt:
             return RiskDecision(False, "cooldown_active", 0, 0.0, 0.0)
 
         open_positions = self.repository.open_positions(account_id=account_id)
         pending_entries = self._pending_entry_frame(account_id)
-        if self.repository.count_daily_entries(today, account_id=account_id) >= risk.max_daily_new_entries:
+        if self.repository.count_daily_entries(
+            today,
+            account_id=account_id,
+            strategy_version=str(signal.strategy_version or "") if strategy_cfg is not None else None,
+        ) >= strategy_daily_limit:
             return RiskDecision(False, "max_daily_entries", 0, 0.0, 0.0)
         if state["drawdown_pct"] <= -(risk.max_drawdown_limit_pct * 100.0):
             return RiskDecision(False, "max_drawdown_limit", 0, 0.0, 0.0)
         if self.repository.recent_closed_realized_pnl(today, account_id=account_id) <= -(state["equity"] * risk.daily_loss_limit_pct):
             return RiskDecision(False, "daily_loss_limit", 0, 0.0, 0.0)
 
-        same_symbol = open_positions[
-            (open_positions["symbol"].astype(str) == signal.symbol)
-            & (open_positions["timeframe"].astype(str) == signal.timeframe)
-        ]
-        same_symbol_pending = pending_entries[
-            (pending_entries["symbol"].astype(str) == signal.symbol)
-            & (pending_entries["timeframe"].astype(str) == signal.timeframe)
-        ]
+        if strategy_cfg is not None:
+            conflict_ids = strategy_conflict_ids(self.settings, str(signal.strategy_version or ""))
+            same_symbol = open_positions[
+                (open_positions["symbol"].astype(str) == signal.symbol)
+                & (open_positions["strategy_version"].astype(str).isin(conflict_ids))
+            ]
+            same_symbol_pending = pending_entries[
+                (pending_entries["symbol"].astype(str) == signal.symbol)
+                & (pending_entries["strategy_version"].astype(str).isin(conflict_ids))
+            ]
+        else:
+            same_symbol = open_positions[
+                (open_positions["symbol"].astype(str) == signal.symbol)
+                & (open_positions["timeframe"].astype(str) == signal.timeframe)
+            ]
+            same_symbol_pending = pending_entries[
+                (pending_entries["symbol"].astype(str) == signal.symbol)
+                & (pending_entries["timeframe"].astype(str) == signal.timeframe)
+            ]
         if not same_symbol_pending.empty:
-            return RiskDecision(False, "duplicate_pending_entry", 0, 0.0, 0.0)
+            return RiskDecision(False, "duplicate_pending_entry" if strategy_cfg is None else "kr_strategy_conflict_pending", 0, 0.0, 0.0)
         if not same_symbol.empty:
-            return RiskDecision(False, "already_holding_symbol", 0, 0.0, 0.0)
+            return RiskDecision(False, "already_holding_symbol" if strategy_cfg is None else "kr_strategy_conflict_active", 0, 0.0, 0.0)
 
         reserved_slots = pd.concat(
             [

@@ -4,16 +4,20 @@ import json
 import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings, load_settings
 from jobs.tasks import broker_account_sync_job, broker_order_sync_job, broker_position_sync_job, entry_decision_job
+from kr_strategy import default_kr_strategy, strategy_schedule
 from monitoring.dashboard_hooks import load_dashboard_data
+from runtime_accounts import resolve_execution_account
 from services.broker_router import BrokerRouter, resolve_broker_mode
 from services.kis_paper_broker import KISPaperBroker
 from services.market_data_service import MarketQuote
@@ -65,12 +69,25 @@ class _FakeMarketDataService:
         required_preclose_minutes: Dict[str, int] | None = None,
         market_open: Dict[str, bool] | None = None,
         correlations: Dict[tuple[str, str], float] | None = None,
+        current_times: Dict[str, datetime] | None = None,
     ) -> None:
         self.settings = settings
         self.prices = dict(prices)
         self.required_preclose_minutes = dict(required_preclose_minutes or {})
         self.market_open = dict(market_open or {})
         self.correlations = dict(correlations or {})
+        self.current_times = dict(current_times or {})
+
+    def current_time(self, asset_type: str) -> datetime:
+        if asset_type in self.current_times:
+            return self.current_times[asset_type]
+        schedule = self.settings.asset_schedules[asset_type]
+        timezone_name = str(schedule.timezone)
+        if timezone_name == "Asia/Seoul":
+            return datetime(2026, 3, 9, 14, 10, tzinfo=ZoneInfo(timezone_name))
+        if timezone_name == "America/New_York":
+            return datetime(2026, 3, 9, 15, 40, tzinfo=ZoneInfo(timezone_name))
+        return datetime(2026, 3, 9, 12, 0, tzinfo=ZoneInfo(timezone_name))
 
     def is_market_open(self, asset_type: str, when=None) -> bool:
         return bool(self.market_open.get(asset_type, True))
@@ -248,11 +265,59 @@ def _profile_settings(profile_path: str | Path) -> RuntimeSettings:
     return settings
 
 
+def _strategy_runtime_meta(settings: RuntimeSettings, asset_type: str) -> Dict[str, Any]:
+    schedule = settings.asset_schedules[asset_type]
+    if asset_type != "한국주식":
+        return {
+            "timeframe": str(schedule.timeframe),
+            "strategy_version": str(settings.strategy.strategy_version),
+            "validation_mode": str(settings.strategy.validation_mode),
+            "forecast_horizon_bars": int(schedule.forecast_horizon_bars),
+            "target_type": "next_close_return",
+            "notes": {"timeframe": str(schedule.timeframe), "planned_signal": 1.0},
+        }
+    strategy = default_kr_strategy(settings)
+    if strategy is None:
+        return {
+            "timeframe": str(schedule.timeframe),
+            "strategy_version": str(settings.strategy.strategy_version),
+            "validation_mode": str(settings.strategy.validation_mode),
+            "forecast_horizon_bars": int(schedule.forecast_horizon_bars),
+            "target_type": "next_close_return",
+            "notes": {"timeframe": str(schedule.timeframe), "planned_signal": 1.0},
+        }
+    strategy_sched = strategy_schedule(settings, strategy.strategy_id)
+    return {
+        "timeframe": str(strategy_sched.timeframe),
+        "strategy_version": str(strategy.strategy_id),
+        "validation_mode": str(strategy.validation_mode),
+        "forecast_horizon_bars": int(strategy.forecast_horizon_bars),
+        "target_type": str(strategy.primary_target),
+        "notes": {
+            "timeframe": str(strategy_sched.timeframe),
+            "planned_signal": 1.0,
+            "strategy_family": str(strategy.strategy_family),
+            "decision_horizon_bars": int(strategy.decision_horizon_bars),
+            "primary_target": str(strategy.primary_target),
+            "secondary_target": str(strategy.secondary_target),
+            "analysis_target": str(strategy.analysis_target),
+            "experimental": bool(strategy.experimental),
+        },
+    }
+
+
+def _execution_account_id(symbol: str, asset_type: str) -> str:
+    return resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
+
+
 def _seed_candidate(repository: TradingRepository, settings: RuntimeSettings, spec: SeedCandidate) -> None:
     created_at = utc_now_iso()
     scan_id = make_id("scan")
     prediction_id = make_id("pred")
-    timeframe = settings.asset_schedules[spec.asset_type].timeframe
+    runtime_meta = _strategy_runtime_meta(settings, spec.asset_type)
+    timeframe = str(runtime_meta["timeframe"])
+    strategy_version = str(runtime_meta["strategy_version"])
+    execution_account_id = _execution_account_id(spec.symbol, spec.asset_type)
     is_candidate = float(spec.signal_strength_pct) >= float(settings.strategy.min_signal_strength_pct)
     threshold = float(spec.signal_strength_pct) / 100.0
     repository.insert_candidate_scans(
@@ -278,10 +343,11 @@ def _seed_candidate(repository: TradingRepository, settings: RuntimeSettings, sp
                 signal="LONG" if is_candidate else "FLAT",
                 model_version="smoke-model-v1",
                 feature_version="smoke-features-v1",
-                strategy_version=str(settings.strategy.strategy_version),
+                strategy_version=strategy_version,
                 cooldown_until=None,
                 is_holding=0,
                 raw_json=json.dumps({"signal_strength_pct": float(spec.signal_strength_pct)}, ensure_ascii=False),
+                execution_account_id=execution_account_id,
             )
         ]
     )
@@ -299,8 +365,8 @@ def _seed_candidate(repository: TradingRepository, settings: RuntimeSettings, sp
                 market_timezone="Asia/Seoul" if spec.asset_type == "한국주식" else ("America/New_York" if spec.asset_type == "미국주식" else "UTC"),
                 data_cutoff_at=created_at,
                 target_at=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat(),
-                forecast_horizon_bars=1,
-                target_type="next_close_return",
+                forecast_horizon_bars=int(runtime_meta["forecast_horizon_bars"]),
+                target_type=str(runtime_meta["target_type"]),
                 current_price=float(spec.current_price),
                 predicted_price=float(spec.current_price) * (1.0 + float(spec.expected_return_pct) / 100.0),
                 predicted_return=float(spec.expected_return_pct) / 100.0,
@@ -314,27 +380,30 @@ def _seed_candidate(repository: TradingRepository, settings: RuntimeSettings, sp
                 model_name="smoke-model",
                 model_version="smoke-model-v1",
                 feature_version="smoke-features-v1",
-                strategy_version=str(settings.strategy.strategy_version),
-                validation_mode=str(settings.strategy.validation_mode),
+                strategy_version=strategy_version,
+                validation_mode=str(runtime_meta["validation_mode"]),
                 feature_hash="smoke-hash",
                 scan_id=scan_id,
                 notes=json.dumps(
                     {
-                        "timeframe": timeframe,
+                        **dict(runtime_meta["notes"]),
                         "stop_level": float(spec.current_price) * 0.98,
                         "take_level": float(spec.current_price) * 1.04,
                         "atr_14": float(spec.current_price) * (float(spec.expected_risk_pct) / 100.0),
-                        "planned_signal": 1.0,
                     },
                     ensure_ascii=False,
                 ),
+                execution_account_id=execution_account_id,
             )
         ]
     )
 
 
 def _seed_prior_entries(repository: TradingRepository, settings: RuntimeSettings, asset_type: str, symbol: str, count: int) -> None:
-    timeframe = settings.asset_schedules[asset_type].timeframe
+    runtime_meta = _strategy_runtime_meta(settings, asset_type)
+    timeframe = str(runtime_meta["timeframe"])
+    strategy_version = str(runtime_meta["strategy_version"])
+    account_id = _execution_account_id(symbol, asset_type)
     created_at = utc_now_iso()
     for index in range(int(count)):
         repository.insert_order(
@@ -358,15 +427,19 @@ def _seed_prior_entries(repository: TradingRepository, settings: RuntimeSettings
                 fees_estimate=0.0,
                 slippage_bps=0.0,
                 retry_count=0,
-                strategy_version=str(settings.strategy.strategy_version),
+                strategy_version=strategy_version,
                 reason="entry",
                 raw_json=json.dumps({"broker": "sim"}, ensure_ascii=False),
+                account_id=account_id,
             )
         )
 
 
 def _seed_pending_entry(repository: TradingRepository, settings: RuntimeSettings, asset_type: str, symbol: str) -> None:
-    timeframe = settings.asset_schedules[asset_type].timeframe
+    runtime_meta = _strategy_runtime_meta(settings, asset_type)
+    timeframe = str(runtime_meta["timeframe"])
+    strategy_version = str(runtime_meta["strategy_version"])
+    account_id = _execution_account_id(symbol, asset_type)
     created_at = utc_now_iso()
     repository.insert_order(
         OrderRecord(
@@ -389,15 +462,19 @@ def _seed_pending_entry(repository: TradingRepository, settings: RuntimeSettings
             fees_estimate=0.0,
             slippage_bps=0.0,
             retry_count=0,
-            strategy_version=str(settings.strategy.strategy_version),
+            strategy_version=strategy_version,
             reason="entry",
             raw_json=json.dumps({"broker": "kis_mock" if symbol.endswith((".KS", ".KQ")) or symbol.isdigit() else "sim"}, ensure_ascii=False),
+            account_id=account_id,
         )
     )
 
 
 def _seed_cooldown(repository: TradingRepository, settings: RuntimeSettings, asset_type: str, symbol: str) -> None:
-    timeframe = settings.asset_schedules[asset_type].timeframe
+    runtime_meta = _strategy_runtime_meta(settings, asset_type)
+    timeframe = str(runtime_meta["timeframe"])
+    strategy_version = str(runtime_meta["strategy_version"])
+    account_id = _execution_account_id(symbol, asset_type)
     now_iso = utc_now_iso()
     repository.upsert_position(
         PositionRecord(
@@ -424,15 +501,19 @@ def _seed_cooldown(repository: TradingRepository, settings: RuntimeSettings, ass
             expected_risk=0.01,
             exposure_value=0.0,
             max_holding_until=now_iso,
-            strategy_version=str(settings.strategy.strategy_version),
+            strategy_version=strategy_version,
             cooldown_until=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=2)).isoformat(),
             notes="cooldown",
+            account_id=account_id,
         )
     )
 
 
 def _seed_open_position(repository: TradingRepository, settings: RuntimeSettings, asset_type: str, symbol: str) -> None:
-    timeframe = settings.asset_schedules[asset_type].timeframe
+    runtime_meta = _strategy_runtime_meta(settings, asset_type)
+    timeframe = str(runtime_meta["timeframe"])
+    strategy_version = str(runtime_meta["strategy_version"])
+    account_id = _execution_account_id(symbol, asset_type)
     now_iso = utc_now_iso()
     repository.upsert_position(
         PositionRecord(
@@ -459,9 +540,10 @@ def _seed_open_position(repository: TradingRepository, settings: RuntimeSettings
             expected_risk=0.01,
             exposure_value=1_000.0,
             max_holding_until=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=5)).isoformat(),
-            strategy_version=str(settings.strategy.strategy_version),
+            strategy_version=strategy_version,
             cooldown_until=None,
             notes="open-for-correlation",
+            account_id=account_id,
         )
     )
 
@@ -481,6 +563,12 @@ def _build_context(
     repository.initialize()
     repository.set_control_flag("runtime_profile_name", str(settings.profile_name), "profile_smoke")
     repository.set_control_flag("runtime_profile_source", str(settings.profile_source), "profile_smoke")
+    repository.set_control_flag(
+        "kr_active_strategies",
+        ",".join(str(strategy_id) for strategy_id, strategy in settings.kr_strategies.items() if bool(strategy.enabled)),
+        "profile_smoke",
+    )
+    repository.set_control_flag("kr_default_strategy_id", str(settings.kr_default_strategy_id), "profile_smoke")
     market_data_service = _FakeMarketDataService(
         settings,
         prices,
@@ -789,6 +877,12 @@ def run_profile_smoke(profile_path: str | Path) -> Dict[str, Any]:
         "max_same_direction_correlation": float(settings.risk.max_same_direction_correlation),
         "kr_pre_close_buffer_minutes": int(settings.asset_schedules[asset_types["kr"]].pre_close_buffer_minutes),
         "us_pre_close_buffer_minutes": int(settings.asset_schedules[asset_types["us"]].pre_close_buffer_minutes),
+    }
+    kr_default = default_kr_strategy(settings)
+    merged["kr_strategy"] = {
+        "default_strategy_id": str(kr_default.strategy_id if kr_default is not None else ""),
+        "active_strategy_ids": [str(strategy_id) for strategy_id, strategy in settings.kr_strategies.items() if bool(strategy.enabled)],
+        "experimental_15m_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1"].enabled),
     }
     merged["bootstrap"] = _run_bootstrap(profile_path)
     return merged

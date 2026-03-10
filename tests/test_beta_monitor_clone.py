@@ -10,11 +10,16 @@ import beta_monitor_clone as clone
 from beta_monitor_clone import (
     _account_card_compact,
     _action_button,
+    _build_total_equity_curve,
+    _build_realized_trade_table_frame,
     _build_entry_result_rows,
     _candidate_tabs_html,
     _equity_svg,
     _ensure_template_base_href,
+    _frame_for_account,
+    _job_label,
     _money_display_pair,
+    _positions_card,
     _replace_template_script,
     _theme_button,
 )
@@ -100,6 +105,30 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('class="equity-line"', markup)
         self.assertIn("최근 평가 자산", markup)
 
+    def test_build_total_equity_curve_converts_usd_series_to_krw(self) -> None:
+        total_curve, note, currency = _build_total_equity_curve(
+            {
+                ACCOUNT_KIS_KR_PAPER: pd.DataFrame(
+                    [
+                        {"created_at": "2026-03-09T14:00:00Z", "equity": 30000000.0},
+                        {"created_at": "2026-03-09T14:05:00Z", "equity": 30100000.0},
+                    ]
+                ),
+                ACCOUNT_SIM_US_EQUITY: pd.DataFrame(
+                    [
+                        {"created_at": "2026-03-09T14:00:00Z", "equity": 1000.0},
+                        {"created_at": "2026-03-09T14:05:00Z", "equity": 1010.0},
+                    ]
+                ),
+            },
+            {"KRW=X": {"current_price": 1450.0}},
+        )
+
+        self.assertFalse(total_curve.empty)
+        self.assertEqual(currency, "KRW")
+        self.assertIn("KRW 환산", note)
+        self.assertAlmostEqual(float(total_curve.iloc[-1]["equity"]), 30100000.0 + 1010.0 * 1450.0)
+
     def test_candidate_tabs_split_markets_and_show_kr_name(self) -> None:
         candidates = pd.DataFrame(
             [
@@ -161,11 +190,12 @@ class BetaMonitorCloneTest(unittest.TestCase):
             token="token1",
             candidate_tab="crypto",
             jobs="all",
+            signals="all",
             theme_mode="dark",
         )
 
         self.assertIn('type="button"', markup)
-        self.assertIn('data-beta-href="/beta?beta_anchor=sync&amp;beta_action=sync_account&amp;beta_token=token1&amp;beta_cand_tab=crypto&amp;beta_jobs=all&amp;beta_theme=dark"', markup)
+        self.assertIn('data-beta-href="/beta?beta_anchor=sync&amp;beta_action=sync_account&amp;beta_token=token1&amp;beta_cand_tab=crypto&amp;beta_jobs=all&amp;beta_signals=all&amp;beta_theme=dark"', markup)
         self.assertIn('data-action="sync_account"', markup)
         self.assertNotIn('target="_top"', markup)
 
@@ -176,13 +206,31 @@ class BetaMonitorCloneTest(unittest.TestCase):
             token="theme1",
             candidate_tab="us",
             jobs=None,
+            signals="all",
         )
 
         self.assertIn('type="button"', markup)
-        self.assertIn('data-beta-href="/beta?beta_anchor=beta-overview&amp;beta_action=toggle_theme&amp;beta_token=theme1&amp;beta_cand_tab=us&amp;beta_theme=dark"', markup)
+        self.assertIn('data-beta-href="/beta?beta_anchor=beta-overview&amp;beta_action=toggle_theme&amp;beta_token=theme1&amp;beta_cand_tab=us&amp;beta_signals=all&amp;beta_theme=dark"', markup)
         self.assertIn('data-theme-toggle="1"', markup)
         self.assertIn('id="theme-label"', markup)
         self.assertNotIn('target="_top"', markup)
+
+    def test_job_label_maps_scan_prefix(self) -> None:
+        self.assertEqual(_job_label("scan:코인"), "시그널 스캔 · 코인")
+        self.assertEqual(_job_label("signal_scan"), "시그널 스캔")
+
+    def test_frame_for_account_falls_back_to_execution_account_id(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {"execution_account_id": ACCOUNT_SIM_US_EQUITY, "symbol": "AAPL"},
+                {"execution_account_id": ACCOUNT_SIM_CRYPTO, "symbol": "BTC-USD"},
+            ]
+        )
+
+        filtered = _frame_for_account(frame, ACCOUNT_SIM_CRYPTO)
+
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(str(filtered.iloc[0]["symbol"]), "BTC-USD")
 
     def test_money_display_pair_converts_usd_to_krw_when_fx_available(self) -> None:
         primary, secondary = _money_display_pair(
@@ -193,6 +241,31 @@ class BetaMonitorCloneTest(unittest.TestCase):
 
         self.assertEqual(primary, "145,000.00 KRW")
         self.assertEqual(secondary, "100.00 USD")
+
+    def test_build_realized_trade_table_frame_formats_trade_history(self) -> None:
+        trades = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T13:00:00Z",
+                    "closed_at": "2026-03-09T14:15:00Z",
+                    "account_id": ACCOUNT_SIM_US_EQUITY,
+                    "symbol": "AAPL",
+                    "side": "LONG",
+                    "entry_price": 100.0,
+                    "mark_price": 105.0,
+                    "realized_pnl": 5.0,
+                    "notes": "closed_by_take_profit",
+                }
+            ]
+        )
+
+        view = _build_realized_trade_table_frame(trades, {"KRW=X": {"current_price": 1450.0}})
+
+        self.assertEqual(list(view.columns), ["종료시각", "계좌", "종목", "방향", "보유기간", "진입가", "청산가", "실현손익", "청산사유"])
+        self.assertEqual(view.iloc[0]["계좌"], "SIM 미국주식 계좌")
+        self.assertEqual(view.iloc[0]["방향"], "롱")
+        self.assertIn("145,000.00 KRW / 100.00 USD", view.iloc[0]["진입가"])
+        self.assertEqual(view.iloc[0]["청산사유"], "익절")
 
     def test_account_card_compact_uses_unrealized_pnl_in_current_pnl(self) -> None:
         markup = _account_card_compact(
@@ -236,6 +309,38 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn("145만", markup)
         self.assertIn("1,000.00 USD", markup)
 
+    def test_positions_card_uses_krw_quote_for_bare_kr_code(self) -> None:
+        frame = pd.DataFrame(
+            [
+                {
+                    "symbol": "005930",
+                    "asset_type": "한국주식",
+                    "side": "LONG",
+                    "quantity": 1,
+                    "entry_price": 189900.0,
+                    "mark_price": 189900.0,
+                    "unrealized_pnl": -94.95,
+                    "stop_loss": 0.0,
+                    "take_profit": 0.0,
+                }
+            ]
+        )
+
+        markup = _positions_card(
+            frame,
+            "한국주식 포지션",
+            "KIS",
+            "broker-kis",
+            30000000.0,
+            {"005930.KS": {"currency": "KRW", "current_price": 190000.0}},
+            {"한국주식"},
+        )
+
+        self.assertIn("190,000.00 KRW", markup)
+        self.assertIn("100.00 KRW", markup)
+        self.assertIn("- / -", markup)
+        self.assertNotIn("USD", markup)
+
     def test_render_beta_overview_component_uses_light_theme_and_compact_detail_stack(self) -> None:
         template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
 <nav class="top-nav"></nav>
@@ -264,7 +369,12 @@ class BetaMonitorCloneTest(unittest.TestCase):
             "candidate_scans": pd.DataFrame(),
             "prediction_report": pd.DataFrame(),
             "equity_curve": pd.DataFrame(),
+            "equity_curves_by_account": {
+                ACCOUNT_KIS_KR_PAPER: pd.DataFrame([{"created_at": "2026-03-09T14:00:00Z", "equity": 30000000.0}]),
+                ACCOUNT_SIM_US_EQUITY: pd.DataFrame([{"created_at": "2026-03-09T14:00:00Z", "equity": 1000.0}]),
+            },
             "today_execution_events": pd.DataFrame(),
+            "recent_realized_trades": pd.DataFrame(),
             "asset_overview": pd.DataFrame(),
         }
         accounts_overview = {
@@ -306,11 +416,203 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('data-theme-toggle="1"', markup)
         self.assertIn("alt-beta-theme", markup)
         self.assertIn("applyTheme(readStoredTheme())", markup)
+        self.assertIn("beta_theme=light", markup)
         self.assertIn("detail-events-grid", markup)
         self.assertIn('id="assets"', markup)
         self.assertIn('id="errors"', markup)
+        self.assertIn("최근 거래 손익", markup)
+        self.assertIn("KRW 환산 합산", markup)
+        self.assertIn("KR 전략", markup)
         self.assertIn('data-beta-href="/beta?beta_anchor=beta-overview', markup)
         self.assertNotIn("window.template = true;", markup)
+        self.assertIs(captured.get("scrolling"), False)
+
+    def test_render_beta_overview_component_renders_kr_strategy_summary(self) -> None:
+        template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
+<nav class="top-nav"></nav>
+<div class="status-strip"></div>
+<div class="main">
+  <div class="account-row"></div>
+  <div class="stat-bar"></div>
+  <div class="content-grid"></div>
+  <div class="bottom-grid"></div>
+</div><!-- /main -->
+<script>window.template = true;</script>
+</body></html>"""
+        data = {
+            "summary": {"latest_account": {}},
+            "auto_trading_status": {"state": "running", "label": "가동 중"},
+            "execution_summary": {"today_noop_breakdown": pd.DataFrame()},
+            "broker_sync_status": pd.DataFrame(),
+            "broker_sync_errors": pd.DataFrame(),
+            "kis_runtime": {},
+            "runtime_profile": {
+                "name": "balanced",
+                "kr_default_strategy_label": "KR Intraday 1h v1",
+                "kr_active_strategy_labels": "KR Intraday 1h v1",
+            },
+            "job_health": pd.DataFrame(),
+            "recent_errors": pd.DataFrame(),
+            "recent_events": pd.DataFrame(),
+            "open_positions": pd.DataFrame(),
+            "open_orders": pd.DataFrame(),
+            "candidate_scans": pd.DataFrame(),
+            "prediction_report": pd.DataFrame(),
+            "equity_curve": pd.DataFrame(),
+            "equity_curves_by_account": {},
+            "today_execution_events": pd.DataFrame(),
+            "recent_realized_trades": pd.DataFrame(),
+            "asset_overview": pd.DataFrame(),
+            "kr_strategy_overview": pd.DataFrame(
+                [
+                    {
+                        "strategy_id": "kr_intraday_1h_v1",
+                        "label": "KR Intraday 1h v1",
+                        "timeframe": "1h",
+                        "enabled": True,
+                        "experimental": False,
+                        "today_candidate_count": 3,
+                        "today_submitted_count": 1,
+                        "today_filled_count": 1,
+                    },
+                    {
+                        "strategy_id": "kr_intraday_15m_v1",
+                        "label": "KR Intraday 15m v1 Experimental",
+                        "timeframe": "15m",
+                        "enabled": False,
+                        "experimental": True,
+                        "today_candidate_count": 0,
+                        "today_submitted_count": 0,
+                        "today_filled_count": 0,
+                    },
+                ]
+            ),
+            "kr_strategy_recent_events": pd.DataFrame(
+                [
+                    {
+                        "created_at": "2026-03-09T14:00:00Z",
+                        "strategy_id": "kr_intraday_1h_v1",
+                        "symbol": "005930.KS",
+                        "event_type": "filled",
+                        "reason": "",
+                        "message": "filled",
+                    }
+                ]
+            ),
+        }
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            template_path = Path(tmp_dir) / "beta_template.html"
+            template_path.write_text(template, encoding="utf-8")
+            original_path = clone.TEMPLATE_PATH
+            original_html = clone.components.html
+            try:
+                clone.TEMPLATE_PATH = template_path
+                clone.components.html = lambda html, height, scrolling: captured.update(
+                    {"html": html, "height": height, "scrolling": scrolling}
+                )
+                clone.render_beta_overview_component(
+                    data=data,
+                    theme_mode="dark",
+                    initial_anchor="beta-overview",
+                    feedback=None,
+                    accounts_overview={},
+                    total_portfolio_overview={},
+                    quote_snapshots={},
+                    kr_asset_types={"한국주식"},
+                    recent_orders=pd.DataFrame(),
+                )
+            finally:
+                clone.TEMPLATE_PATH = original_path
+                clone.components.html = original_html
+
+        markup = str(captured.get("html") or "")
+        self.assertIn("KR Intraday 1h v1", markup)
+        self.assertIn("KR Intraday 15m v1 Experimental", markup)
+        self.assertIn("experimental", markup)
+        self.assertIs(captured.get("scrolling"), False)
+
+    def test_render_beta_overview_component_shows_signal_toggle_when_more_than_four_results(self) -> None:
+        template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
+<nav class="top-nav"></nav>
+<div class="status-strip"></div>
+<div class="main">
+  <div class="account-row"></div>
+  <div class="stat-bar"></div>
+  <div class="content-grid"></div>
+  <div class="bottom-grid"></div>
+</div><!-- /main -->
+<script>window.template = true;</script>
+</body></html>"""
+        events = pd.DataFrame(
+            [
+                {
+                    "created_at": f"2026-03-09T14:0{i}:00Z",
+                    "component": "execution_pipeline",
+                    "event_type": "entry_rejected",
+                    "message": "rejected",
+                    "details": {"symbol": f"ASSET{i}", "reason": "insufficient_buying_power"},
+                }
+                for i in range(5)
+            ]
+        )
+        data = {
+            "summary": {"latest_account": {}},
+            "auto_trading_status": {"state": "running", "label": "가동 중"},
+            "execution_summary": {"today_noop_breakdown": pd.DataFrame(), "today_entry_rejected_count": 5},
+            "broker_sync_status": pd.DataFrame(),
+            "broker_sync_errors": pd.DataFrame(),
+            "kis_runtime": {},
+            "runtime_profile": {"name": "active"},
+            "job_health": pd.DataFrame(),
+            "recent_errors": pd.DataFrame(),
+            "recent_events": pd.DataFrame(),
+            "open_positions": pd.DataFrame(),
+            "open_orders": pd.DataFrame(),
+            "candidate_scans": pd.DataFrame(),
+            "prediction_report": pd.DataFrame(),
+            "equity_curve": pd.DataFrame(),
+            "equity_curves_by_account": {},
+            "today_execution_events": events,
+            "recent_realized_trades": pd.DataFrame(),
+            "asset_overview": pd.DataFrame(),
+        }
+        accounts_overview = {}
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            template_path = Path(tmp_dir) / "beta_template.html"
+            template_path.write_text(template, encoding="utf-8")
+            original_path = clone.TEMPLATE_PATH
+            original_html = clone.components.html
+            try:
+                clone.TEMPLATE_PATH = template_path
+                clone.components.html = lambda html, height, scrolling: captured.update(
+                    {"html": html, "height": height, "scrolling": scrolling}
+                )
+                clone.render_beta_overview_component(
+                    data=data,
+                    theme_mode="light",
+                    initial_anchor="events",
+                    feedback=None,
+                    accounts_overview=accounts_overview,
+                    total_portfolio_overview={},
+                    quote_snapshots={},
+                    kr_asset_types={"한국주식"},
+                    recent_orders=pd.DataFrame(),
+                    current_candidate_tab="us",
+                    jobs_expanded=False,
+                    signals_expanded=False,
+                )
+            finally:
+                clone.TEMPLATE_PATH = original_path
+                clone.components.html = original_html
+
+        markup = str(captured.get("html") or "")
+        self.assertIn("표시 4 / 전체 5건", markup)
+        self.assertIn("상세보기", markup)
+        self.assertIn("beta_signals=all", markup)
 
 
 if __name__ == "__main__":

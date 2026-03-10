@@ -1,5 +1,19 @@
 {
   "profile_name": "baseline",
+  "kr_default_strategy_id": "kr_intraday_1h_v1",
+  "kr_strategies": {
+    "kr_daily_preclose_v1": {
+      "enabled": false
+    },
+    "kr_intraday_1h_v1": {
+      "enabled": true,
+      "experimental": false
+    },
+    "kr_intraday_15m_v1": {
+      "enabled": false,
+      "experimental": true
+    }
+  },
   "storage": {
     "db_path": ".runtime/paper_trading.sqlite3"
   },

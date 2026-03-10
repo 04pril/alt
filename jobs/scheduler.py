@@ -20,6 +20,7 @@ from jobs.tasks import (
     retrain_check_job,
     scan_job,
 )
+from kr_strategy import active_kr_strategy_ids, strategy_schedule
 from storage.repository import utc_now_iso
 
 
@@ -97,6 +98,23 @@ def run_once(settings_path: str | None = None) -> None:
         fn=lambda: broker_account_sync_job(context),
     )
     for asset_type, schedule in settings.asset_schedules.items():
+        if asset_type == "한국주식" and active_kr_strategy_ids(settings):
+            for strategy_id in active_kr_strategy_ids(settings):
+                strategy_cfg = strategy_schedule(settings, strategy_id)
+                now = datetime.now(ZoneInfo(strategy_cfg.timezone))
+                _run_guarded(
+                    context,
+                    job_name=f"scan:{strategy_id}",
+                    run_key=_bucket_key(now, strategy_cfg.scan_interval_minutes),
+                    fn=lambda strategy_id=strategy_id: scan_job(context, strategy_ids=[strategy_id]),
+                )
+                _run_guarded(
+                    context,
+                    job_name=f"entry:{strategy_id}",
+                    run_key=_bucket_key(now, strategy_cfg.entry_interval_minutes),
+                    fn=lambda strategy_id=strategy_id: entry_decision_job(context, strategy_ids=[strategy_id]),
+                )
+            continue
         now = datetime.now(ZoneInfo(schedule.timezone))
         _run_guarded(
             context,

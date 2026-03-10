@@ -9,6 +9,7 @@ import pandas as pd
 
 from config.settings import RuntimeSettings
 from kis_paper import KISPaperClient, extract_kis_code
+from kr_strategy import entry_gate_reason, get_kr_strategy
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, BROKER_MODE_KIS
 from services.market_data_service import MarketDataService
 from services.paper_broker import PaperBroker
@@ -179,8 +180,14 @@ class KISPaperBroker:
             return {"allowed": False, "reason": "kis_disabled", "broker": BROKER_MODE_KIS, "account_id": account_id}
         if not market_data_service.is_market_open(asset_type):
             return {"allowed": False, "reason": "market_closed", "broker": BROKER_MODE_KIS, "account_id": account_id}
-        if self.settings.asset_schedules[asset_type].timeframe == "1d" and not market_data_service.is_pre_close_window(asset_type):
-            return {"allowed": False, "reason": "outside_preclose_window", "broker": BROKER_MODE_KIS, "account_id": account_id}
+        gate_reason = entry_gate_reason(
+            self.settings,
+            str(signal.strategy_version or ""),
+            when=(market_data_service.current_time(asset_type) if market_data_service is not None and callable(getattr(market_data_service, "current_time", None)) else None),
+            market_is_open=True,
+        )
+        if gate_reason:
+            return {"allowed": False, "reason": gate_reason, "broker": BROKER_MODE_KIS, "account_id": account_id}
 
         client = self._client()
         quote = client.get_quote(signal.symbol)
@@ -295,7 +302,8 @@ class KISPaperBroker:
                 "take_level": signal.take_level,
                 "max_holding_until": (
                     pd.Timestamp.now(tz="UTC")
-                    + self.sim_broker._timeframe_delta(signal.timeframe) * int(self.settings.strategy.max_holding_bars)
+                    + self.sim_broker._timeframe_delta(signal.timeframe)
+                    * int(get_kr_strategy(self.settings, str(signal.strategy_version or "")).max_holding_bars if get_kr_strategy(self.settings, str(signal.strategy_version or "")) is not None else self.settings.strategy.max_holding_bars)
                 ).isoformat(),
                 "strategy_version": signal.strategy_version,
                 "broker_state": "submit_requested",

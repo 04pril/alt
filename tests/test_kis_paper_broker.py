@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from kr_strategy import default_kr_strategy, strategy_schedule
 from kis_paper import KISPaperSnapshot
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER
 from services.kis_paper_broker import KISPaperBroker
@@ -21,12 +24,18 @@ class _FakeMarketDataService:
     def __init__(self, *, market_open: bool = True, pre_close: bool = True):
         self.market_open = market_open
         self.pre_close = pre_close
+        self.current_times: dict[str, datetime] = {}
 
     def is_market_open(self, asset_type: str, when=None) -> bool:
         return self.market_open
 
     def is_pre_close_window(self, asset_type: str, when=None) -> bool:
         return self.pre_close
+
+    def current_time(self, asset_type: str) -> datetime:
+        if asset_type in self.current_times:
+            return self.current_times[asset_type]
+        return datetime(2026, 3, 9, 14, 10, tzinfo=ZoneInfo("Asia/Seoul"))
 
 
 class _FakeKISClient:
@@ -103,6 +112,9 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.kr_asset_type = next(
             asset_type for asset_type, schedule in self.settings.asset_schedules.items() if schedule.timeframe == "1d" and schedule.timezone == "Asia/Seoul"
         )
+        self.kr_strategy = default_kr_strategy(self.settings)
+        self.assertIsNotNone(self.kr_strategy)
+        self.kr_timeframe = str(strategy_schedule(self.settings, str(self.kr_strategy.strategy_id)).timeframe)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -111,7 +123,7 @@ class KISPaperBrokerTest(unittest.TestCase):
         return SignalDecision(
             symbol="005930.KS",
             asset_type=self.kr_asset_type,
-            timeframe="1d",
+            timeframe=self.kr_timeframe,
             prediction_id="pred-kr-1",
             scan_id="scan-kr-1",
             score=1.0,
@@ -128,8 +140,8 @@ class KISPaperBrokerTest(unittest.TestCase):
             take_level=73000.0,
             model_version="v1",
             feature_version="f1",
-            strategy_version="s1",
-            validation_mode="holdout",
+            strategy_version=str(self.kr_strategy.strategy_id),
+            validation_mode=str(self.kr_strategy.validation_mode),
             result=None,
         )
 
@@ -152,9 +164,10 @@ class KISPaperBrokerTest(unittest.TestCase):
 
     def test_outside_preclose_window_does_not_submit(self) -> None:
         market = _FakeMarketDataService(market_open=True, pre_close=False)
+        market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 15, 5, tzinfo=ZoneInfo("Asia/Seoul"))
         result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=market)
         self.assertFalse(result["submitted"])
-        self.assertEqual(result["reason"], "outside_preclose_window")
+        self.assertEqual(result["reason"], "outside_intraday_entry_window")
         self.assertEqual(self.client.place_calls, 0)
 
     def test_insufficient_buying_power_does_not_submit(self) -> None:
@@ -173,7 +186,7 @@ class KISPaperBrokerTest(unittest.TestCase):
                 scan_id="scan-old",
                 symbol="005930.KS",
                 asset_type=self.kr_asset_type,
-                timeframe="1d",
+                timeframe=self.kr_timeframe,
                 side="buy",
                 order_type="market",
                 requested_qty=1,
@@ -185,9 +198,10 @@ class KISPaperBrokerTest(unittest.TestCase):
                 fees_estimate=0.0,
                 slippage_bps=0.0,
                 retry_count=0,
-                strategy_version="s1",
+                strategy_version=str(self.kr_strategy.strategy_id),
                 reason="entry",
                 raw_json='{"broker":"kis_mock"}',
+                account_id=ACCOUNT_KIS_KR_PAPER,
             )
         )
         result = self.broker.submit_entry_order_result(self._signal(), quantity=1, market_data_service=self.market)

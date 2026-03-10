@@ -521,14 +521,47 @@ class TradingRepository:
             if not account_id:
                 account_id = order_map.get(str(payload.get("order_id") or ""), "")
             if not account_id:
-                account_id = infer_execution_account_id(
-                    symbol=str(payload.get("symbol") or ""),
-                    asset_type=str(payload.get("asset_type") or ""),
-                    source="kis_account_sync" if str(row["component"] or "").startswith("kis_") else "",
-                    raw_payload=payload,
-                    prefer_legacy_sim_snapshot=False,
-                )
+                symbol = str(payload.get("symbol") or "").strip()
+                asset_type = str(payload.get("asset_type") or "").strip()
+                payload_broker = str(payload.get("broker") or "").strip()
+                if symbol or asset_type or payload_broker or str(row["component"] or "").startswith("kis_"):
+                    account_id = infer_execution_account_id(
+                        symbol=symbol,
+                        asset_type=asset_type,
+                        source="kis_account_sync" if str(row["component"] or "").startswith("kis_") else "",
+                        raw_payload=payload,
+                        prefer_legacy_sim_snapshot=False,
+                    )
             conn.execute("UPDATE system_events SET account_id = ? WHERE rowid = ?", (account_id, row["rowid"]))
+
+    def _sanitize_system_event_account_ids(self, conn: sqlite3.Connection) -> None:
+        if not self._table_exists(conn, "system_events"):
+            return
+        rows = conn.execute(
+            """
+            SELECT rowid, component, details_json, account_id
+            FROM system_events
+            WHERE COALESCE(TRIM(account_id), '') <> ''
+            """
+        ).fetchall()
+        for row in rows:
+            payload = self._parse_json_payload(row["details_json"])
+            if str(payload.get("account_id") or payload.get("execution_account_id") or "").strip():
+                continue
+            if str(payload.get("order_id") or "").strip():
+                continue
+            symbol = str(payload.get("symbol") or "").strip()
+            asset_type = str(payload.get("asset_type") or "").strip()
+            payload_broker = str(payload.get("broker") or "").strip()
+            inferred = infer_execution_account_id(
+                symbol=symbol,
+                asset_type=asset_type,
+                source="kis_account_sync" if str(row["component"] or "").startswith("kis_") else "",
+                raw_payload=payload,
+                prefer_legacy_sim_snapshot=False,
+            )
+            if not inferred and not symbol and not asset_type and not payload_broker:
+                conn.execute("UPDATE system_events SET account_id = '' WHERE rowid = ?", (row["rowid"],))
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         job_run_columns = self._column_names(conn, "job_runs")
@@ -558,6 +591,7 @@ class TradingRepository:
         self._backfill_position_account_ids(conn)
         self._backfill_snapshot_account_ids(conn)
         self._backfill_system_event_account_ids(conn)
+        self._sanitize_system_event_account_ids(conn)
 
     def initialize_runtime_flags(self, defaults: Dict[str, tuple[str, str]]) -> None:
         rows = [(name, value, utc_now_iso(), notes) for name, (value, notes) in defaults.items()]
@@ -1003,6 +1037,7 @@ class TradingRepository:
         limit: int = 50,
         *,
         execution_account_id: str | None = None,
+        strategy_version: str | None = None,
     ) -> pd.DataFrame:
         clauses: List[str] = []
         params: List[Any] = []
@@ -1015,6 +1050,9 @@ class TradingRepository:
         if execution_account_id:
             clauses.append("execution_account_id = ?")
             params.append(str(execution_account_id))
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         query = "SELECT * FROM candidate_scans"
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
@@ -1091,10 +1129,13 @@ class TradingRepository:
             row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
         return dict(row) if row else None
 
-    def recent_orders(self, limit: int = 200, *, account_id: str | None = None) -> pd.DataFrame:
+    def recent_orders(self, limit: int = 200, *, account_id: str | None = None, strategy_version: str | None = None) -> pd.DataFrame:
         clauses: List[str] = []
         params: List[Any] = []
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         query = """
                 SELECT rowid, *
                 FROM orders
@@ -1109,12 +1150,47 @@ class TradingRepository:
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
 
-    def open_orders(self, statuses: Iterable[str] | None = None, *, account_id: str | None = None) -> pd.DataFrame:
+    def candidate_scans_by_date(
+        self,
+        created_date: str,
+        *,
+        asset_type: str | None = None,
+        strategy_version: str | None = None,
+        execution_account_id: str | None = None,
+        limit: int = 5000,
+    ) -> pd.DataFrame:
+        clauses = ["substr(created_at, 1, 10) = ?"]
+        params: List[Any] = [str(created_date)]
+        if asset_type:
+            clauses.append("asset_type = ?")
+            params.append(str(asset_type))
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
+        if execution_account_id:
+            clauses.append("execution_account_id = ?")
+            params.append(str(execution_account_id))
+        query = "SELECT * FROM candidate_scans WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def open_orders(
+        self,
+        statuses: Iterable[str] | None = None,
+        *,
+        account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> pd.DataFrame:
         statuses = tuple(statuses or ACTIVE_ORDER_STATUSES)
         placeholders = ", ".join("?" for _ in statuses)
         clauses = [f"status IN ({placeholders})"]
         params: List[Any] = list(statuses)
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         query = "SELECT rowid, * FROM orders WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, rowid ASC"
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
@@ -1126,6 +1202,7 @@ class TradingRepository:
         timeframe: str | None = None,
         asset_type: str | None = None,
         account_id: str | None = None,
+        strategy_version: str | None = None,
         active_only: bool = True,
     ) -> pd.DataFrame:
         clauses = ["reason = 'entry'"]
@@ -1143,6 +1220,9 @@ class TradingRepository:
         if asset_type:
             clauses.append("asset_type = ?")
             params.append(asset_type)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         self._append_account_filter(clauses, params, account_id)
         query = "SELECT rowid, * FROM orders WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, rowid ASC"
         with self.connect() as conn:
@@ -1209,10 +1289,13 @@ class TradingRepository:
                 row,
             )
 
-    def open_positions(self, *, account_id: str | None = None) -> pd.DataFrame:
+    def open_positions(self, *, account_id: str | None = None, strategy_version: str | None = None) -> pd.DataFrame:
         clauses = ["status = 'open'"]
         params: List[Any] = []
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         with self.connect() as conn:
             return pd.read_sql_query(
                 "SELECT rowid, * FROM positions WHERE " + " AND ".join(clauses) + " ORDER BY created_at ASC, rowid ASC",
@@ -1220,10 +1303,38 @@ class TradingRepository:
                 params=params,
             )
 
-    def latest_position_by_symbol(self, symbol: str, timeframe: str, *, account_id: str | None = None) -> pd.DataFrame:
+    def recent_closed_positions(
+        self,
+        limit: int = 100,
+        *,
+        account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> pd.DataFrame:
+        clauses = ["status = 'closed'", "closed_at IS NOT NULL"]
+        params: List[Any] = []
+        self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
+        query = "SELECT rowid, * FROM positions WHERE " + " AND ".join(clauses) + " ORDER BY closed_at DESC, rowid DESC LIMIT ?"
+        params.append(int(limit))
+        with self.connect() as conn:
+            return pd.read_sql_query(query, conn, params=params)
+
+    def latest_position_by_symbol(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> pd.DataFrame:
         clauses = ["symbol = ?", "timeframe = ?"]
         params: List[Any] = [symbol, timeframe]
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         query = """
                 SELECT *
                 FROM positions
@@ -1235,10 +1346,20 @@ class TradingRepository:
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
 
-    def latest_cooldown_until(self, symbol: str, timeframe: str, *, account_id: str | None = None) -> str | None:
+    def latest_cooldown_until(
+        self,
+        symbol: str,
+        timeframe: str,
+        *,
+        account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> str | None:
         clauses = ["symbol = ?", "timeframe = ?"]
         params: List[Any] = [symbol, timeframe]
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         query = """
                 SELECT cooldown_until
                 FROM positions
@@ -1258,7 +1379,7 @@ class TradingRepository:
         account_id = str(record.account_id or "").strip() or infer_execution_account_id(
             source=str(record.source or ""),
             raw_payload=payload,
-            prefer_legacy_sim_snapshot=True,
+            prefer_legacy_sim_snapshot=False,
         )
         payload.setdefault("account_id", account_id)
         row = asdict(record)
@@ -1316,7 +1437,13 @@ class TradingRepository:
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
 
-    def count_daily_entries(self, created_date: str, *, account_id: str | None = None) -> int:
+    def count_daily_entries(
+        self,
+        created_date: str,
+        *,
+        account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> int:
         clauses = [
             "substr(created_at, 1, 10) = ?",
             "reason = 'entry'",
@@ -1324,6 +1451,9 @@ class TradingRepository:
         ]
         params: List[Any] = [created_date]
         self._append_account_filter(clauses, params, account_id)
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         with self.connect() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS cnt FROM orders WHERE " + " AND ".join(clauses),
@@ -1539,12 +1669,21 @@ class TradingRepository:
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
 
-    def prediction_by_scan(self, scan_id: str, *, execution_account_id: str | None = None) -> pd.DataFrame:
+    def prediction_by_scan(
+        self,
+        scan_id: str,
+        *,
+        execution_account_id: str | None = None,
+        strategy_version: str | None = None,
+    ) -> pd.DataFrame:
         clauses = ["scan_id = ?"]
         params: List[Any] = [scan_id]
         if execution_account_id:
             clauses.append("execution_account_id = ?")
             params.append(str(execution_account_id))
+        if strategy_version:
+            clauses.append("strategy_version = ?")
+            params.append(str(strategy_version))
         with self.connect() as conn:
             return pd.read_sql_query(
                 """

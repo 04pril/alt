@@ -20,6 +20,15 @@ class OutcomeResolver:
             return timestamp.tz_localize("UTC")
         return timestamp.tz_convert("UTC")
 
+    @staticmethod
+    def _floor_frequency(timeframe: object) -> str:
+        normalized = str(timeframe or "").strip().lower()
+        if normalized.endswith("m") and normalized[:-1].isdigit():
+            return f"{int(normalized[:-1])}min"
+        if normalized.endswith("h") and normalized[:-1].isdigit():
+            return f"{int(normalized[:-1])}h"
+        return str(timeframe or "")
+
     def resolve(self, limit: int = 500) -> int:
         unresolved = self.repository.unresolved_predictions(limit=limit)
         if unresolved.empty:
@@ -44,7 +53,7 @@ class OutcomeResolver:
                 target_key = target_at.tz_convert("UTC").tz_localize(None).normalize()
                 close_map = pd.Series(bars["Close"].astype(float).values, index=index.tz_localize(None).normalize())
             else:
-                target_key = target_at.tz_convert("UTC").tz_localize(None).floor(str(row["timeframe"]))
+                target_key = target_at.tz_convert("UTC").tz_localize(None).floor(self._floor_frequency(row["timeframe"]))
                 close_map = pd.Series(bars["Close"].astype(float).values, index=index.tz_localize(None))
             actual_price = close_map.get(target_key)
             if pd.isna(actual_price):

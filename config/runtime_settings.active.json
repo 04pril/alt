@@ -1,5 +1,19 @@
 {
   "profile_name": "active",
+  "kr_default_strategy_id": "kr_intraday_1h_v1",
+  "kr_strategies": {
+    "kr_daily_preclose_v1": {
+      "enabled": false
+    },
+    "kr_intraday_1h_v1": {
+      "enabled": true,
+      "experimental": false
+    },
+    "kr_intraday_15m_v1": {
+      "enabled": false,
+      "experimental": true
+    }
+  },
   "strategy": {
     "min_signal_strength_pct": 0.18,
     "min_expected_return_pct": 0.3,

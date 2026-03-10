@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
+from kr_strategy import get_kr_strategy
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -219,12 +220,30 @@ class PaperBroker:
         return (entry_price - mark_price) * quantity
 
     def _timeframe_delta(self, timeframe: str) -> timedelta:
+        if timeframe == "15m":
+            return timedelta(minutes=15)
         if timeframe == "1h":
             return timedelta(hours=1)
         return timedelta(days=1)
 
-    def _compute_cooldown_until(self, asset_type: str, timeframe: str, now_iso: str) -> str:
-        bars = max(int(self.settings.risk.cooldown_bars_after_exit), 0)
+    def _strategy_config(self, strategy_version: str = ""):
+        return get_kr_strategy(self.settings, str(strategy_version or ""))
+
+    def _max_holding_bars(self, strategy_version: str = "") -> int:
+        strategy_cfg = self._strategy_config(strategy_version)
+        return max(int(strategy_cfg.max_holding_bars if strategy_cfg is not None else self.settings.strategy.max_holding_bars), 0)
+
+    def _trailing_stop_mult(self, strategy_version: str = "") -> float:
+        strategy_cfg = self._strategy_config(strategy_version)
+        return float(strategy_cfg.trailing_stop_atr_mult if strategy_cfg is not None else self.settings.strategy.trailing_stop_atr_mult)
+
+    def _score_decay_threshold(self, strategy_version: str = "") -> float:
+        strategy_cfg = self._strategy_config(strategy_version)
+        return float(strategy_cfg.score_decay_exit_threshold if strategy_cfg is not None else self.settings.strategy.score_decay_exit_threshold)
+
+    def _compute_cooldown_until(self, asset_type: str, timeframe: str, now_iso: str, *, strategy_version: str = "") -> str:
+        strategy_cfg = self._strategy_config(strategy_version)
+        bars = max(int(strategy_cfg.cooldown_bars_after_exit if strategy_cfg is not None else self.settings.risk.cooldown_bars_after_exit), 0)
         current = pd.Timestamp(now_iso)
         if current.tzinfo is None:
             current = current.tz_localize("UTC")
@@ -279,7 +298,7 @@ class PaperBroker:
         side = "buy" if signal.signal == "LONG" else "sell"
         resolved_account_id = self._resolve_account_id(symbol=signal.symbol, asset_type=signal.asset_type, account_id=account_id)
         max_holding_until = (
-            pd.Timestamp.now(tz="UTC") + self._timeframe_delta(signal.timeframe) * int(self.settings.strategy.max_holding_bars)
+            pd.Timestamp.now(tz="UTC") + self._timeframe_delta(signal.timeframe) * int(self._max_holding_bars(signal.strategy_version))
         ).isoformat()
         record = OrderRecord(
             order_id=order_id,
@@ -337,7 +356,7 @@ class PaperBroker:
             "execution_pipeline",
             "submit_requested",
             "sim entry submit requested",
-            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id},
+            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id, "strategy_version": signal.strategy_version},
             account_id=resolved_account_id,
         )
         self.repository.log_event(
@@ -345,7 +364,7 @@ class PaperBroker:
             "execution_pipeline",
             "submitted",
             "sim entry submitted",
-            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id},
+            {"order_id": order_id, "symbol": signal.symbol, "account_id": resolved_account_id, "strategy_version": signal.strategy_version},
             account_id=resolved_account_id,
         )
         return {
@@ -550,6 +569,7 @@ class PaperBroker:
                             asset_type=str(position["asset_type"]),
                             timeframe=str(position["timeframe"]),
                             now_iso=now_iso,
+                            strategy_version=str(position.get("strategy_version") or ""),
                         ),
                         "notes": f"closed_by_{order['reason']}",
                         "account_id": account_id,
@@ -703,7 +723,7 @@ class PaperBroker:
                 "execution_pipeline",
                 "filled" if remaining_qty <= 0 else "partially_filled",
                 "sim order filled",
-                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty), "account_id": account_id},
+                {"order_id": str(order["order_id"]), "symbol": str(order["symbol"]), "fill_qty": int(fill_qty), "account_id": account_id, "strategy_version": str(order.get("strategy_version") or "")},
                 account_id=account_id,
             )
         for account_id in touched_accounts:

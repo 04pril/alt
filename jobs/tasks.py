@@ -7,7 +7,15 @@ from typing import Any, Callable, Dict, Iterable
 import pandas as pd
 
 from config.settings import RuntimeSettings, load_settings
-from runtime_accounts import resolve_execution_account
+from kr_strategy import (
+    active_kr_strategy_ids,
+    default_kr_strategy,
+    entry_gate_reason,
+    get_kr_strategy,
+    strategy_label,
+    strategy_schedule,
+)
+from runtime_accounts import account_scope_for_asset_type, resolve_execution_account
 from services.broker_router import BrokerRouter
 from services.evaluator import Evaluator
 from services.kis_paper_broker import KISPaperBroker
@@ -66,6 +74,16 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
         str(settings.profile_source or "embedded_defaults"),
         "task_context",
     )
+    repository.set_control_flag(
+        "kr_active_strategies",
+        ",".join(active_kr_strategy_ids(settings)),
+        "task_context",
+    )
+    repository.set_control_flag(
+        "kr_default_strategy_id",
+        str((default_kr_strategy(settings).strategy_id if default_kr_strategy(settings) is not None else settings.kr_default_strategy_id) or ""),
+        "task_context",
+    )
     return TaskContext(
         settings=settings,
         repository=repository,
@@ -82,13 +100,20 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
 
 
 def _rebuild_signal(context: TaskContext, candidate_row: pd.Series) -> SignalDecision | None:
+    candidate_meta = json.loads(str(candidate_row.get("raw_json") or "{}")) if str(candidate_row.get("raw_json") or "").strip() else {}
     predictions = context.repository.prediction_by_scan(
         str(candidate_row["scan_id"]),
         execution_account_id=str(candidate_row.get("execution_account_id") or ""),
+        strategy_version=str(candidate_row.get("strategy_version") or ""),
     )
     if predictions.empty:
         return None
-    pred = predictions.iloc[0]
+    selected_prediction_id = str(candidate_meta.get("prediction_id") or "").strip()
+    if selected_prediction_id:
+        matched = predictions.loc[predictions["prediction_id"].astype(str) == selected_prediction_id]
+        pred = matched.iloc[0] if not matched.empty else predictions.iloc[0]
+    else:
+        pred = predictions.iloc[0]
     notes = json.loads(str(pred.get("notes") or "{}"))
     return SignalDecision(
         symbol=str(pred["symbol"]),
@@ -113,17 +138,28 @@ def _rebuild_signal(context: TaskContext, candidate_row: pd.Series) -> SignalDec
         strategy_version=str(pred["strategy_version"]),
         validation_mode=str(pred["validation_mode"]),
         result=None,
+        strategy_family=str(notes.get("strategy_family") or ""),
+        decision_horizon_bars=int(notes.get("decision_horizon_bars") or 1),
+        primary_target_type=str(notes.get("primary_target") or pred.get("target_type") or "next_close_return"),
+        secondary_target_type=str(notes.get("secondary_target") or ""),
+        analysis_target_type=str(notes.get("analysis_target") or ""),
+        experimental=bool(notes.get("experimental", False)),
     )
 
 
 def _execution_event(context: TaskContext, event_type: str, message: str, details: Dict[str, Any], *, level: str = "INFO") -> None:
     account_id = str(details.get("account_id") or details.get("execution_account_id") or "").strip()
     if not account_id:
-        account_id = resolve_execution_account(
-            symbol=str(details.get("symbol") or ""),
-            asset_type=str(details.get("asset_type") or ""),
-            kis_enabled=True,
-        ).account_id
+        symbol = str(details.get("symbol") or "").strip()
+        asset_type = str(details.get("asset_type") or "").strip()
+        if symbol:
+            account_id = resolve_execution_account(
+                symbol=symbol,
+                asset_type=asset_type,
+                kis_enabled=True,
+            ).account_id
+        elif asset_type:
+            account_id = account_scope_for_asset_type(asset_type)
     context.repository.log_event(
         level,
         "execution_pipeline",
@@ -139,7 +175,9 @@ def _record_noop(context: TaskContext, asset_type: str, reason: str, details: Di
 
 
 def _account_scope_for_asset(asset_type: str, symbol: str = "") -> str:
-    return resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
+    if str(symbol or "").strip():
+        return resolve_execution_account(symbol=symbol, asset_type=asset_type, kis_enabled=True).account_id
+    return account_scope_for_asset_type(asset_type)
 
 
 def _active_account_ids(context: TaskContext) -> list[str]:
@@ -149,10 +187,54 @@ def _active_account_ids(context: TaskContext) -> list[str]:
     return [str(value) for value in accounts["account_id"].dropna().astype(str).tolist() if str(value).strip()]
 
 
-def scan_job(context: TaskContext, asset_types: Iterable[str] | None = None) -> Dict[str, int]:
-    asset_list = list(asset_types or context.settings.asset_schedules.keys())
+def _market_current_time(market_data_service: Any, asset_type: str):
+    current_time_fn = getattr(market_data_service, "current_time", None)
+    if callable(current_time_fn):
+        try:
+            return current_time_fn(asset_type)
+        except Exception:
+            return None
+    return None
+
+
+def scan_job(
+    context: TaskContext,
+    asset_types: Iterable[str] | None = None,
+    strategy_ids: Iterable[str] | None = None,
+) -> Dict[str, int]:
     results: Dict[str, int] = {}
+    if strategy_ids:
+        for strategy_id in strategy_ids:
+            strategy = get_kr_strategy(context.settings, str(strategy_id))
+            if strategy is None:
+                continue
+            account_id = _account_scope_for_asset("한국주식")
+            context.touch_runtime("scan_strategy", {"asset_type": "한국주식", "strategy_version": strategy.strategy_id})
+            rows = context.universe_scanner.scan_strategy(strategy.strategy_id, touch=context.touch_runtime)
+            results[str(strategy.strategy_id)] = len(rows)
+            context.repository.log_event(
+                "INFO",
+                "scan_job",
+                "scan_complete",
+                f"{strategy.display_name} scanned",
+                {
+                    "count": len(rows),
+                    "asset_type": "한국주식",
+                    "account_id": account_id,
+                    "strategy_version": strategy.strategy_id,
+                    "strategy_family": strategy.strategy_family,
+                    "experimental": bool(strategy.experimental),
+                },
+                account_id=account_id,
+            )
+        return results
+
+    asset_list = list(asset_types or context.settings.asset_schedules.keys())
     for asset_type in asset_list:
+        if asset_type == "한국주식" and active_kr_strategy_ids(context.settings):
+            nested = scan_job(context, strategy_ids=active_kr_strategy_ids(context.settings))
+            results.update(nested)
+            continue
         account_id = _account_scope_for_asset(asset_type)
         context.touch_runtime("scan_asset", {"asset_type": asset_type})
         rows = context.universe_scanner.scan_asset(asset_type, touch=context.touch_runtime)
@@ -168,10 +250,192 @@ def scan_job(context: TaskContext, asset_types: Iterable[str] | None = None) -> 
     return results
 
 
-def entry_decision_job(context: TaskContext, asset_types: Iterable[str] | None = None) -> Dict[str, int]:
-    asset_list = list(asset_types or context.settings.asset_schedules.keys())
+def entry_decision_job(
+    context: TaskContext,
+    asset_types: Iterable[str] | None = None,
+    strategy_ids: Iterable[str] | None = None,
+) -> Dict[str, int]:
     entered: Dict[str, int] = {}
+    if strategy_ids:
+        for strategy_id in strategy_ids:
+            strategy = get_kr_strategy(context.settings, str(strategy_id))
+            if strategy is None:
+                continue
+            asset_type = "한국주식"
+            schedule = strategy_schedule(context.settings, strategy.strategy_id)
+            market_is_open = context.market_data_service.is_market_open(asset_type)
+            gate_reason = entry_gate_reason(
+                context.settings,
+                strategy.strategy_id,
+                when=_market_current_time(context.market_data_service, asset_type),
+                market_is_open=market_is_open,
+            )
+            if gate_reason:
+                entered[strategy.strategy_id] = 0
+                _record_noop(
+                    context,
+                    asset_type,
+                    gate_reason,
+                    {
+                        "market_phase": context.market_data_service.market_phase(asset_type),
+                        "strategy_version": strategy.strategy_id,
+                        "experimental": bool(strategy.experimental),
+                    },
+                )
+                continue
+
+            latest = context.repository.latest_candidates(
+                asset_type=asset_type,
+                timeframe=schedule.timeframe,
+                limit=200,
+                strategy_version=strategy.strategy_id,
+            )
+            if latest.empty:
+                entered[strategy.strategy_id] = 0
+                _record_noop(context, asset_type, "no_candidate", {"strategy_version": strategy.strategy_id})
+                continue
+
+            latest = latest.sort_values(["created_at", "rank"], ascending=[False, True]).drop_duplicates(subset=["symbol", "strategy_version"], keep="first")
+            latest = latest[(latest["status"] == "candidate") & (latest["is_holding"] == 0)]
+            if latest.empty:
+                entered[strategy.strategy_id] = 0
+                _record_noop(context, asset_type, "no_candidate", {"filtered": True, "strategy_version": strategy.strategy_id})
+                continue
+
+            count = 0
+            detailed_no_trade_reason_logged = False
+            for _, candidate in latest.iterrows():
+                context.touch_runtime(
+                    "entry_candidate",
+                    {"asset_type": asset_type, "symbol": str(candidate["symbol"]), "strategy_version": strategy.strategy_id},
+                )
+                _execution_event(
+                    context,
+                    "candidate",
+                    "candidate considered for execution",
+                    {
+                        "asset_type": asset_type,
+                        "account_id": str(candidate.get("execution_account_id") or ""),
+                        "symbol": str(candidate["symbol"]),
+                        "scan_id": str(candidate["scan_id"]),
+                        "rank": int(candidate["rank"]),
+                        "score": float(candidate["score"]),
+                        "strategy_version": strategy.strategy_id,
+                        "experimental": bool(strategy.experimental),
+                    },
+                )
+                signal = _rebuild_signal(context, candidate)
+                if signal is None:
+                    detailed_no_trade_reason_logged = True
+                    _execution_event(
+                        context,
+                        "entry_rejected",
+                        "candidate missing prediction",
+                        {
+                            "symbol": str(candidate["symbol"]),
+                            "reason": "missing_prediction",
+                            "scan_id": str(candidate["scan_id"]),
+                            "account_id": str(candidate.get("execution_account_id") or ""),
+                            "strategy_version": strategy.strategy_id,
+                        },
+                    )
+                    continue
+                account_id = context.paper_broker.resolve_execution_account_id(signal.symbol, signal.asset_type)
+                open_positions = context.repository.open_positions(account_id=account_id)
+                corr_symbols = list(open_positions["symbol"].astype(str).tolist()) if not open_positions.empty else []
+                correlation_matrix = (
+                    context.market_data_service.correlation_matrix(
+                        symbols=list(set(corr_symbols + [signal.symbol])),
+                        asset_type=asset_type,
+                        timeframe=schedule.timeframe,
+                        lookback_bars=context.settings.risk.correlation_window_bars,
+                    )
+                    if corr_symbols
+                    else pd.DataFrame()
+                )
+                risk_decision = context.risk_engine.evaluate_entry(signal, correlation_matrix=correlation_matrix, market_is_open=market_is_open)
+                if not risk_decision.allowed:
+                    detailed_no_trade_reason_logged = True
+                    _execution_event(
+                        context,
+                        "entry_rejected",
+                        "risk gate rejected candidate",
+                        {
+                            "symbol": signal.symbol,
+                            "asset_type": asset_type,
+                            "reason": risk_decision.reason,
+                            "scan_id": signal.scan_id,
+                            "account_id": account_id,
+                            "strategy_version": strategy.strategy_id,
+                        },
+                    )
+                    continue
+
+                _execution_event(
+                    context,
+                    "entry_allowed",
+                    "entry passed risk gate",
+                    {
+                        "symbol": signal.symbol,
+                        "asset_type": asset_type,
+                        "quantity": int(risk_decision.quantity),
+                        "scan_id": signal.scan_id,
+                        "account_id": account_id,
+                        "strategy_version": strategy.strategy_id,
+                    },
+                )
+                submit = context.paper_broker.submit_entry_order_result(
+                    signal=signal,
+                    quantity=risk_decision.quantity,
+                    scan_id=signal.scan_id,
+                    market_data_service=context.market_data_service,
+                )
+                if not submit.get("submitted", False):
+                    detailed_no_trade_reason_logged = True
+                    _execution_event(
+                        context,
+                        "entry_rejected",
+                        "broker pre-submit rejected candidate",
+                        {
+                            "symbol": signal.symbol,
+                            "asset_type": asset_type,
+                            "reason": str(submit.get("reason") or "broker_rejected"),
+                            "scan_id": signal.scan_id,
+                            "account_id": account_id,
+                            "strategy_version": strategy.strategy_id,
+                        },
+                    )
+                    continue
+                count += 1
+            entered[strategy.strategy_id] = count
+            if count == 0:
+                if not detailed_no_trade_reason_logged:
+                    _record_noop(context, asset_type, "no_submit", {"strategy_version": strategy.strategy_id})
+            else:
+                account_id = _account_scope_for_asset(asset_type)
+                context.repository.log_event(
+                    "INFO",
+                    "entry_job",
+                    "entry_orders_created",
+                    f"{strategy.display_name} entries",
+                    {
+                        "count": count,
+                        "asset_type": asset_type,
+                        "account_id": account_id,
+                        "strategy_version": strategy.strategy_id,
+                        "strategy_family": strategy.strategy_family,
+                        "experimental": bool(strategy.experimental),
+                    },
+                    account_id=account_id,
+                )
+        return entered
+
+    asset_list = list(asset_types or context.settings.asset_schedules.keys())
     for asset_type in asset_list:
+        if asset_type == "한국주식" and active_kr_strategy_ids(context.settings):
+            nested = entry_decision_job(context, strategy_ids=active_kr_strategy_ids(context.settings))
+            entered.update(nested)
+            continue
         schedule = context.settings.asset_schedules[asset_type]
         market_is_open = context.market_data_service.is_market_open(asset_type)
         if not market_is_open:
