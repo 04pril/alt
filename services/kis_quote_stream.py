@@ -66,7 +66,7 @@ KR_QUOTE_FIELDS = (
     "MRKT_TRTM_CLS_CODE",
     "VI_STND_PRC",
 )
-MAX_KR_QUOTE_SYMBOLS = 40
+MAX_KR_QUOTE_SYMBOLS = 100
 
 
 def _f(value: object) -> float:

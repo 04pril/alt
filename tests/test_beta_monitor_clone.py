@@ -210,6 +210,69 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('data-cand-tab="us"', markup)
         self.assertNotIn("beta_cand_tab=us", markup)
 
+    def test_candidate_tabs_prefer_latest_row_with_expected_return(self) -> None:
+        candidates = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T14:11:00Z",
+                    "symbol": "BTC-USD",
+                    "asset_type": "crypto",
+                    "status": "rejected",
+                    "signal": "FLAT",
+                    "expected_return": float("nan"),
+                    "confidence": 0.0,
+                    "score": -999.0,
+                },
+                {
+                    "created_at": "2026-03-09T14:10:00Z",
+                    "symbol": "BTC-USD",
+                    "asset_type": "crypto",
+                    "status": "candidate",
+                    "signal": "LONG",
+                    "expected_return": 0.014,
+                    "confidence": 0.62,
+                    "score": 2.1,
+                },
+            ]
+        )
+
+        markup = _candidate_tabs_html(
+            candidates,
+            kr_asset_types={"한국주식"},
+            kr_symbol_names={},
+            current_tab="crypto",
+            jobs="all",
+        )
+
+        self.assertIn("+1.40%", markup)
+        self.assertNotIn(">N/A<", markup)
+
+    def test_candidate_tabs_show_kr_name_for_bare_code(self) -> None:
+        candidates = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T14:10:00Z",
+                    "symbol": "005930",
+                    "asset_type": "한국주식",
+                    "signal": "LONG",
+                    "expected_return": 0.012,
+                    "confidence": 0.71,
+                    "score": 3.4,
+                }
+            ]
+        )
+
+        markup = _candidate_tabs_html(
+            candidates,
+            kr_asset_types={"한국주식"},
+            kr_symbol_names={"005930": "삼성전자"},
+            current_tab="kr",
+            jobs="all",
+        )
+
+        self.assertIn("삼성전자", markup)
+        self.assertIn("005930", markup)
+
     def test_action_button_uses_button_markup_with_beta_href(self) -> None:
         markup = _action_button(
             "계좌 동기화",

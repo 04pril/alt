@@ -177,6 +177,15 @@ def _execution_event(context: TaskContext, event_type: str, message: str, detail
     )
 
 
+def _finite_metric_details(**values: Any) -> Dict[str, Any]:
+    details: Dict[str, Any] = {}
+    for key, value in values.items():
+        number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+        if pd.notna(number):
+            details[key] = float(number)
+    return details
+
+
 def _record_noop(context: TaskContext, asset_type: str, reason: str, details: Dict[str, Any] | None = None) -> None:
     _execution_event(context, "noop", f"{asset_type} entry noop", {"asset_type": asset_type, "reason": reason, **(details or {})})
 
@@ -360,6 +369,12 @@ def entry_decision_job(
                         "strategy_family": strategy.strategy_family,
                         "session_mode": strategy_session_label(strategy),
                         "experimental": bool(strategy.experimental),
+                        **_finite_metric_details(
+                            expected_return=candidate.get("expected_return"),
+                            expected_risk=candidate.get("expected_risk"),
+                            confidence=candidate.get("confidence"),
+                            threshold=candidate.get("threshold"),
+                        ),
                     },
                 )
                 signal = _rebuild_signal(context, candidate)
@@ -409,6 +424,12 @@ def entry_decision_job(
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
                             "session_mode": strategy_session_label(strategy),
+                            **_finite_metric_details(
+                                expected_return=signal.expected_return,
+                                expected_risk=signal.expected_risk,
+                                confidence=signal.confidence,
+                                threshold=signal.threshold,
+                            ),
                         },
                     )
                     continue
@@ -426,6 +447,12 @@ def entry_decision_job(
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
                         "session_mode": strategy_session_label(strategy),
+                        **_finite_metric_details(
+                            expected_return=signal.expected_return,
+                            expected_risk=signal.expected_risk,
+                            confidence=signal.confidence,
+                            threshold=signal.threshold,
+                        ),
                     },
                 )
                 submit = context.paper_broker.submit_entry_order_result(
@@ -449,6 +476,12 @@ def entry_decision_job(
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
                             "session_mode": strategy_session_label(strategy),
+                            **_finite_metric_details(
+                                expected_return=signal.expected_return,
+                                expected_risk=signal.expected_risk,
+                                confidence=signal.confidence,
+                                threshold=signal.threshold,
+                            ),
                         },
                     )
                     continue
@@ -531,6 +564,12 @@ def entry_decision_job(
                     "scan_id": str(candidate["scan_id"]),
                     "rank": int(candidate["rank"]),
                     "score": float(candidate["score"]),
+                    **_finite_metric_details(
+                        expected_return=candidate.get("expected_return"),
+                        expected_risk=candidate.get("expected_risk"),
+                        confidence=candidate.get("confidence"),
+                        threshold=candidate.get("threshold"),
+                    ),
                 },
             )
             signal = _rebuild_signal(context, candidate)
@@ -568,7 +607,19 @@ def entry_decision_job(
                     context,
                     "entry_rejected",
                     "risk gate rejected candidate",
-                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": risk_decision.reason, "scan_id": signal.scan_id, "account_id": account_id},
+                    {
+                        "symbol": signal.symbol,
+                        "asset_type": asset_type,
+                        "reason": risk_decision.reason,
+                        "scan_id": signal.scan_id,
+                        "account_id": account_id,
+                        **_finite_metric_details(
+                            expected_return=signal.expected_return,
+                            expected_risk=signal.expected_risk,
+                            confidence=signal.confidence,
+                            threshold=signal.threshold,
+                        ),
+                    },
                 )
                 continue
 
@@ -576,7 +627,19 @@ def entry_decision_job(
                 context,
                 "entry_allowed",
                 "entry passed risk gate",
-                {"symbol": signal.symbol, "asset_type": asset_type, "quantity": int(risk_decision.quantity), "scan_id": signal.scan_id, "account_id": account_id},
+                {
+                    "symbol": signal.symbol,
+                    "asset_type": asset_type,
+                    "quantity": int(risk_decision.quantity),
+                    "scan_id": signal.scan_id,
+                    "account_id": account_id,
+                    **_finite_metric_details(
+                        expected_return=signal.expected_return,
+                        expected_risk=signal.expected_risk,
+                        confidence=signal.confidence,
+                        threshold=signal.threshold,
+                    ),
+                },
             )
             submit = context.paper_broker.submit_entry_order_result(
                 signal=signal,
@@ -590,7 +653,19 @@ def entry_decision_job(
                     context,
                     "entry_rejected",
                     "broker pre-submit rejected candidate",
-                    {"symbol": signal.symbol, "asset_type": asset_type, "reason": str(submit.get("reason") or "broker_rejected"), "scan_id": signal.scan_id, "account_id": account_id},
+                    {
+                        "symbol": signal.symbol,
+                        "asset_type": asset_type,
+                        "reason": str(submit.get("reason") or "broker_rejected"),
+                        "scan_id": signal.scan_id,
+                        "account_id": account_id,
+                        **_finite_metric_details(
+                            expected_return=signal.expected_return,
+                            expected_risk=signal.expected_risk,
+                            confidence=signal.confidence,
+                            threshold=signal.threshold,
+                        ),
+                    },
                 )
                 continue
             count += 1

@@ -383,6 +383,16 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         reasons = matched["details_json"].fillna("{}").map(lambda payload: json.loads(str(payload or "{}")).get("reason"))
         self.assertIn(reason, set(reasons.tolist()))
 
+    def _latest_event_details(self, *, event_type: str, account_id: str | None = None) -> dict:
+        events = self._event_frame()
+        matched = events.loc[events["event_type"].astype(str) == event_type].copy()
+        self.assertFalse(matched.empty)
+        if account_id is not None:
+            matched = matched.loc[matched["account_id"].fillna("").astype(str) == str(account_id)]
+            self.assertFalse(matched.empty)
+        matched = matched.sort_values("created_at", ascending=False)
+        return json.loads(str(matched.iloc[0]["details_json"] or "{}"))
+
     def _load_dashboard_data_for_kis(self):
         with patch("monitoring.dashboard_hooks._kis_enabled_for_monitor", return_value=True):
             return load_dashboard_data(self.fixture.settings)
@@ -469,6 +479,21 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_submitted_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_acknowledged_count"], 1)
         self.assertGreaterEqual(dashboard_data["execution_summary"]["today_filled_count"], 1)
+
+    def test_crypto_candidate_event_includes_expected_return_metrics(self) -> None:
+        self._insert_candidate_prediction(
+            symbol="BTC-USD",
+            asset_type=self.fixture.crypto_asset_type,
+            timeframe="1h",
+            scan_id="scan-crypto-metrics",
+        )
+
+        entry_decision_job(self.fixture.context, [self.fixture.crypto_asset_type])
+
+        details = self._latest_event_details(event_type="candidate", account_id=ACCOUNT_SIM_CRYPTO)
+        self.assertAlmostEqual(float(details["expected_return"]), 0.02)
+        self.assertAlmostEqual(float(details["confidence"]), 0.9)
+        self.assertAlmostEqual(float(details["threshold"]), 0.003)
 
     def test_kr_15m_after_close_close_smoke_submit_requested_and_session_split(self) -> None:
         strategy_id = "kr_intraday_15m_v1_after_close_close"

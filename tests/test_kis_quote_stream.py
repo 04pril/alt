@@ -2,7 +2,35 @@ from __future__ import annotations
 
 import unittest
 
-from services.kis_quote_stream import KR_QUOTE_FIELDS, _stream_connect_kwargs, parse_kr_quote_message
+import pandas as pd
+
+from config.settings import RuntimeSettings, UniverseSettings
+from services.kis_quote_stream import (
+    KR_QUOTE_FIELDS,
+    MAX_KR_QUOTE_SYMBOLS,
+    KISKRQuoteStream,
+    _stream_connect_kwargs,
+    parse_kr_quote_message,
+)
+
+
+class _StubRepository:
+    def open_positions(self, *, account_id: str | None = None) -> pd.DataFrame:
+        return pd.DataFrame({"symbol": [f"{index:06d}.KS" for index in range(1, 41)]})
+
+    def open_orders(self, *, account_id: str | None = None) -> pd.DataFrame:
+        return pd.DataFrame({"symbol": [f"{index:06d}.KS" for index in range(41, 81)]})
+
+    def latest_candidates(
+        self,
+        asset_type: str | None = None,
+        execution_account_id: str | None = None,
+        limit: int = 20,
+    ) -> pd.DataFrame:
+        return pd.DataFrame({"symbol": [f"{index:06d}.KS" for index in range(81, 101)]})
+
+    def set_control_flag(self, flag_name: str, flag_value: str, notes: str = "") -> None:
+        return None
 
 
 class KISQuoteStreamTest(unittest.TestCase):
@@ -36,3 +64,18 @@ class KISQuoteStreamTest(unittest.TestCase):
         self.assertAlmostEqual(rows[0].ask_price, 190100.0)
         self.assertAlmostEqual(rows[0].bid_price, 189900.0)
         self.assertAlmostEqual(rows[0].volume, 1234567.0)
+
+    def test_candidate_symbols_expand_to_100_unique_codes(self) -> None:
+        settings = RuntimeSettings()
+        settings.universes["한국주식"] = UniverseSettings(
+            watchlist=[f"{index:06d}.KS" for index in range(101, 111)],
+            top_universe=[f"{index:06d}.KS" for index in range(111, 161)],
+        )
+        stream = KISKRQuoteStream(settings, _StubRepository(), client_factory=lambda: None)
+
+        symbols = stream._candidate_symbols()
+
+        self.assertEqual(len(symbols), MAX_KR_QUOTE_SYMBOLS)
+        self.assertEqual(symbols[0], "000001")
+        self.assertEqual(symbols[-1], "000100")
+        self.assertEqual(len(set(symbols)), MAX_KR_QUOTE_SYMBOLS)
