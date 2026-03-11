@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
-from kr_strategy import get_kr_strategy
+from kr_strategy import get_kr_strategy, strategy_runtime_metadata
 from runtime_accounts import (
     ACCOUNT_KIS_KR_PAPER,
     ACCOUNT_SIM_CRYPTO,
@@ -118,7 +118,14 @@ class PaperBroker:
         payload.setdefault("account_id", account_id)
         if str(payload.get("broker") or "").strip() == "":
             payload["broker"] = BROKER_MODE_SIM
-        peak_source = float(self.repository.max_account_equity(account_id=account_id))
+        normalized_source = str(source or "").strip()
+        peak_kwargs: Dict[str, Any] = {"account_id": account_id}
+        if account_id == ACCOUNT_KIS_KR_PAPER:
+            if normalized_source == "kis_account_sync":
+                peak_kwargs["source"] = "kis_account_sync"
+            else:
+                peak_kwargs["exclude_sources"] = ("kis_account_sync",)
+        peak_source = float(self.repository.max_account_equity(**peak_kwargs))
         if peak_source <= 0.0 and account_id != ACCOUNT_SIM_LEGACY_MIXED:
             peak_source = float(self.repository.max_account_equity(account_id=ACCOUNT_SIM_LEGACY_MIXED))
         peak = max(peak_source, float(equity))
@@ -241,6 +248,67 @@ class PaperBroker:
         strategy_cfg = self._strategy_config(strategy_version)
         return float(strategy_cfg.score_decay_exit_threshold if strategy_cfg is not None else self.settings.strategy.score_decay_exit_threshold)
 
+    def _stop_loss_mult(self, strategy_version: str = "") -> float:
+        strategy_cfg = self._strategy_config(strategy_version)
+        return float(strategy_cfg.stop_loss_atr_mult if strategy_cfg is not None else self.settings.strategy.stop_loss_atr_mult)
+
+    def _take_profit_mult(self, strategy_version: str = "") -> float:
+        strategy_cfg = self._strategy_config(strategy_version)
+        return float(strategy_cfg.take_profit_atr_mult if strategy_cfg is not None else self.settings.strategy.take_profit_atr_mult)
+
+    def _atr_value_from_order_meta(self, order_meta: Dict[str, Any], entry_price: float) -> float:
+        atr_value = float(pd.to_numeric(pd.Series([order_meta.get("atr_14")]), errors="coerce").iloc[0])
+        if np.isfinite(atr_value) and atr_value > 0:
+            return atr_value
+        expected_risk = float(pd.to_numeric(pd.Series([order_meta.get("expected_risk")]), errors="coerce").iloc[0])
+        if np.isfinite(expected_risk) and expected_risk > 0 and np.isfinite(entry_price) and entry_price > 0:
+            return float(entry_price) * float(expected_risk)
+        return float("nan")
+
+    def _recalculate_exit_levels(
+        self,
+        *,
+        entry_price: float,
+        side: str,
+        order_meta: Dict[str, Any],
+        strategy_version: str = "",
+        fallback_stop: float = float("nan"),
+        fallback_take: float = float("nan"),
+        fallback_trailing: float = float("nan"),
+    ) -> Dict[str, float]:
+        def _valid_exit(value: float, *, is_stop: bool) -> float:
+            if not np.isfinite(value):
+                return float("nan")
+            if side == "LONG":
+                return float(value) if (value < entry_price if is_stop else value > entry_price) else float("nan")
+            return float(value) if (value > entry_price if is_stop else value < entry_price) else float("nan")
+
+        atr_value = self._atr_value_from_order_meta(order_meta, entry_price)
+        if np.isfinite(atr_value) and atr_value > 0:
+            stop_mult = max(self._stop_loss_mult(strategy_version), 0.0)
+            take_mult = max(self._take_profit_mult(strategy_version), 0.0)
+            if side == "LONG":
+                stop_loss = entry_price - atr_value * stop_mult if stop_mult > 0 else float("nan")
+                take_profit = entry_price + atr_value * take_mult if take_mult > 0 else float("nan")
+            else:
+                stop_loss = entry_price + atr_value * stop_mult if stop_mult > 0 else float("nan")
+                take_profit = entry_price - atr_value * take_mult if take_mult > 0 else float("nan")
+            return {
+                "stop_loss": float(stop_loss),
+                "take_profit": float(take_profit),
+                "trailing_stop": float(stop_loss),
+            }
+        stop_loss = _valid_exit(float(fallback_stop), is_stop=True)
+        take_profit = _valid_exit(float(fallback_take), is_stop=False)
+        trailing_stop = _valid_exit(float(fallback_trailing), is_stop=True)
+        if not np.isfinite(trailing_stop):
+            trailing_stop = stop_loss
+        return {
+            "stop_loss": float(stop_loss),
+            "take_profit": float(take_profit),
+            "trailing_stop": float(trailing_stop),
+        }
+
     def _compute_cooldown_until(self, asset_type: str, timeframe: str, now_iso: str, *, strategy_version: str = "") -> str:
         strategy_cfg = self._strategy_config(strategy_version)
         bars = max(int(strategy_cfg.cooldown_bars_after_exit if strategy_cfg is not None else self.settings.risk.cooldown_bars_after_exit), 0)
@@ -265,6 +333,16 @@ class PaperBroker:
                 continue
             remaining -= 1
         return cursor.tz_convert("UTC").isoformat()
+
+    def _execution_metadata(self, strategy_version: str) -> Dict[str, str]:
+        return strategy_runtime_metadata(self.settings, str(strategy_version or ""))
+
+    def _position_metadata(self, source: Dict[str, Any]) -> Dict[str, str]:
+        return {
+            "strategy_family": str(source.get("strategy_family") or ""),
+            "session_mode": str(source.get("session_mode") or ""),
+            "price_policy": str(source.get("price_policy") or ""),
+        }
 
     def preflight_entry(
         self,
@@ -329,9 +407,11 @@ class PaperBroker:
                     "prediction_id": signal.prediction_id,
                     "stop_level": signal.stop_level,
                     "take_level": signal.take_level,
+                    "atr_14": signal.atr_value,
                     "expected_risk": signal.expected_risk,
                     "max_holding_until": max_holding_until,
                     "strategy_version": signal.strategy_version,
+                    **self._execution_metadata(signal.strategy_version),
                 },
                 ensure_ascii=False,
             ),
@@ -412,6 +492,8 @@ class PaperBroker:
                     "broker": BROKER_MODE_SIM,
                     "account_id": resolved_account_id,
                     "position_id": str(position["position_id"]),
+                    "strategy_version": str(position["strategy_version"]),
+                    **self._position_metadata(position),
                 },
                 ensure_ascii=False,
             ),
@@ -481,7 +563,18 @@ class PaperBroker:
         now_iso = utc_now_iso()
         side = self._position_side_from_order(str(order["side"]))
         order_meta = json.loads(str(order.get("raw_json") or "{}"))
+        strategy_version = str(order_meta.get("strategy_version") or order["strategy_version"])
+        metadata = self._execution_metadata(strategy_version)
         if latest.empty or str(latest.iloc[0]["status"]) != "open":
+            exit_levels = self._recalculate_exit_levels(
+                entry_price=float(fill_price),
+                side=side,
+                order_meta=order_meta,
+                strategy_version=strategy_version,
+                fallback_stop=float(order_meta.get("stop_level", np.nan)),
+                fallback_take=float(order_meta.get("take_level", np.nan)),
+                fallback_trailing=float(order_meta.get("stop_level", np.nan)),
+            )
             self.repository.upsert_position(
                 PositionRecord(
                     position_id=make_id("pos"),
@@ -497,9 +590,9 @@ class PaperBroker:
                     quantity=int(fill_qty),
                     entry_price=float(fill_price),
                     mark_price=float(fill_price),
-                    stop_loss=float(order_meta.get("stop_level", np.nan)),
-                    take_profit=float(order_meta.get("take_level", np.nan)),
-                    trailing_stop=float(order_meta.get("stop_level", np.nan)),
+                    stop_loss=float(exit_levels["stop_loss"]),
+                    take_profit=float(exit_levels["take_profit"]),
+                    trailing_stop=float(exit_levels["trailing_stop"]),
                     highest_price=float(fill_price),
                     lowest_price=float(fill_price),
                     unrealized_pnl=-fees,
@@ -507,10 +600,13 @@ class PaperBroker:
                     expected_risk=float(order_meta.get("expected_risk", np.nan)),
                     exposure_value=self._signed_market_value(side, int(fill_qty), float(fill_price)),
                     max_holding_until=str(order_meta.get("max_holding_until") or now_iso),
-                    strategy_version=str(order_meta.get("strategy_version") or order["strategy_version"]),
+                    strategy_version=strategy_version,
                     cooldown_until=None,
                     notes="opened_by_fill",
                     account_id=account_id,
+                    strategy_family=str(order_meta.get("strategy_family") or metadata["strategy_family"]),
+                    session_mode=str(order_meta.get("session_mode") or metadata["session_mode"]),
+                    price_policy=str(order_meta.get("price_policy") or metadata["price_policy"]),
                 )
             )
             return
@@ -525,6 +621,15 @@ class PaperBroker:
         if same_direction:
             new_qty = current_qty + fill_qty
             avg_price = ((entry_price * current_qty) + (fill_price * fill_qty)) / max(new_qty, 1)
+            exit_levels = self._recalculate_exit_levels(
+                entry_price=float(avg_price),
+                side=position_side,
+                order_meta=order_meta,
+                strategy_version=strategy_version,
+                fallback_stop=float(position["stop_loss"]),
+                fallback_take=float(position["take_profit"]),
+                fallback_trailing=float(position["trailing_stop"]),
+            )
             self.repository.upsert_position(
                 PositionRecord(
                     **{
@@ -533,14 +638,18 @@ class PaperBroker:
                         "quantity": int(new_qty),
                         "entry_price": float(avg_price),
                         "mark_price": float(fill_price),
-                        "stop_loss": float(order_meta.get("stop_level", position["stop_loss"])),
-                        "take_profit": float(order_meta.get("take_level", position["take_profit"])),
+                        "stop_loss": float(exit_levels["stop_loss"]),
+                        "take_profit": float(exit_levels["take_profit"]),
+                        "trailing_stop": float(exit_levels["trailing_stop"]),
                         "highest_price": max(float(position["highest_price"]), float(fill_price)),
                         "lowest_price": min(float(position["lowest_price"]), float(fill_price)),
                         "unrealized_pnl": self._compute_unrealized(position_side, float(avg_price), float(fill_price), int(new_qty)),
                         "exposure_value": self._signed_market_value(position_side, int(new_qty), float(fill_price)),
                         "notes": "scaled_position",
                         "account_id": account_id,
+                        "strategy_family": str(position.get("strategy_family") or order_meta.get("strategy_family") or metadata["strategy_family"]),
+                        "session_mode": str(position.get("session_mode") or order_meta.get("session_mode") or metadata["session_mode"]),
+                        "price_policy": str(position.get("price_policy") or order_meta.get("price_policy") or metadata["price_policy"]),
                     }
                 )
             )
@@ -573,6 +682,9 @@ class PaperBroker:
                         ),
                         "notes": f"closed_by_{order['reason']}",
                         "account_id": account_id,
+                        "strategy_family": str(position.get("strategy_family") or order_meta.get("strategy_family") or metadata["strategy_family"]),
+                        "session_mode": str(position.get("session_mode") or order_meta.get("session_mode") or metadata["session_mode"]),
+                        "price_policy": str(position.get("price_policy") or order_meta.get("price_policy") or metadata["price_policy"]),
                     }
                 )
             )
@@ -589,6 +701,9 @@ class PaperBroker:
                         "exposure_value": self._signed_market_value(position_side, int(remaining), float(fill_price)),
                         "notes": "partial_close",
                         "account_id": account_id,
+                        "strategy_family": str(position.get("strategy_family") or order_meta.get("strategy_family") or metadata["strategy_family"]),
+                        "session_mode": str(position.get("session_mode") or order_meta.get("session_mode") or metadata["session_mode"]),
+                        "price_policy": str(position.get("price_policy") or order_meta.get("price_policy") or metadata["price_policy"]),
                     }
                 )
             )
@@ -625,7 +740,14 @@ class PaperBroker:
                 fees=float(effective_fees),
                 slippage_bps=float(order["slippage_bps"]),
                 status="filled",
-                raw_json=json.dumps(raw_json or {}, default=str, ensure_ascii=False),
+                raw_json=json.dumps(
+                    {
+                        **self._execution_metadata(str(order.get("strategy_version") or "")),
+                        **(raw_json or {}),
+                    },
+                    default=str,
+                    ensure_ascii=False,
+                ),
                 account_id=account_id,
             )
         )
@@ -645,7 +767,8 @@ class PaperBroker:
         else:
             cash_value += applied_qty * fill_price - effective_fees
         self._update_position_from_fill(order=order, fill_qty=applied_qty, fill_price=float(fill_price), fees=float(effective_fees))
-        self.snapshot_account(cash_override=cash_value, account_id=account_id)
+        if account_id != ACCOUNT_KIS_KR_PAPER:
+            self.snapshot_account(cash_override=cash_value, account_id=account_id)
         return True
 
     def process_open_orders(self, market_data_service: MarketDataService, touch: Any | None = None) -> int:
@@ -696,7 +819,14 @@ class PaperBroker:
                     fees=float(fees),
                     slippage_bps=float(order["slippage_bps"]),
                     status="filled",
-                    raw_json=json.dumps(asdict(quote), default=str, ensure_ascii=False),
+                    raw_json=json.dumps(
+                        {
+                            **self._execution_metadata(str(order.get("strategy_version") or "")),
+                            **asdict(quote),
+                        },
+                        default=str,
+                        ensure_ascii=False,
+                    ),
                     account_id=account_id,
                 )
             )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
-from dataclasses import asdict
+import time
 from typing import Any, Iterable, Sequence
 
 import pandas as pd
@@ -66,7 +66,20 @@ KR_QUOTE_FIELDS = (
     "MRKT_TRTM_CLS_CODE",
     "VI_STND_PRC",
 )
-MAX_KR_QUOTE_SYMBOLS = 100
+# Runtime observation on 2026-03-11: KIS paper KR quote subscriptions
+# started returning OPSP0008 / "MAX SUBSCRIBE OVER" once total active
+# requests moved past roughly 40 symbols. Keep the total cap at 40.
+# KIS paper websocket also rejects parallel sockets with the same appkey,
+# so keep KR quotes on a single session.
+MAX_KR_QUOTE_SYMBOLS_PER_CONNECTION = 40
+MAX_KR_QUOTE_SYMBOLS = 40
+TRANSIENT_STREAM_RECONNECT_SECONDS = 1
+QUOTE_FLAG_UPDATE_INTERVAL_SECONDS = 2.0
+TRANSIENT_STREAM_ERROR_PATTERNS = (
+    "no close frame received or sent",
+    "keepalive ping timeout",
+    "connection closed",
+)
 
 
 def _f(value: object) -> float:
@@ -102,6 +115,23 @@ def _stream_connect_kwargs() -> dict[str, Any]:
         "max_size": None,
         "open_timeout": 20,
     }
+
+
+def _chunk_symbol_codes(symbol_codes: Sequence[str], *, batch_size: int = MAX_KR_QUOTE_SYMBOLS_PER_CONNECTION) -> tuple[tuple[str, ...], ...]:
+    normalized = tuple(str(symbol).strip() for symbol in symbol_codes if str(symbol).strip())
+    size = max(int(batch_size), 1)
+    return tuple(
+        normalized[index : index + size]
+        for index in range(0, len(normalized), size)
+        if normalized[index : index + size]
+    )
+
+
+def _is_transient_stream_error(exc: Exception) -> bool:
+    message = str(exc or "").strip().lower()
+    if not message:
+        return False
+    return any(pattern in message for pattern in TRANSIENT_STREAM_ERROR_PATTERNS)
 
 
 def parse_kr_quote_message(message: str, *, received_at: str | None = None) -> list[LiveMarketQuoteRecord]:
@@ -160,6 +190,7 @@ class KISKRQuoteStream:
         self._desired_symbols: tuple[str, ...] = ()
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
+        self._last_quote_flag_update_monotonic = 0.0
 
     def is_enabled(self) -> bool:
         try:
@@ -206,7 +237,8 @@ class KISKRQuoteStream:
         return tuple(normalized)
 
     def refresh_symbols(self, symbols: Sequence[str] | None = None) -> bool:
-        target = tuple(dict.fromkeys(str(symbol).strip() for symbol in (symbols or self._candidate_symbols()) if str(symbol).strip()))
+        deduped = tuple(dict.fromkeys(str(symbol).strip() for symbol in (symbols or self._candidate_symbols()) if str(symbol).strip()))
+        target = deduped[:MAX_KR_QUOTE_SYMBOLS]
         with self._lock:
             changed = target != self._desired_symbols
             self._desired_symbols = target
@@ -230,6 +262,67 @@ class KISKRQuoteStream:
     def _run_thread(self) -> None:
         asyncio.run(self._run())
 
+    async def _handle_message(self, ws, message: str) -> None:
+        stripped = message.strip()
+        if not stripped:
+            return
+        if stripped.startswith("{"):
+            payload = json.loads(stripped)
+            header = payload.get("header") or {}
+            body = payload.get("body") or {}
+            tr_id = str(header.get("tr_id") or "")
+            if tr_id == "PINGPONG":
+                await ws.send(stripped)
+                return
+            if body.get("rt_cd") not in (None, "0"):
+                self.repository.log_event(
+                    "WARNING",
+                    "kis_quote_stream",
+                    "stream_notice",
+                    str(body.get("msg1") or "KIS websocket notice"),
+                    {"payload": payload},
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            return
+        rows = parse_kr_quote_message(stripped)
+        if rows:
+            await asyncio.to_thread(self._persist_quote_rows, rows)
+
+    def _persist_quote_rows(self, rows: list[LiveMarketQuoteRecord]) -> None:
+        self.repository.upsert_live_market_quotes(rows)
+        now_monotonic = time.monotonic()
+        if (
+            self._last_quote_flag_update_monotonic <= 0.0
+            or (now_monotonic - self._last_quote_flag_update_monotonic) >= QUOTE_FLAG_UPDATE_INTERVAL_SECONDS
+            or len(rows) > 1
+        ):
+            self.repository.set_control_flag(
+                "kis_last_websocket_quote_at",
+                rows[-1].updated_at,
+                f"{len(rows)} quote updates",
+            )
+            self._last_quote_flag_update_monotonic = now_monotonic
+
+    async def _consume_batch(
+        self,
+        *,
+        approval_key: str,
+        desired_symbols: tuple[str, ...],
+        symbol_batch: tuple[str, ...],
+    ) -> None:
+        async with connect(KR_QUOTE_STREAM_URL, **_stream_connect_kwargs()) as ws:
+            for symbol_code in symbol_batch:
+                await ws.send(_build_subscribe_message(approval_key, symbol_code))
+            while not self._stop_event.is_set():
+                if desired_symbols != self._desired_snapshot():
+                    return
+                try:
+                    message = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+                if isinstance(message, str):
+                    await self._handle_message(ws, message)
+
     async def _run(self) -> None:
         reconnect_wait = max(int(self.settings.broker.websocket_reconnect_interval_seconds), 5)
         while not self._stop_event.is_set():
@@ -241,66 +334,51 @@ class KISKRQuoteStream:
             try:
                 client = self.client_factory()
                 approval_key = client.get_websocket_approval_key()
-                self._set_status("connecting", f"{len(desired_symbols)} symbols")
-                async with connect(KR_QUOTE_STREAM_URL, **_stream_connect_kwargs()) as ws:
-                    for symbol_code in desired_symbols:
-                        await ws.send(_build_subscribe_message(approval_key, symbol_code))
-                    self._set_status("connected", f"{len(desired_symbols)} symbols")
-                    self.repository.log_event(
-                        "INFO",
-                        "kis_quote_stream",
-                        "stream_connected",
-                        "KIS KR quote websocket connected",
-                        {"symbols": list(desired_symbols)},
-                        account_id=ACCOUNT_KIS_KR_PAPER,
+                symbol_batches = _chunk_symbol_codes(desired_symbols)
+                self._set_status("connecting", f"{len(desired_symbols)} symbols / {len(symbol_batches)} sessions")
+                tasks = [
+                    asyncio.create_task(
+                        self._consume_batch(
+                            approval_key=approval_key,
+                            desired_symbols=desired_symbols,
+                            symbol_batch=batch,
+                        )
                     )
-                    while not self._stop_event.is_set():
-                        if desired_symbols != self._desired_snapshot():
-                            break
-                        try:
-                            message = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                        except asyncio.TimeoutError:
-                            continue
-                        if not isinstance(message, str):
-                            continue
-                        stripped = message.strip()
-                        if not stripped:
-                            continue
-                        if stripped.startswith("{"):
-                            payload = json.loads(stripped)
-                            header = payload.get("header") or {}
-                            body = payload.get("body") or {}
-                            tr_id = str(header.get("tr_id") or "")
-                            if tr_id == "PINGPONG":
-                                await ws.send(stripped)
-                                continue
-                            if body.get("rt_cd") not in (None, "0"):
-                                self.repository.log_event(
-                                    "WARNING",
-                                    "kis_quote_stream",
-                                    "stream_notice",
-                                    str(body.get("msg1") or "KIS websocket notice"),
-                                    {"payload": payload},
-                                    account_id=ACCOUNT_KIS_KR_PAPER,
-                                )
-                            continue
-                        rows = parse_kr_quote_message(stripped)
-                        for row in rows:
-                            self.repository.upsert_live_market_quote(row)
-                        if rows:
-                            self.repository.set_control_flag(
-                                "kis_last_websocket_quote_at",
-                                rows[-1].updated_at,
-                                f"{len(rows)} quote updates",
-                            )
+                    for batch in symbol_batches
+                ]
+                self._set_status("connected", f"{len(desired_symbols)} symbols / {len(symbol_batches)} sessions")
+                self.repository.log_event(
+                    "INFO",
+                    "kis_quote_stream",
+                    "stream_connected",
+                    "KIS KR quote websocket connected",
+                    {
+                        "symbols": list(desired_symbols),
+                        "session_count": len(symbol_batches),
+                        "batch_sizes": [len(batch) for batch in symbol_batches],
+                    },
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+                for task in done:
+                    exc = task.exception()
+                    if exc is not None:
+                        raise exc
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                if desired_symbols != self._desired_snapshot():
+                    continue
             except Exception as exc:
+                transient = _is_transient_stream_error(exc)
                 self._set_status("reconnecting", str(exc))
                 self.repository.log_event(
-                    "ERROR",
+                    "WARNING" if transient else "ERROR",
                     "kis_quote_stream",
-                    "stream_error",
-                    "KIS KR quote websocket error",
+                    "stream_reconnect" if transient else "stream_error",
+                    "KIS KR quote websocket reconnecting" if transient else "KIS KR quote websocket error",
                     {"error": str(exc)},
                     account_id=ACCOUNT_KIS_KR_PAPER,
                 )
-                await asyncio.sleep(reconnect_wait)
+                await asyncio.sleep(TRANSIENT_STREAM_RECONNECT_SECONDS if transient else reconnect_wait)

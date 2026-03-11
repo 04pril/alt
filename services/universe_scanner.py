@@ -6,7 +6,7 @@ from typing import Dict, List
 import numpy as np
 
 from config.settings import RuntimeSettings
-from kr_strategy import get_kr_strategy, strategy_schedule
+from kr_strategy import get_kr_strategy, strategy_asset_schedule_key, strategy_runtime_config, strategy_schedule
 from services.market_data_service import MarketDataService
 from services.signal_engine import SignalDecision, SignalEngine
 from runtime_accounts import resolve_execution_account
@@ -56,11 +56,14 @@ class UniverseScanner:
         return self._scan(asset_type=asset_type, strategy_id=None, touch=touch)
 
     def scan_strategy(self, strategy_id: str, touch=None) -> List[CandidateScanRecord]:
-        return self._scan(asset_type="한국주식", strategy_id=strategy_id, touch=touch)
+        strategy = get_kr_strategy(self.settings, strategy_id)
+        return self._scan(asset_type=strategy_asset_schedule_key(strategy), strategy_id=strategy_id, touch=touch)
 
     def _scan(self, *, asset_type: str, strategy_id: str | None, touch=None) -> List[CandidateScanRecord]:
-        schedule = strategy_schedule(self.settings, strategy_id) if strategy_id else self.settings.asset_schedules[asset_type]
+        current_time = self.market_data_service.current_time(asset_type)
+        schedule = strategy_schedule(self.settings, strategy_id, when=current_time) if strategy_id else self.settings.asset_schedules[asset_type]
         strategy = get_kr_strategy(self.settings, strategy_id or "") if strategy_id else None
+        strategy_view = strategy_runtime_config(strategy, when=current_time) if strategy is not None else None
         strategy_version = str(strategy.strategy_id if strategy is not None else self.settings.strategy.strategy_version)
         candidates: List[CandidateScanRecord] = []
         for symbol in self._universe(asset_type):
@@ -148,6 +151,7 @@ class UniverseScanner:
                     scan_id=scan_id,
                     cost_bps=float(strategy.round_trip_cost_bps if strategy is not None else self.settings.strategy.round_trip_cost_bps),
                     volatility=float(metrics.get("volatility", np.nan)),
+                    current_time=current_time,
                 )
                 latest_position = self.repository.latest_position_by_symbol(symbol=symbol, timeframe=schedule.timeframe, account_id=execution_account_id)
                 pending_entry = self.repository.active_entry_orders(
@@ -196,7 +200,8 @@ class UniverseScanner:
                                 "market_phase": self.market_data_service.market_phase(asset_type),
                                 "strategy_version": signal.strategy_version,
                                 "strategy_family": signal.strategy_family,
-                                "session_mode": str(strategy.session_mode if strategy is not None else ""),
+                                "session_mode": str(strategy_view.session_mode if strategy_view is not None else ""),
+                                "price_policy": str(strategy_view.session_price_policy if strategy_view is not None else ""),
                                 "decision_horizon_bars": int(signal.decision_horizon_bars),
                                 "primary_target": signal.primary_target_type,
                                 "secondary_target": signal.secondary_target_type,

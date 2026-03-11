@@ -4,9 +4,10 @@ import tempfile
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from config.settings import RuntimeSettings
-from jobs.scheduler import _run_guarded
+from jobs.scheduler import _run_guarded, run_once
 from jobs.tasks import broker_account_sync_job
 from storage.repository import TradingRepository
 
@@ -149,6 +150,74 @@ class SchedulerRuntimeTest(unittest.TestCase):
         self.assertEqual(row["status"], "completed")
         self.assertTrue(self.repo.get_control_flag("worker_heartbeat_job", "").startswith("broker_position_sync"))
         self.assertNotEqual(observed["heartbeat_after"], "")
+
+    def test_run_once_prioritizes_exit_management_before_scan_jobs(self) -> None:
+        call_order: list[str] = []
+        context = SimpleNamespace(
+            settings=self.settings,
+            repository=SimpleNamespace(set_control_flag=lambda *args, **kwargs: None),
+        )
+
+        def fake_run_guarded(context, job_name: str, run_key: str, fn):
+            call_order.append(job_name)
+            return {}
+
+        with patch("jobs.scheduler.build_task_context", return_value=context):
+            with patch("jobs.scheduler.active_strategy_ids", return_value=[]):
+                with patch("jobs.scheduler._run_guarded", side_effect=fake_run_guarded):
+                    run_once()
+
+        first_scan_index = next(index for index, job_name in enumerate(call_order) if job_name.startswith("scan:"))
+        self.assertLess(call_order.index("exit_management"), first_scan_index)
+
+    def test_run_once_prioritizes_kr_scans_before_us_and_crypto(self) -> None:
+        call_order: list[str] = []
+        context = SimpleNamespace(
+            settings=self.settings,
+            repository=SimpleNamespace(set_control_flag=lambda *args, **kwargs: None),
+        )
+
+        def fake_run_guarded(context, job_name: str, run_key: str, fn):
+            call_order.append(job_name)
+            return {}
+
+        def fake_active_strategy_ids(settings, *, asset_schedule_key=None):
+            if asset_schedule_key == "한국주식":
+                return ["kr_intraday_15m_v1"]
+            return []
+
+        with patch("jobs.scheduler.build_task_context", return_value=context):
+            with patch("jobs.scheduler.active_strategy_ids", side_effect=fake_active_strategy_ids):
+                with patch("jobs.scheduler._run_guarded", side_effect=fake_run_guarded):
+                    run_once()
+
+        self.assertLess(call_order.index("scan:kr_intraday_15m_v1"), call_order.index("scan:미국주식"))
+        self.assertLess(call_order.index("scan:kr_intraday_15m_v1"), call_order.index("scan:코인"))
+
+    def test_run_once_uses_us_strategy_loop_when_us_strategy_enabled(self) -> None:
+        call_order: list[str] = []
+        context = SimpleNamespace(
+            settings=self.settings,
+            repository=SimpleNamespace(set_control_flag=lambda *args, **kwargs: None),
+        )
+
+        def fake_run_guarded(context, job_name: str, run_key: str, fn):
+            call_order.append(job_name)
+            return {}
+
+        def fake_active_strategy_ids(settings, *, asset_schedule_key=None):
+            if asset_schedule_key == "미국주식":
+                return ["us_intraday_1h_v1"]
+            return []
+
+        with patch("jobs.scheduler.build_task_context", return_value=context):
+            with patch("jobs.scheduler.active_strategy_ids", side_effect=fake_active_strategy_ids):
+                with patch("jobs.scheduler._run_guarded", side_effect=fake_run_guarded):
+                    run_once()
+
+        self.assertIn("scan:us_intraday_1h_v1", call_order)
+        self.assertIn("entry:us_intraday_1h_v1", call_order)
+        self.assertNotIn("scan:미국주식", call_order)
 
 
 if __name__ == "__main__":

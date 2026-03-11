@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
-from kr_strategy import get_kr_strategy, strategy_conflict_ids
+from kr_strategy import get_kr_strategy, strategy_asset_schedule_key, strategy_conflict_ids
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_LEGACY_MIXED, ExecutionAccount, resolve_execution_account
 from services.signal_engine import SignalDecision
 from storage.repository import TradingRepository, parse_utc_timestamp
@@ -87,7 +87,9 @@ class RiskEngine:
         market_is_open: bool,
     ) -> RiskDecision:
         strategy = self.settings.strategy
-        strategy_cfg = get_kr_strategy(self.settings, str(signal.strategy_version or "")) if signal.asset_type == "한국주식" else None
+        strategy_cfg = get_kr_strategy(self.settings, str(signal.strategy_version or ""))
+        if strategy_cfg is not None and strategy_asset_schedule_key(strategy_cfg) != str(signal.asset_type):
+            strategy_cfg = None
         risk = self.settings.risk
         state = self._latest_account_state(asset_type=signal.asset_type, symbol=signal.symbol)
         account_id = str(state["account_id"])

@@ -331,21 +331,22 @@ $logDir = Join-Path $workspace ".runtime\logs"
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 $streamlitNeedle = "-m streamlit run app.py"
+$betaNeedle = "beta_server.py"
 $workerNeedle = "-m jobs.scheduler"
 
 # 기존 프로세스 종료 = 진짜 restart
 Stop-ManagedProcess -Needle $workerNeedle
 Stop-ManagedProcess -Needle $streamlitNeedle
+Stop-ManagedProcess -Needle $betaNeedle
 
 $workerArgs = $runner.PrefixArgs + @(
     "-m", "jobs.scheduler"
 )
 
 $appArgs = $runner.PrefixArgs + @(
-    "-m", "streamlit", "run", "app.py",
-    "--server.address", "0.0.0.0",
-    "--server.port", "8505",
-    "--server.headless", "true"
+    "beta_server.py",
+    "--host", "0.0.0.0",
+    "--port", "8505"
 )
 
 $workerProc = Start-ManagedProcess `
@@ -372,11 +373,11 @@ try {
 
     Start-Sleep -Seconds 3
 
-    Write-Host "Alt app/worker restart completed."
-    Write-Host "App PID: $($appProc.Id)"
+    Write-Host "Alt beta server/worker restart completed."
+    Write-Host "Beta Server PID: $($appProc.Id)"
     Write-Host "Worker PID: $($workerProc.Id)"
     Write-Host "Logs: $logDir"
-    Write-Host "Monitor URL: http://127.0.0.1:8505"
+    Write-Host "Monitor URL: http://127.0.0.1:8505/beta"
     Write-Host "Keep this window open while the app is running."
     Write-Host "Closing this console will stop both app and worker."
 

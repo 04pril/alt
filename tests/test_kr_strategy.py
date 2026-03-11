@@ -5,7 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config.settings import RuntimeSettings
-from kr_strategy import default_kr_strategy, entry_gate_reason, flatten_due, strategy_conflict_ids, strategy_schedule
+from kr_strategy import active_kr_strategy_ids, active_us_strategy_ids, default_kr_strategy, default_us_strategy, entry_gate_reason, flatten_due, iter_visible_strategy_rows, strategy_conflict_ids, strategy_schedule
 
 
 class KRStrategyTest(unittest.TestCase):
@@ -18,9 +18,57 @@ class KRStrategyTest(unittest.TestCase):
         self.assertEqual(str(default_strategy.strategy_id), "kr_intraday_1h_v1")
         self.assertTrue(bool(settings.kr_strategies["kr_intraday_1h_v1"].enabled))
         self.assertFalse(bool(settings.kr_strategies["kr_intraday_15m_v1"].enabled))
+        self.assertFalse(bool(settings.kr_strategies["kr_intraday_15m_v1_auto"].enabled))
         self.assertTrue(bool(settings.kr_strategies["kr_intraday_15m_v1"].experimental))
         self.assertFalse(bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_close"].enabled))
         self.assertFalse(bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_single"].enabled))
+
+    def test_active_kr_strategy_ids_ignore_non_kr_schedule_entries(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_strategies["kr_intraday_1h_v1"].enabled = False
+        settings.kr_strategies["kr_intraday_15m_v1"].enabled = True
+        settings.kr_strategies["us_combo_15m_ahc_regular_v1"].enabled = True
+        settings.kr_strategies["us_combo_15m_ahc_afterhours_v1"].enabled = True
+        settings.kr_strategies["kr_combo_15m_ahc_afterclose_v2"].enabled = True
+
+        self.assertEqual(
+            active_kr_strategy_ids(settings),
+            ["kr_intraday_15m_v1", "kr_combo_15m_ahc_afterclose_v2"],
+        )
+
+    def test_default_kr_strategy_ignores_enabled_us_schedule_entries(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_default_strategy_id = "us_combo_15m_ahc_regular_v1"
+        settings.kr_strategies["kr_intraday_1h_v1"].enabled = False
+        settings.kr_strategies["kr_intraday_15m_v1"].enabled = True
+        settings.kr_strategies["us_combo_15m_ahc_regular_v1"].enabled = True
+
+        default_strategy = default_kr_strategy(settings)
+
+        self.assertIsNotNone(default_strategy)
+        self.assertEqual(str(default_strategy.strategy_id), "kr_intraday_15m_v1")
+
+    def test_active_us_strategy_ids_only_include_us_schedule_entries(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_strategies["us_intraday_1h_v1"].enabled = True
+        settings.kr_strategies["us_combo_15m_ahc_regular_v1"].enabled = True
+        settings.kr_strategies["kr_intraday_1h_v1"].enabled = True
+
+        self.assertEqual(
+            active_us_strategy_ids(settings),
+            ["us_intraday_1h_v1", "us_combo_15m_ahc_regular_v1"],
+        )
+
+    def test_default_us_strategy_prefers_enabled_us_entry(self) -> None:
+        settings = RuntimeSettings()
+        settings.us_default_strategy_id = "us_intraday_1h_v1"
+        settings.kr_strategies["us_intraday_1h_v1"].enabled = False
+        settings.kr_strategies["us_combo_15m_ahc_regular_v1"].enabled = True
+
+        default_strategy = default_us_strategy(settings)
+
+        self.assertIsNotNone(default_strategy)
+        self.assertEqual(str(default_strategy.strategy_id), "us_combo_15m_ahc_regular_v1")
 
     def test_15m_entry_gate_uses_completed_bar_and_blocks_opening_bar(self) -> None:
         settings = RuntimeSettings()
@@ -99,6 +147,52 @@ class KRStrategyTest(unittest.TestCase):
         self.assertEqual(before, "outside_after_close_close_session")
         self.assertIsNone(inside)
         self.assertFalse(flatten)
+
+    def test_auto_15m_switches_to_after_close_close_profile(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_strategies["kr_intraday_15m_v1_auto"].enabled = True
+
+        allowed = entry_gate_reason(
+            settings,
+            "kr_intraday_15m_v1_auto",
+            when=datetime(2026, 3, 9, 15, 45, tzinfo=ZoneInfo("Asia/Seoul")),
+            market_is_open=False,
+        )
+        schedule = strategy_schedule(
+            settings,
+            "kr_intraday_15m_v1_auto",
+            when=datetime(2026, 3, 9, 15, 45, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertIsNone(allowed)
+        self.assertEqual(schedule.session_mode, "after_close_close_price")
+        self.assertEqual(schedule.scan_interval_minutes, 5)
+
+    def test_auto_15m_switches_to_after_close_single_profile_and_late_flatten(self) -> None:
+        settings = RuntimeSettings()
+        settings.kr_strategies["kr_intraday_15m_v1_auto"].enabled = True
+
+        allowed = entry_gate_reason(
+            settings,
+            "kr_intraday_15m_v1_auto",
+            when=datetime(2026, 3, 9, 16, 10, tzinfo=ZoneInfo("Asia/Seoul")),
+            market_is_open=False,
+        )
+        schedule = strategy_schedule(
+            settings,
+            "kr_intraday_15m_v1_auto",
+            when=datetime(2026, 3, 9, 16, 10, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+        flatten_now = flatten_due(
+            settings,
+            "kr_intraday_15m_v1_auto",
+            when=datetime(2026, 3, 9, 17, 55, tzinfo=ZoneInfo("Asia/Seoul")),
+        )
+
+        self.assertIsNone(allowed)
+        self.assertEqual(schedule.session_mode, "after_close_single_price")
+        self.assertEqual(schedule.scan_interval_minutes, 10)
+        self.assertTrue(flatten_now)
 
     def test_after_close_single_session_gate_and_auction_alignment(self) -> None:
         settings = RuntimeSettings()
@@ -180,10 +274,29 @@ class KRStrategyTest(unittest.TestCase):
                 "kr_daily_preclose_v1",
                 "kr_intraday_1h_v1",
                 "kr_intraday_15m_v1",
+                "kr_intraday_15m_v1_auto",
                 "kr_intraday_15m_v1_after_close_close",
                 "kr_intraday_15m_v1_after_close_single",
             }
             <= conflicts
+        )
+
+    def test_visible_kr_strategy_rows_hide_legacy_after_close_profiles(self) -> None:
+        settings = RuntimeSettings()
+
+        visible_ids = [
+            str(strategy.strategy_id)
+            for strategy in iter_visible_strategy_rows(settings, asset_schedule_key="한국주식")
+        ]
+
+        self.assertEqual(
+            visible_ids,
+            [
+                "kr_daily_preclose_v1",
+                "kr_intraday_1h_v1",
+                "kr_intraday_15m_v1",
+                "kr_intraday_15m_v1_auto",
+            ],
         )
 
 

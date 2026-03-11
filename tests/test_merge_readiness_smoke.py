@@ -281,8 +281,10 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         forecast_horizon_bars = 1
         validation_mode = "holdout"
         notes_payload = {"stop_level": 68_000.0, "take_level": 73_000.0}
-        if asset_type == self.fixture.kr_asset_type:
-            strategy = get_kr_strategy(self.fixture.settings, str(strategy_id or "")) if strategy_id else default_kr_strategy(self.fixture.settings)
+        strategy = get_kr_strategy(self.fixture.settings, str(strategy_id or "")) if strategy_id else None
+        if strategy is None and asset_type == self.fixture.kr_asset_type:
+            strategy = default_kr_strategy(self.fixture.settings)
+        if strategy is not None:
             self.assertIsNotNone(strategy)
             timeframe = str(strategy_schedule(self.fixture.settings, str(strategy.strategy_id)).timeframe)
             strategy_version = str(strategy.strategy_id)
@@ -300,6 +302,16 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     "experimental": bool(strategy.experimental),
                 }
             )
+        market_timezone = "Asia/Seoul"
+        execution_account_id = ""
+        if asset_type == self.fixture.us_asset_type:
+            market_timezone = "America/New_York"
+            execution_account_id = ACCOUNT_SIM_US_EQUITY
+        elif asset_type == self.fixture.kr_asset_type:
+            execution_account_id = ACCOUNT_KIS_KR_PAPER
+        elif asset_type == self.fixture.crypto_asset_type:
+            market_timezone = "UTC"
+            execution_account_id = ACCOUNT_SIM_CRYPTO
         notes = json.dumps(notes_payload, ensure_ascii=False)
         self.fixture.repository.insert_predictions(
             [
@@ -310,7 +322,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     symbol=symbol,
                     asset_type=asset_type,
                     timeframe=timeframe,
-                    market_timezone="Asia/Seoul",
+                    market_timezone=market_timezone,
                     data_cutoff_at=now_iso,
                     target_at=(pd.Timestamp.now(tz="UTC") + pd.Timedelta(days=1)).isoformat(),
                     forecast_horizon_bars=forecast_horizon_bars,
@@ -334,7 +346,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     status="unresolved",
                     scan_id=scan_id,
                     notes=notes,
-                    execution_account_id=ACCOUNT_KIS_KR_PAPER if asset_type == self.fixture.kr_asset_type else "",
+                    execution_account_id=execution_account_id,
                 )
             ]
         )
@@ -364,7 +376,7 @@ class MergeReadinessSmokeTest(unittest.TestCase):
                     strategy_version=strategy_version,
                     is_holding=0,
                     raw_json="{}",
-                    execution_account_id=ACCOUNT_KIS_KR_PAPER if asset_type == self.fixture.kr_asset_type else "",
+                    execution_account_id=execution_account_id,
                 )
             ]
         )
@@ -550,6 +562,32 @@ class MergeReadinessSmokeTest(unittest.TestCase):
         self.assertEqual(str(raw_payload.get("session_mode") or ""), "after_close_single_price")
         self.assertEqual(self.fixture.client.place_orders[-1]["order_division"], "07")
         self.assertEqual(self.fixture.client.place_orders[-1]["order_type"], "after_close_single")
+
+    def test_us_strategy_entry_uses_strategy_loop_and_sim_us_account(self) -> None:
+        strategy_id = "us_intraday_1h_v1"
+        self.fixture.settings.us_default_strategy_id = strategy_id
+        self.fixture.settings.kr_strategies[strategy_id].enabled = True
+        self.fixture.market.market_open = True
+        self.fixture.market.current_times[self.fixture.us_asset_type] = datetime(2026, 3, 9, 10, 30, tzinfo=ZoneInfo("America/New_York"))
+        self._insert_candidate_prediction(
+            symbol="AAPL",
+            asset_type=self.fixture.us_asset_type,
+            timeframe="1h",
+            scan_id="scan-us-strategy",
+            strategy_id=strategy_id,
+        )
+
+        entered = entry_decision_job(self.fixture.context, strategy_ids=[strategy_id])
+        orders = self.fixture.repository.open_orders(
+            statuses=("new", "submitted", "acknowledged", "pending_fill", "partially_filled", "filled"),
+            account_id=ACCOUNT_SIM_US_EQUITY,
+        )
+        matched = orders.loc[orders["strategy_version"].astype(str) == strategy_id]
+
+        self.assertEqual(entered[strategy_id], 1)
+        self.assertEqual(len(matched), 1)
+        self.assertEqual(str(matched.iloc[0]["asset_type"]), self.fixture.us_asset_type)
+        self.assertEqual(str(matched.iloc[0]["account_id"]), ACCOUNT_SIM_US_EQUITY)
 
     def test_kr_noop_and_rejection_reasons_are_explicit(self) -> None:
         self.fixture.market.market_open = False

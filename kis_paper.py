@@ -468,7 +468,7 @@ class KISPaperClient:
         payload, _ = self._request(
             "GET",
             "/uapi/domestic-stock/v1/trading/inquire-psbl-sell",
-            "TTTC8408R",
+            "VTTC8408R" if self.config.is_paper else "TTTC8408R",
             params={
                 "CANO": self.config.account_no,
                 "ACNT_PRDT_CD": self.config.product_code,

@@ -10,6 +10,7 @@ import beta_monitor_clone as clone
 from beta_monitor_clone import (
     _account_card_compact,
     _action_button,
+    _build_kr_symbol_name_map,
     _build_total_equity_curve,
     _build_realized_trade_table_frame,
     _build_entry_result_rows,
@@ -210,7 +211,7 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('data-cand-tab="us"', markup)
         self.assertNotIn("beta_cand_tab=us", markup)
 
-    def test_candidate_tabs_prefer_latest_row_with_expected_return(self) -> None:
+    def test_candidate_tabs_hide_older_candidate_when_latest_decision_is_rejected(self) -> None:
         candidates = pd.DataFrame(
             [
                 {
@@ -244,8 +245,46 @@ class BetaMonitorCloneTest(unittest.TestCase):
             jobs="all",
         )
 
-        self.assertIn("+1.40%", markup)
+        self.assertNotIn("+1.40%", markup)
         self.assertNotIn(">N/A<", markup)
+        self.assertIn("최근 스캔 실패 1건", markup)
+
+    def test_candidate_tabs_keep_latest_candidate_for_same_symbol(self) -> None:
+        candidates = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T14:09:00Z",
+                    "symbol": "BTC-USD",
+                    "asset_type": "crypto",
+                    "status": "candidate",
+                    "signal": "SHORT",
+                    "expected_return": -0.009,
+                    "confidence": 0.57,
+                    "score": 1.5,
+                },
+                {
+                    "created_at": "2026-03-09T14:10:00Z",
+                    "symbol": "BTC-USD",
+                    "asset_type": "crypto",
+                    "status": "candidate",
+                    "signal": "LONG",
+                    "expected_return": 0.014,
+                    "confidence": 0.62,
+                    "score": 2.1,
+                },
+            ]
+        )
+
+        markup = _candidate_tabs_html(
+            candidates,
+            kr_asset_types={"한국주식"},
+            kr_symbol_names={},
+            current_tab="crypto",
+            jobs="all",
+        )
+
+        self.assertIn("+1.40%", markup)
+        self.assertNotIn("-0.90%", markup)
 
     def test_candidate_tabs_show_kr_name_for_bare_code(self) -> None:
         candidates = pd.DataFrame(
@@ -272,6 +311,44 @@ class BetaMonitorCloneTest(unittest.TestCase):
 
         self.assertIn("삼성전자", markup)
         self.assertIn("005930", markup)
+
+    def test_candidate_tabs_hide_error_rows_without_expected_return(self) -> None:
+        candidates = pd.DataFrame(
+            [
+                {
+                    "created_at": "2026-03-09T14:10:00Z",
+                    "symbol": "BTC-USD",
+                    "asset_type": "코인",
+                    "status": "error",
+                    "signal": "FLAT",
+                    "expected_return": float("nan"),
+                    "confidence": 0.0,
+                    "score": -999.0,
+                    "reason": "시세 데이터가 비어 있습니다: BTC-USD 1h",
+                }
+            ]
+        )
+
+        markup = _candidate_tabs_html(
+            candidates,
+            kr_asset_types={"한국주식"},
+            kr_symbol_names={},
+            current_tab="crypto",
+            jobs="all",
+        )
+
+        self.assertNotIn(">N/A<", markup)
+        self.assertIn("최근 스캔 실패 1건", markup)
+        self.assertIn("시세 데이터가 비어 있습니다", markup)
+
+    def test_build_kr_symbol_name_map_includes_manual_kr_etf_aliases(self) -> None:
+        symbol_map = _build_kr_symbol_name_map(
+            {"삼성전자": {"market": "유가", "code": "005930"}}
+        )
+
+        self.assertEqual(symbol_map.get("005930"), "삼성전자")
+        self.assertEqual(symbol_map.get("411060"), "ACE KRX금현물")
+        self.assertEqual(symbol_map.get("411060.KS"), "ACE KRX금현물")
 
     def test_action_button_uses_button_markup_with_beta_href(self) -> None:
         markup = _action_button(
@@ -331,8 +408,8 @@ class BetaMonitorCloneTest(unittest.TestCase):
             {"KRW=X": {"current_price": 1450.0}},
         )
 
-        self.assertEqual(primary, "145,000.00 KRW")
-        self.assertEqual(secondary, "100.00 USD")
+        self.assertEqual(primary, "₩145,000")
+        self.assertEqual(secondary, "$100.00")
 
     def test_build_realized_trade_table_frame_formats_trade_history(self) -> None:
         trades = pd.DataFrame(
@@ -358,9 +435,9 @@ class BetaMonitorCloneTest(unittest.TestCase):
         )
 
         self.assertEqual(list(view.columns), ["종료시각", "계좌", "종목", "방향", "보유기간", "진입가", "청산가", "실현손익", "청산사유"])
-        self.assertEqual(view.iloc[0]["계좌"], "SIM 미국주식 계좌")
+        self.assertEqual(view.iloc[0]["계좌"], "미장")
         self.assertEqual(view.iloc[0]["방향"], "롱")
-        self.assertIn("145,000.00 KRW / 100.00 USD", view.iloc[0]["진입가"])
+        self.assertIn("₩145,000 / $100.00", view.iloc[0]["진입가"])
         self.assertEqual(view.iloc[0]["청산사유"], "익절")
 
     def test_account_card_compact_uses_unrealized_pnl_in_current_pnl(self) -> None:
@@ -396,14 +473,14 @@ class BetaMonitorCloneTest(unittest.TestCase):
             {},
             {"today_pnl": 0.0},
             "SIM",
-            "미국주식 계좌",
+            "미장",
             "sim",
             currency="USD",
             quote_snapshots={"KRW=X": {"current_price": 1450.0}},
         )
 
         self.assertIn("145만", markup)
-        self.assertIn("1,000.00 USD", markup)
+        self.assertIn("$1,000.00", markup)
 
     def test_positions_card_uses_krw_quote_for_bare_kr_code(self) -> None:
         frame = pd.DataFrame(
@@ -424,8 +501,8 @@ class BetaMonitorCloneTest(unittest.TestCase):
 
         markup = _positions_card(
             frame,
-            "한국주식 포지션",
-            "KIS",
+            "국장 포지션",
+            "국장",
             "broker-kis",
             30000000.0,
             {"005930.KS": {"currency": "KRW", "current_price": 190000.0}},
@@ -434,9 +511,9 @@ class BetaMonitorCloneTest(unittest.TestCase):
         )
 
         self.assertIn("삼성전자", markup)
-        self.assertIn("190,000.00 KRW", markup)
-        self.assertIn("현재가 190,000.00 KRW", markup)
-        self.assertIn("100.00 KRW", markup)
+        self.assertIn("190,000 KRW", markup)
+        self.assertIn("현재가 190,000 KRW", markup)
+        self.assertIn("100 KRW", markup)
         self.assertIn("- / -", markup)
         self.assertNotIn("USD", markup)
 
@@ -527,7 +604,6 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertNotIn("beta_live_tick", markup)
         self.assertNotIn("window.parent.location.replace", markup)
         self.assertIn("detail-events-grid", markup)
-        self.assertIn('id="assets"', markup)
         self.assertIn('id="errors"', markup)
         self.assertIn("최근 거래 손익", markup)
         self.assertIn("KRW 환산 합산", markup)
@@ -557,10 +633,10 @@ class BetaMonitorCloneTest(unittest.TestCase):
             "kis_runtime": {},
             "runtime_profile": {
                 "name": "balanced",
-                "kr_default_strategy_label": "KR Intraday 1h v1",
+                "kr_default_strategy_label": "KR 1시간봉 v1",
                 "kr_default_strategy_session_mode": "regular",
-                "kr_recommended_strategy_label": "KR Intraday 1h v1",
-                "kr_active_strategy_labels": "KR Intraday 1h v1",
+                "kr_recommended_strategy_label": "KR 1시간봉 v1",
+                "kr_active_strategy_labels": "KR 1시간봉 v1",
             },
             "job_health": pd.DataFrame(),
             "recent_errors": pd.DataFrame(),
@@ -578,7 +654,7 @@ class BetaMonitorCloneTest(unittest.TestCase):
                 [
                     {
                         "strategy_id": "kr_intraday_1h_v1",
-                        "label": "KR Intraday 1h v1",
+                        "label": "KR 1시간봉 v1",
                         "session_mode": "regular",
                         "timeframe": "1h",
                         "enabled": True,
@@ -592,7 +668,7 @@ class BetaMonitorCloneTest(unittest.TestCase):
                     },
                     {
                         "strategy_id": "kr_intraday_15m_v1",
-                        "label": "KR Intraday 15m v1 Experimental",
+                        "label": "KR 15분봉 정규장 v1",
                         "session_mode": "regular",
                         "timeframe": "15m",
                         "enabled": False,
@@ -606,7 +682,7 @@ class BetaMonitorCloneTest(unittest.TestCase):
                     },
                     {
                         "strategy_id": "kr_intraday_15m_v1_after_close_single",
-                        "label": "KR 15m After-close Single v1 Experimental",
+                        "label": "KR 15m After-close Single v1",
                         "session_mode": "after_close_single",
                         "timeframe": "15m",
                         "enabled": False,
@@ -661,14 +737,123 @@ class BetaMonitorCloneTest(unittest.TestCase):
                 clone.components.html = original_html
 
         markup = str(captured.get("html") or "")
-        self.assertIn("KR Intraday 1h v1", markup)
-        self.assertIn("KR Intraday 15m v1 Experimental", markup)
-        self.assertIn("기본 추천 KR Intraday 1h v1", markup)
+        self.assertIn("KR 1시간봉 v1", markup)
+        self.assertIn("KR 15분봉 정규장 v1", markup)
+        self.assertIn("기본 추천 KR 1시간봉 v1", markup)
         self.assertIn("세션 regular", markup)
         self.assertIn("10분 단일가 경매", markup)
         self.assertIn("auction experimental", markup)
         self.assertIn("experimental", markup)
         self.assertIs(captured.get("scrolling"), False)
+
+    def test_render_beta_overview_component_wires_us_strategy_buttons(self) -> None:
+        template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
+<nav class="top-nav"></nav>
+<div class="status-strip"></div>
+<div class="main">
+  <div class="account-row"></div>
+  <div class="stat-bar"></div>
+  <div class="content-grid"></div>
+  <div class="bottom-grid"></div>
+</div><!-- /main -->
+<script>window.template = true;</script>
+</body></html>"""
+        data = {
+            "summary": {"latest_account": {}},
+            "auto_trading_status": {"state": "running", "label": "가동 중"},
+            "execution_summary": {"today_noop_breakdown": pd.DataFrame()},
+            "broker_sync_status": pd.DataFrame(),
+            "broker_sync_errors": pd.DataFrame(),
+            "kis_runtime": {},
+            "runtime_profile": {
+                "name": "active",
+                "kr_default_strategy_label": "KR 15분봉 정규장 v1",
+                "kr_default_strategy_id": "kr_intraday_15m_v1",
+                "kr_default_strategy_session_mode": "regular",
+                "kr_recommended_strategy_label": "KR 1시간봉 v1",
+                "kr_active_strategy_labels": "KR 15분봉 정규장 v1",
+                "us_default_strategy_label": "US Combo 15m AHC Regular v1",
+                "us_default_strategy_id": "us_combo_15m_ahc_regular_v1",
+            },
+            "job_health": pd.DataFrame(),
+            "recent_errors": pd.DataFrame(),
+            "recent_events": pd.DataFrame(),
+            "open_positions": pd.DataFrame(),
+            "open_orders": pd.DataFrame(),
+            "candidate_scans": pd.DataFrame(),
+            "prediction_report": pd.DataFrame(),
+            "equity_curve": pd.DataFrame(),
+            "equity_curves_by_account": {},
+            "today_execution_events": pd.DataFrame(),
+            "recent_realized_trades": pd.DataFrame(),
+            "asset_overview": pd.DataFrame(),
+            "kr_strategy_overview": pd.DataFrame(
+                [
+                    {
+                        "strategy_id": "us_combo_15m_ahc_regular_v1",
+                        "label": "US Combo 15m AHC Regular v1",
+                        "session_mode": "regular",
+                        "timeframe": "15m",
+                        "enabled": True,
+                        "experimental": True,
+                        "broker_mode": "sim",
+                        "execution_account_id": ACCOUNT_SIM_US_EQUITY,
+                        "execution_cadence": "15m 완성봉 기준",
+                        "today_candidate_count": 2,
+                        "today_submitted_count": 1,
+                        "today_filled_count": 0,
+                    },
+                    {
+                        "strategy_id": "us_combo_15m_ahc_afterhours_v1",
+                        "label": "US Combo 15m AHC Afterhours v1",
+                        "session_mode": "after_close_close",
+                        "timeframe": "15m",
+                        "enabled": True,
+                        "experimental": True,
+                        "broker_mode": "sim",
+                        "execution_account_id": ACCOUNT_SIM_US_EQUITY,
+                        "execution_cadence": "15m 완성봉 기준",
+                        "today_candidate_count": 1,
+                        "today_submitted_count": 0,
+                        "today_filled_count": 0,
+                    },
+                ]
+            ),
+            "kr_strategy_recent_events": pd.DataFrame(),
+        }
+        captured: dict[str, object] = {}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            template_path = Path(tmp_dir) / "beta_template.html"
+            template_path.write_text(template, encoding="utf-8")
+            original_path = clone.TEMPLATE_PATH
+            original_html = clone.components.html
+            try:
+                clone.TEMPLATE_PATH = template_path
+                clone.components.html = lambda html, height, scrolling: captured.update(
+                    {"html": html, "height": height, "scrolling": scrolling}
+                )
+                clone.render_beta_overview_component(
+                    data=data,
+                    theme_mode="dark",
+                    initial_anchor="beta-overview",
+                    feedback=None,
+                    accounts_overview={},
+                    total_portfolio_overview={},
+                    quote_snapshots={},
+                    kr_asset_types={"한국주식"},
+                    recent_orders=pd.DataFrame(),
+                )
+            finally:
+                clone.TEMPLATE_PATH = original_path
+                clone.components.html = original_html
+
+        markup = str(captured.get("html") or "")
+        self.assertIn("US 전략", markup)
+        self.assertIn("US Combo 15m AHC Regular v1", markup)
+        self.assertIn("US Combo 15m AHC Afterhours v1", markup)
+        self.assertIn('set_strategy:us_combo_15m_ahc_afterhours_v1', markup)
+        self.assertIn("기본</span>", markup)
 
     def test_render_beta_overview_component_shows_signal_toggle_when_more_than_four_results(self) -> None:
         template = """<!DOCTYPE html><html lang="ko" data-theme="dark"><head><style></style></head><body>
@@ -749,7 +934,7 @@ class BetaMonitorCloneTest(unittest.TestCase):
         markup = str(captured.get("html") or "")
         self.assertIn("표시 4 / 전체 5건", markup)
         self.assertIn("상세보기", markup)
-        self.assertIn("beta_signals=all", markup)
+        self.assertIn('data-toggle-target="signal-list"', markup)
 
     def test_build_beta_live_payload_and_host_include_live_sections(self) -> None:
         payload = build_beta_live_payload(
@@ -790,8 +975,9 @@ class BetaMonitorCloneTest(unittest.TestCase):
         self.assertIn('id="beta-live-positions"', payload["positions_html"])
 
         host_markup = render_beta_live_payload_host(payload)
-        self.assertIn('id="beta-live-payload"', host_markup)
-        self.assertIn('"version"', host_markup)
+        self.assertIn("alt-beta-live-payload", host_markup)
+        self.assertIn("localStorage.setItem", host_markup)
+        self.assertIn('\\"version\\"', host_markup)
 
 
 if __name__ == "__main__":

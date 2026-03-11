@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
 import pandas as pd
 
 from config.settings import RuntimeSettings
-from kr_strategy import get_kr_strategy
+from kr_strategy import get_kr_strategy, strategy_asset_schedule_key, strategy_runtime_config
 from predictor import ForecastResult, run_forecast_on_price_data
 from runtime_accounts import resolve_execution_account
 from storage.models import PredictionRecord
@@ -45,6 +46,7 @@ class SignalDecision:
     secondary_target_type: str = ""
     analysis_target_type: str = ""
     experimental: bool = False
+    atr_value: float = float("nan")
 
 
 class SignalEngine:
@@ -81,11 +83,15 @@ class SignalEngine:
         score: float,
         confidence: float,
         expected_risk: float,
+        current_time: datetime | None = None,
     ) -> List[PredictionRecord]:
         now_iso = utc_now_iso()
         run_id = make_id("run")
         rows: List[PredictionRecord] = []
-        strategy_cfg = get_kr_strategy(self.settings, strategy_id or "") if asset_type == "한국주식" else None
+        strategy_cfg = get_kr_strategy(self.settings, strategy_id or "")
+        if strategy_cfg is not None and strategy_asset_schedule_key(strategy_cfg) != str(asset_type):
+            strategy_cfg = None
+        strategy_view = strategy_runtime_config(strategy_cfg, when=current_time) if strategy_cfg is not None else None
         decision_horizon = int(strategy_cfg.decision_horizon_bars) if strategy_cfg is not None else 1
         secondary_horizon = int(strategy_cfg.forecast_horizon_bars) if strategy_cfg is not None else 1
         execution_account_id = resolve_execution_account(symbol=result.symbol, asset_type=asset_type, kis_enabled=True).account_id
@@ -141,7 +147,8 @@ class SignalEngine:
                         {
                             "timeframe": timeframe,
                             "strategy_family": str(strategy_cfg.strategy_family if strategy_cfg is not None else ""),
-                            "session_mode": str(strategy_cfg.session_mode if strategy_cfg is not None else ""),
+                            "session_mode": str(strategy_view.session_mode if strategy_view is not None else ""),
+                            "price_policy": str(strategy_view.session_price_policy if strategy_view is not None else ""),
                             "decision_horizon_bars": int(decision_horizon),
                             "primary_target": str(strategy_cfg.primary_target if strategy_cfg is not None else target_type),
                             "secondary_target": str(strategy_cfg.secondary_target if strategy_cfg is not None else ""),
@@ -170,9 +177,13 @@ class SignalEngine:
         scan_id: str | None = None,
         cost_bps: float | None = None,
         volatility: float = np.nan,
+        current_time: datetime | None = None,
     ) -> SignalDecision:
         strategy = self.settings.strategy
-        strategy_cfg = get_kr_strategy(self.settings, strategy_id or "") if asset_type == "한국주식" else None
+        strategy_cfg = get_kr_strategy(self.settings, strategy_id or "")
+        if strategy_cfg is not None and strategy_asset_schedule_key(strategy_cfg) != str(asset_type):
+            strategy_cfg = None
+        strategy_view = strategy_runtime_config(strategy_cfg, when=current_time) if strategy_cfg is not None else None
         shortable_assets = {str(value) for value in getattr(strategy, "allow_short_asset_types", [])}
         effective_round_trip_cost = float(strategy_cfg.round_trip_cost_bps if strategy_cfg is not None else strategy.round_trip_cost_bps)
         result = run_forecast_on_price_data(
@@ -235,6 +246,7 @@ class SignalEngine:
             score=score,
             confidence=confidence,
             expected_risk=expected_risk,
+            current_time=current_time,
         )
         head_prediction = prediction_rows[min(decision_horizon - 1, len(prediction_rows) - 1)]
         return SignalDecision(
@@ -266,4 +278,5 @@ class SignalEngine:
             secondary_target_type=str(strategy_cfg.secondary_target if strategy_cfg is not None else ""),
             analysis_target_type=str(strategy_cfg.analysis_target if strategy_cfg is not None else ""),
             experimental=bool(strategy_cfg.experimental) if strategy_cfg is not None else False,
+            atr_value=float(primary.get("atr_14", np.nan)),
         )

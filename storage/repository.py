@@ -205,7 +205,10 @@ CREATE TABLE IF NOT EXISTS positions (
     strategy_version TEXT NOT NULL,
     cooldown_until TEXT,
     notes TEXT,
-    account_id TEXT
+    account_id TEXT,
+    strategy_family TEXT,
+    session_mode TEXT,
+    price_policy TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
 
@@ -590,6 +593,42 @@ class TradingRepository:
             if not inferred and not symbol and not asset_type and not payload_broker:
                 conn.execute("UPDATE system_events SET account_id = '' WHERE rowid = ?", (row["rowid"],))
 
+    def _backfill_position_execution_metadata(self, conn: sqlite3.Connection) -> None:
+        if not self._table_exists(conn, "positions") or not self._table_exists(conn, "orders"):
+            return
+        rows = conn.execute(
+            """
+            SELECT rowid, symbol, strategy_version, account_id, strategy_family, session_mode, price_policy
+            FROM positions
+            WHERE COALESCE(TRIM(strategy_family), '') = ''
+               OR COALESCE(TRIM(session_mode), '') = ''
+               OR COALESCE(TRIM(price_policy), '') = ''
+            """
+        ).fetchall()
+        for row in rows:
+            order = conn.execute(
+                """
+                SELECT raw_json
+                FROM orders
+                WHERE symbol = ? AND strategy_version = ? AND account_id = ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (str(row["symbol"] or ""), str(row["strategy_version"] or ""), str(row["account_id"] or "")),
+            ).fetchone()
+            payload = self._parse_json_payload(order["raw_json"] if order is not None else "{}")
+            strategy_family = str(row["strategy_family"] or payload.get("strategy_family") or "").strip()
+            session_mode = str(row["session_mode"] or payload.get("session_mode") or "").strip()
+            price_policy = str(row["price_policy"] or payload.get("price_policy") or "").strip()
+            conn.execute(
+                """
+                UPDATE positions
+                SET strategy_family = ?, session_mode = ?, price_policy = ?
+                WHERE rowid = ?
+                """,
+                (strategy_family, session_mode, price_policy, row["rowid"]),
+            )
+
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         job_run_columns = self._column_names(conn, "job_runs")
         if "next_retry_at" not in job_run_columns:
@@ -601,6 +640,9 @@ class TradingRepository:
         self._add_column_if_missing(conn, "orders", "account_id", "account_id TEXT")
         self._add_column_if_missing(conn, "fills", "account_id", "account_id TEXT")
         self._add_column_if_missing(conn, "positions", "account_id", "account_id TEXT")
+        self._add_column_if_missing(conn, "positions", "strategy_family", "strategy_family TEXT")
+        self._add_column_if_missing(conn, "positions", "session_mode", "session_mode TEXT")
+        self._add_column_if_missing(conn, "positions", "price_policy", "price_policy TEXT")
         self._add_column_if_missing(conn, "account_snapshots", "account_id", "account_id TEXT")
         self._add_column_if_missing(conn, "system_events", "account_id", "account_id TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_execution_account ON predictions(execution_account_id, created_at)")
@@ -619,6 +661,7 @@ class TradingRepository:
         self._backfill_snapshot_account_ids(conn)
         self._backfill_system_event_account_ids(conn)
         self._sanitize_system_event_account_ids(conn)
+        self._backfill_position_execution_metadata(conn)
 
     def initialize_runtime_flags(self, defaults: Dict[str, tuple[str, str]]) -> None:
         rows = [(name, value, utc_now_iso(), notes) for name, (value, notes) in defaults.items()]
@@ -715,6 +758,42 @@ class TradingRepository:
                     raw_json=excluded.raw_json
                 """,
                 row,
+            )
+
+    def upsert_live_market_quotes(self, records: Iterable[LiveMarketQuoteRecord]) -> None:
+        rows = []
+        for record in records:
+            row = asdict(record)
+            row["symbol_code"] = _normalize_live_quote_symbol_code(str(record.symbol_code or record.symbol))
+            row["symbol"] = str(record.symbol or row["symbol_code"])
+            rows.append(row)
+        if not rows:
+            return
+        with self.connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO live_market_quotes(
+                    symbol_code, symbol, asset_type, currency, source, current_price, previous_close,
+                    change_pct, ask_price, bid_price, volume, updated_at, raw_json
+                ) VALUES(
+                    :symbol_code, :symbol, :asset_type, :currency, :source, :current_price, :previous_close,
+                    :change_pct, :ask_price, :bid_price, :volume, :updated_at, :raw_json
+                )
+                ON CONFLICT(symbol_code) DO UPDATE SET
+                    symbol=excluded.symbol,
+                    asset_type=excluded.asset_type,
+                    currency=excluded.currency,
+                    source=excluded.source,
+                    current_price=excluded.current_price,
+                    previous_close=excluded.previous_close,
+                    change_pct=excluded.change_pct,
+                    ask_price=excluded.ask_price,
+                    bid_price=excluded.bid_price,
+                    volume=excluded.volume,
+                    updated_at=excluded.updated_at,
+                    raw_json=excluded.raw_json
+                """,
+                rows,
             )
 
     def latest_live_market_quotes(
@@ -881,6 +960,39 @@ class TradingRepository:
                 """,
                 (lease_dt.isoformat().replace("+00:00", "Z"), job_run_id),
             )
+
+    def expire_stale_job_runs(self, *, stale_status: str = "abandoned") -> int:
+        now_iso = utc_now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM job_runs
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (now_iso,),
+            ).fetchone()
+            stale_count = int(row["cnt"] or 0) if row else 0
+            if stale_count <= 0:
+                return 0
+            conn.execute(
+                """
+                UPDATE job_runs
+                SET status = ?,
+                    error_message = CASE
+                        WHEN COALESCE(error_message, '') = '' THEN 'job lease expired before completion'
+                        ELSE error_message
+                    END,
+                    lease_expires_at = NULL
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (str(stale_status), now_iso),
+            )
+        return stale_count
 
     def finish_job_run(
         self,
@@ -1340,17 +1452,20 @@ class TradingRepository:
                 INSERT INTO positions(
                     position_id, created_at, updated_at, closed_at, prediction_id, symbol, asset_type, timeframe, side, status,
                     quantity, entry_price, mark_price, stop_loss, take_profit, trailing_stop, highest_price, lowest_price,
-                    unrealized_pnl, realized_pnl, expected_risk, exposure_value, max_holding_until, strategy_version, cooldown_until, notes, account_id
+                    unrealized_pnl, realized_pnl, expected_risk, exposure_value, max_holding_until, strategy_version, cooldown_until, notes, account_id,
+                    strategy_family, session_mode, price_policy
                 ) VALUES(
                     :position_id, :created_at, :updated_at, :closed_at, :prediction_id, :symbol, :asset_type, :timeframe, :side, :status,
                     :quantity, :entry_price, :mark_price, :stop_loss, :take_profit, :trailing_stop, :highest_price, :lowest_price,
-                    :unrealized_pnl, :realized_pnl, :expected_risk, :exposure_value, :max_holding_until, :strategy_version, :cooldown_until, :notes, :account_id
+                    :unrealized_pnl, :realized_pnl, :expected_risk, :exposure_value, :max_holding_until, :strategy_version, :cooldown_until, :notes, :account_id,
+                    :strategy_family, :session_mode, :price_policy
                 )
                 ON CONFLICT(position_id) DO UPDATE SET
                     updated_at=excluded.updated_at,
                     closed_at=excluded.closed_at,
                     status=excluded.status,
                     quantity=excluded.quantity,
+                    entry_price=excluded.entry_price,
                     mark_price=excluded.mark_price,
                     stop_loss=excluded.stop_loss,
                     take_profit=excluded.take_profit,
@@ -1364,7 +1479,10 @@ class TradingRepository:
                     max_holding_until=excluded.max_holding_until,
                     cooldown_until=excluded.cooldown_until,
                     notes=excluded.notes,
-                    account_id=excluded.account_id
+                    account_id=excluded.account_id,
+                    strategy_family=excluded.strategy_family,
+                    session_mode=excluded.session_mode,
+                    price_policy=excluded.price_policy
                 """,
                 row,
             )
@@ -1674,6 +1792,21 @@ class TradingRepository:
         params.append(int(limit))
         with self.connect() as conn:
             return pd.read_sql_query(query, conn, params=params)
+
+    def clear_broker_error_events(self) -> int:
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM system_events
+                WHERE level = 'ERROR'
+                  AND (
+                    component LIKE '%broker%'
+                    OR component LIKE 'kis_%'
+                    OR event_type IN ('broker_market_status', 'broker_account_sync', 'broker_order_sync', 'broker_position_sync')
+                  )
+                """
+            )
+            return int(cursor.rowcount or 0)
 
     def system_events_by_date(
         self,

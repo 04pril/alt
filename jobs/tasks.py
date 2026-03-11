@@ -9,10 +9,14 @@ import pandas as pd
 from config.settings import RuntimeSettings, load_settings
 from kr_strategy import (
     active_kr_strategy_ids,
+    active_strategy_ids,
     default_kr_strategy,
+    default_us_strategy,
     entry_gate_reason,
     get_kr_strategy,
     strategy_label,
+    strategy_asset_type,
+    strategy_execution_account_id,
     strategy_schedule,
     strategy_session_is_open,
     strategy_session_label,
@@ -89,6 +93,21 @@ def build_task_context(settings_path: str | None = None) -> TaskContext:
     repository.set_control_flag(
         "kr_default_strategy_session_mode",
         str(strategy_session_label(default_kr_strategy(settings))),
+        "task_context",
+    )
+    repository.set_control_flag(
+        "us_active_strategies",
+        ",".join(active_strategy_ids(settings, asset_schedule_key="미국주식")),
+        "task_context",
+    )
+    repository.set_control_flag(
+        "us_default_strategy_id",
+        str((default_us_strategy(settings).strategy_id if default_us_strategy(settings) is not None else settings.us_default_strategy_id) or ""),
+        "task_context",
+    )
+    repository.set_control_flag(
+        "us_default_strategy_session_mode",
+        str(strategy_session_label(default_us_strategy(settings))),
         "task_context",
     )
     return TaskContext(
@@ -224,8 +243,10 @@ def scan_job(
             strategy = get_kr_strategy(context.settings, str(strategy_id))
             if strategy is None:
                 continue
-            account_id = _account_scope_for_asset("한국주식")
-            context.touch_runtime("scan_strategy", {"asset_type": "한국주식", "strategy_version": strategy.strategy_id})
+            asset_type = strategy_asset_type(context.settings, strategy.strategy_id)
+            account_id = strategy_execution_account_id(context.settings, strategy.strategy_id)
+            current_time = _market_current_time(context.market_data_service, asset_type)
+            context.touch_runtime("scan_strategy", {"asset_type": asset_type, "strategy_version": strategy.strategy_id})
             rows = context.universe_scanner.scan_strategy(strategy.strategy_id, touch=context.touch_runtime)
             results[str(strategy.strategy_id)] = len(rows)
             context.repository.log_event(
@@ -235,11 +256,11 @@ def scan_job(
                 f"{strategy.display_name} scanned",
                 {
                     "count": len(rows),
-                    "asset_type": "한국주식",
+                    "asset_type": asset_type,
                     "account_id": account_id,
                     "strategy_version": strategy.strategy_id,
                     "strategy_family": strategy.strategy_family,
-                    "session_mode": strategy_session_label(strategy),
+                    "session_mode": strategy_session_label(strategy, when=current_time),
                     "experimental": bool(strategy.experimental),
                 },
                 account_id=account_id,
@@ -248,8 +269,9 @@ def scan_job(
 
     asset_list = list(asset_types or context.settings.asset_schedules.keys())
     for asset_type in asset_list:
-        if asset_type == "한국주식" and active_kr_strategy_ids(context.settings):
-            nested = scan_job(context, strategy_ids=active_kr_strategy_ids(context.settings))
+        asset_strategy_ids = active_strategy_ids(context.settings, asset_schedule_key=asset_type)
+        if asset_strategy_ids:
+            nested = scan_job(context, strategy_ids=asset_strategy_ids)
             results.update(nested)
             continue
         account_id = _account_scope_for_asset(asset_type)
@@ -278,10 +300,10 @@ def entry_decision_job(
             strategy = get_kr_strategy(context.settings, str(strategy_id))
             if strategy is None:
                 continue
-            asset_type = "한국주식"
-            schedule = strategy_schedule(context.settings, strategy.strategy_id)
+            asset_type = strategy_asset_type(context.settings, strategy.strategy_id)
             regular_market_open = context.market_data_service.is_market_open(asset_type)
             current_time = _market_current_time(context.market_data_service, asset_type)
+            schedule = strategy_schedule(context.settings, strategy.strategy_id, when=current_time)
             session_open = strategy_session_is_open(
                 context.settings,
                 strategy.strategy_id,
@@ -304,7 +326,7 @@ def entry_decision_job(
                         "market_phase": context.market_data_service.market_phase(asset_type),
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                         "experimental": bool(strategy.experimental),
                     },
                 )
@@ -325,7 +347,7 @@ def entry_decision_job(
                     {
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                     },
                 )
                 continue
@@ -342,7 +364,7 @@ def entry_decision_job(
                         "filtered": True,
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                     },
                 )
                 continue
@@ -367,7 +389,7 @@ def entry_decision_job(
                         "score": float(candidate["score"]),
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                         "experimental": bool(strategy.experimental),
                         **_finite_metric_details(
                             expected_return=candidate.get("expected_return"),
@@ -391,7 +413,7 @@ def entry_decision_job(
                             "account_id": str(candidate.get("execution_account_id") or ""),
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
-                            "session_mode": strategy_session_label(strategy),
+                            "session_mode": strategy_session_label(strategy, when=current_time),
                         },
                     )
                     continue
@@ -423,7 +445,7 @@ def entry_decision_job(
                             "account_id": account_id,
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
-                            "session_mode": strategy_session_label(strategy),
+                            "session_mode": strategy_session_label(strategy, when=current_time),
                             **_finite_metric_details(
                                 expected_return=signal.expected_return,
                                 expected_risk=signal.expected_risk,
@@ -446,7 +468,7 @@ def entry_decision_job(
                         "account_id": account_id,
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                         **_finite_metric_details(
                             expected_return=signal.expected_return,
                             expected_risk=signal.expected_risk,
@@ -475,7 +497,7 @@ def entry_decision_job(
                             "account_id": account_id,
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
-                            "session_mode": strategy_session_label(strategy),
+                            "session_mode": strategy_session_label(strategy, when=current_time),
                             **_finite_metric_details(
                                 expected_return=signal.expected_return,
                                 expected_risk=signal.expected_risk,
@@ -496,11 +518,11 @@ def entry_decision_job(
                         {
                             "strategy_version": strategy.strategy_id,
                             "strategy_family": strategy.strategy_family,
-                            "session_mode": strategy_session_label(strategy),
+                            "session_mode": strategy_session_label(strategy, when=current_time),
                         },
                     )
             else:
-                account_id = _account_scope_for_asset(asset_type)
+                account_id = strategy_execution_account_id(context.settings, strategy.strategy_id)
                 context.repository.log_event(
                     "INFO",
                     "entry_job",
@@ -512,7 +534,7 @@ def entry_decision_job(
                         "account_id": account_id,
                         "strategy_version": strategy.strategy_id,
                         "strategy_family": strategy.strategy_family,
-                        "session_mode": strategy_session_label(strategy),
+                        "session_mode": strategy_session_label(strategy, when=current_time),
                         "experimental": bool(strategy.experimental),
                     },
                     account_id=account_id,
@@ -521,8 +543,9 @@ def entry_decision_job(
 
     asset_list = list(asset_types or context.settings.asset_schedules.keys())
     for asset_type in asset_list:
-        if asset_type == "한국주식" and active_kr_strategy_ids(context.settings):
-            nested = entry_decision_job(context, strategy_ids=active_kr_strategy_ids(context.settings))
+        asset_strategy_ids = active_strategy_ids(context.settings, asset_schedule_key=asset_type)
+        if asset_strategy_ids:
+            nested = entry_decision_job(context, strategy_ids=asset_strategy_ids)
             entered.update(nested)
             continue
         schedule = context.settings.asset_schedules[asset_type]

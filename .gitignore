@@ -2,4 +2,7 @@
 .prediction_tracking/
 __pycache__/
 .runtime/
+.claude/
+.tmp_kis_repo/
+alt.db
 config/runtime_settings.json

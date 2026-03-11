@@ -268,6 +268,146 @@ class PaperBrokerTest(unittest.TestCase):
         self.assertEqual(str(snapshot["source"]), "kis_account_sync")
         self.assertAlmostEqual(float(snapshot["drawdown_pct"]), -20.0)
 
+    def test_kis_snapshot_drawdown_ignores_legacy_paper_peak_on_same_account(self) -> None:
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_legacy_paper_peak",
+                created_at="2026-03-08T08:00:00Z",
+                cash=500.0,
+                equity=500.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="paper_broker",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_true_peak",
+                created_at="2026-03-08T08:05:00Z",
+                cash=300.0,
+                equity=300.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="kis_account_sync",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+
+        snapshot = self.broker.record_external_account_snapshot(
+            cash=240.0,
+            equity=240.0,
+            gross_exposure=0.0,
+            net_exposure=0.0,
+            unrealized_pnl=0.0,
+            open_positions=0,
+            source="kis_account_sync",
+        )
+
+        self.assertEqual(str(snapshot["source"]), "kis_account_sync")
+        self.assertAlmostEqual(float(snapshot["drawdown_pct"]), -20.0)
+
+    def test_fill_recalculates_long_exit_levels_from_actual_fill_price(self) -> None:
+        signal = SignalDecision(
+            **{
+                **self._signal().__dict__,
+                "symbol": "005930.KS",
+                "asset_type": "한국주식",
+                "timeframe": "15m",
+                "strategy_version": "kr_intraday_15m_v1",
+                "current_price": 194500.0,
+                "stop_level": 194070.0,
+                "take_level": 195353.0,
+                "expected_risk": 0.003302578834825514,
+                "atr_value": 643.0,
+            }
+        )
+        order_id = self.broker.submit_entry_order(signal, quantity=1, account_id=ACCOUNT_KIS_KR_PAPER)
+
+        self.broker.apply_external_fill(
+            order_id,
+            fill_qty=1,
+            fill_price=190100.0,
+            raw_json={"broker": "kis_mock", "account_id": ACCOUNT_KIS_KR_PAPER},
+            final_status="filled",
+        )
+
+        position = self.repo.open_positions(account_id=ACCOUNT_KIS_KR_PAPER).iloc[0]
+        self.assertLess(float(position["stop_loss"]), float(position["entry_price"]))
+        self.assertGreater(float(position["take_profit"]), float(position["entry_price"]))
+        self.assertAlmostEqual(float(position["trailing_stop"]), float(position["stop_loss"]))
+        self.assertEqual(str(position["strategy_family"]), "kr_intraday_15m")
+        self.assertEqual(str(position["session_mode"]), "regular")
+        self.assertEqual(str(position["price_policy"]), "market_best_effort")
+        with self.repo.connect() as conn:
+            fills = pd.read_sql_query(
+                "SELECT * FROM fills WHERE account_id = ? ORDER BY created_at DESC, rowid DESC",
+                conn,
+                params=[ACCOUNT_KIS_KR_PAPER],
+            )
+        self.assertFalse(fills.empty)
+        fill_meta = json.loads(str(fills.iloc[0]["raw_json"] or "{}"))
+        self.assertEqual(str(fill_meta.get("strategy_family") or ""), "kr_intraday_15m")
+        self.assertEqual(str(fill_meta.get("session_mode") or ""), "regular")
+        self.assertEqual(str(fill_meta.get("price_policy") or ""), "market_best_effort")
+
+    def test_external_fill_for_kis_order_does_not_write_paper_snapshot(self) -> None:
+        self.repo.insert_account_snapshot(
+            AccountSnapshotRecord(
+                snapshot_id="snap_kis_only",
+                created_at="2026-03-08T08:00:00Z",
+                cash=30000000.0,
+                equity=30000000.0,
+                gross_exposure=0.0,
+                net_exposure=0.0,
+                realized_pnl=0.0,
+                unrealized_pnl=0.0,
+                daily_pnl=0.0,
+                drawdown_pct=0.0,
+                open_positions=0,
+                open_orders=0,
+                paused=0,
+                source="kis_account_sync",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+        signal = SignalDecision(
+            **{
+                **self._signal().__dict__,
+                "symbol": "005930.KS",
+                "asset_type": "한국주식",
+                "timeframe": "15m",
+                "strategy_version": "kr_intraday_15m_v1",
+                "atr_value": 643.0,
+            }
+        )
+        order_id = self.broker.submit_entry_order(signal, quantity=1, account_id=ACCOUNT_KIS_KR_PAPER)
+
+        self.broker.apply_external_fill(
+            order_id,
+            fill_qty=1,
+            fill_price=190100.0,
+            raw_json={"broker": "kis_mock", "account_id": ACCOUNT_KIS_KR_PAPER},
+            final_status="filled",
+        )
+
+        latest = self.repo.latest_account_snapshot(account_id=ACCOUNT_KIS_KR_PAPER)
+        self.assertEqual(str(latest["source"]), "kis_account_sync")
+
     def test_submit_entry_order_records_crypto_account_id(self) -> None:
         order_id = self.broker.submit_entry_order(self._signal(), quantity=1)
         order = self.repo.get_order(order_id)

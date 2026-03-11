@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
+import pandas as pd
+
 from config.settings import RuntimeSettings
+from kr_strategy import strategy_schedule
 from monitoring.dashboard_hooks import (
     build_asset_overview,
     compute_auto_trading_status,
@@ -12,7 +15,7 @@ from monitoring.dashboard_hooks import (
     load_monitor_open_positions,
 )
 from runtime_accounts import ACCOUNT_KIS_KR_PAPER, ACCOUNT_SIM_CRYPTO, ACCOUNT_SIM_US_EQUITY
-from storage.models import AccountSnapshotRecord, PositionRecord
+from storage.models import AccountSnapshotRecord, CandidateScanRecord, OrderRecord, PositionRecord
 from storage.repository import TradingRepository
 
 
@@ -93,6 +96,20 @@ class DashboardHooksTest(unittest.TestCase):
         self.assertEqual(str(kr_row["실험전략"]), "예")
         self.assertEqual(str(kr_row["세션모드"]), "regular")
 
+    def test_asset_overview_reflects_active_us_strategy(self) -> None:
+        settings = RuntimeSettings()
+        settings.us_default_strategy_id = "us_combo_15m_ahc_regular_v1"
+        settings.kr_strategies["us_intraday_1h_v1"].enabled = False
+        settings.kr_strategies["us_combo_15m_ahc_regular_v1"].enabled = True
+
+        overview = build_asset_overview(settings, kis_enabled=True)
+
+        us_row = overview.loc[(overview["자산유형"] == "미국주식") & (overview["전략ID"].astype(str) == "us_combo_15m_ahc_regular_v1")].iloc[0]
+        self.assertEqual(str(us_row["타임프레임"]), "15m")
+        self.assertEqual(int(us_row["스캔주기(분)"]), 15)
+        self.assertEqual(str(us_row["세션모드"]), "regular")
+        self.assertEqual(str(us_row["실행브로커"]), "sim")
+
     def test_dashboard_reader_lists_regular_and_after_hours_kr_15m_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = RuntimeSettings()
@@ -103,10 +120,17 @@ class DashboardHooksTest(unittest.TestCase):
             data = load_dashboard_data(settings)
             rows = data["kr_strategy_overview"]
             session_modes = dict(zip(rows["strategy_id"].astype(str), rows["session_mode"].astype(str)))
+            auto_schedule = strategy_schedule(settings, "kr_intraday_15m_v1_auto")
+            expected_auto_mode = {
+                "regular": "regular",
+                "after_close_close_price": "after_close_close",
+                "after_close_single_price": "after_close_single",
+            }[auto_schedule.session_mode]
 
             self.assertEqual(session_modes["kr_intraday_15m_v1"], "regular")
-            self.assertEqual(session_modes["kr_intraday_15m_v1_after_close_close"], "after_close_close")
-            self.assertEqual(session_modes["kr_intraday_15m_v1_after_close_single"], "after_close_single")
+            self.assertEqual(session_modes["kr_intraday_15m_v1_auto"], expected_auto_mode)
+            self.assertNotIn("kr_intraday_15m_v1_after_close_close", session_modes)
+            self.assertNotIn("kr_intraday_15m_v1_after_close_single", session_modes)
 
     def test_auto_trading_status_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -199,6 +223,8 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(data["runtime_profile"]["kr_recommended_strategy_id"], "kr_intraday_1h_v1")
             self.assertIn("kr_intraday_1h_v1", data["runtime_profile"]["kr_active_strategies"])
             self.assertIn("regular", data["runtime_profile"]["kr_active_strategy_session_modes"])
+            self.assertEqual(data["runtime_profile"]["us_default_strategy_id"], "us_intraday_1h_v1")
+            self.assertEqual(data["runtime_profile"]["us_recommended_strategy_id"], "us_intraday_1h_v1")
 
     def test_broker_sync_errors_filters_out_healthy_info_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,18 +392,19 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertTrue(str(total["display_currency"]) in {"", "KRW", "USD"})
             self.assertEqual(total["equity_by_currency"]["KRW"], 30_500_000.0)
             self.assertEqual(total["equity_by_currency"]["USD"], 15_750.0)
+            self.assertEqual(float(accounts[ACCOUNT_KIS_KR_PAPER]["trade_performance"]["samples"]), 1.0)
+            self.assertEqual(float(accounts[ACCOUNT_SIM_US_EQUITY]["trade_performance"]["samples"]), 1.0)
+            self.assertEqual(float(data["trade_performance"]["samples"]), 3.0)
             self.assertEqual(str(data["recent_realized_trades"].iloc[0]["position_id"]), "pos_us_closed")
             self.assertFalse(data["kr_strategy_overview"].empty)
             strategy_ids = set(data["kr_strategy_overview"]["strategy_id"].astype(str))
-            self.assertEqual(
-                strategy_ids,
+            self.assertTrue(
                 {
                     "kr_daily_preclose_v1",
                     "kr_intraday_1h_v1",
                     "kr_intraday_15m_v1",
-                    "kr_intraday_15m_v1_after_close_close",
-                    "kr_intraday_15m_v1_after_close_single",
-                },
+                    "kr_intraday_15m_v1_auto",
+                }.issubset(strategy_ids)
             )
             intraday_15m = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1"].iloc[0]
             self.assertFalse(bool(intraday_15m["enabled"]))
@@ -385,15 +412,151 @@ class DashboardHooksTest(unittest.TestCase):
             self.assertEqual(str(intraday_15m["session_mode"]), "regular")
             self.assertEqual(str(intraday_15m["broker_mode"]), "kis_mock")
             self.assertEqual(str(intraday_15m["execution_account_id"]), ACCOUNT_KIS_KR_PAPER)
-            self.assertEqual(str(intraday_15m["intended_use"]), "experimental regular intraday")
-            after_close = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_after_close_close"].iloc[0]
-            self.assertEqual(str(after_close["session_mode"]), "after_close_close")
-            self.assertEqual(str(after_close["session_window"]), "15:40~16:00")
-            after_close_single = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_after_close_single"].iloc[0]
-            self.assertEqual(str(after_close_single["session_mode"]), "after_close_single")
-            self.assertEqual(str(after_close_single["execution_cadence"]), "10분 단일가 경매")
-            self.assertEqual(str(after_close_single["price_policy"]), "시간외 단일가 예상체결")
-            self.assertEqual(str(after_close_single["intended_use"]), "10-minute single-price auction")
+            self.assertEqual(str(intraday_15m["intended_use"]), "regular intraday only")
+            auto_15m = data["kr_strategy_overview"].loc[data["kr_strategy_overview"]["strategy_id"].astype(str) == "kr_intraday_15m_v1_auto"].iloc[0]
+            expected_auto = strategy_schedule(settings, "kr_intraday_15m_v1_auto")
+            expected_auto_mode = {
+                "regular": "regular",
+                "after_close_close_price": "after_close_close",
+                "after_close_single_price": "after_close_single",
+            }[expected_auto.session_mode]
+            expected_auto_window = {
+                "regular": "09:15~14:45",
+                "after_close_close_price": "15:40~16:00",
+                "after_close_single_price": "16:00~18:00",
+            }[expected_auto.session_mode]
+            self.assertEqual(str(auto_15m["session_mode"]), expected_auto_mode)
+            self.assertEqual(str(auto_15m["session_window"]), expected_auto_window)
+            self.assertEqual(str(auto_15m["intended_use"]), "auto regular + after-close")
+
+    def test_dashboard_reader_uses_today_candidate_scans_not_latest_300_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            us_start = pd.Timestamp.now(tz="America/New_York").normalize()
+            crypto_start = pd.Timestamp.now(tz="UTC").normalize()
+
+            records = []
+            for index in range(320):
+                created_at = (us_start + pd.Timedelta(minutes=index)).tz_convert("UTC").isoformat()
+                records.append(
+                    CandidateScanRecord(
+                        scan_id=f"us_{index}",
+                        created_at=created_at,
+                        symbol=f"US{index}",
+                        asset_type="미국주식",
+                        timeframe="15m",
+                        score=float(index),
+                        rank=index + 1,
+                        status="flat",
+                        reason="flat_signal",
+                        expected_return=0.01,
+                        expected_risk=0.01,
+                        confidence=0.5,
+                        threshold=0.1,
+                        volatility=0.1,
+                        liquidity_score=1.0,
+                        cost_bps=8.0,
+                        recent_performance=0.0,
+                        signal="FLAT",
+                        model_version="m",
+                        feature_version="f",
+                        strategy_version="us_intraday_1h_v1",
+                        execution_account_id=ACCOUNT_SIM_US_EQUITY,
+                    )
+                )
+            records.append(
+                CandidateScanRecord(
+                    scan_id="coin_1",
+                    created_at=(crypto_start + pd.Timedelta(hours=1)).isoformat(),
+                    symbol="BTC-USD",
+                    asset_type="코인",
+                    timeframe="1h",
+                    score=10.0,
+                    rank=1,
+                    status="candidate",
+                    reason="signal_ready",
+                    expected_return=0.02,
+                    expected_risk=0.01,
+                    confidence=0.7,
+                    threshold=0.1,
+                    volatility=0.2,
+                    liquidity_score=1.0,
+                    cost_bps=10.0,
+                    recent_performance=0.0,
+                    signal="LONG",
+                    model_version="m",
+                    feature_version="f",
+                    strategy_version="crypto_intraday",
+                    execution_account_id=ACCOUNT_SIM_CRYPTO,
+                )
+            )
+            repo.insert_candidate_scans(records)
+
+            data = load_dashboard_data(settings)
+            candidate_scans = data["candidate_scans"]
+
+            self.assertGreater(len(candidate_scans), 300)
+            self.assertIn("BTC-USD", set(candidate_scans["symbol"].astype(str)))
+
+    def test_dashboard_reader_preserves_event_session_mode_and_surfaces_hidden_strategy_with_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = RuntimeSettings()
+            settings.storage.db_path = f"{tmp}/runtime.sqlite3"
+            repo = TradingRepository(settings.storage.db_path)
+            repo.initialize()
+            created_at = pd.Timestamp.now(tz="Asia/Seoul").tz_convert("UTC").isoformat()
+            repo.insert_order(
+                OrderRecord(
+                    order_id="ord_hidden_strategy",
+                    created_at=created_at,
+                    updated_at=created_at,
+                    prediction_id="pred_hidden",
+                    scan_id="scan_hidden",
+                    symbol="005930.KS",
+                    asset_type="한국주식",
+                    timeframe="15m",
+                    side="buy",
+                    order_type="after_close_close",
+                    requested_qty=1,
+                    filled_qty=0,
+                    remaining_qty=1,
+                    requested_price=70000.0,
+                    limit_price=70000.0,
+                    status="submitted",
+                    fees_estimate=0.0,
+                    slippage_bps=0.0,
+                    retry_count=0,
+                    broker_order_id="b_hidden",
+                    strategy_version="kr_combo_15m_ahc_afterclose_v2",
+                    reason="entry",
+                    raw_json="{}",
+                    account_id=ACCOUNT_KIS_KR_PAPER,
+                )
+            )
+            repo.log_event(
+                "INFO",
+                "execution_pipeline",
+                "submitted",
+                "hidden strategy submitted",
+                {
+                    "symbol": "005930.KS",
+                    "strategy_version": "kr_combo_15m_ahc_afterclose_v2",
+                    "session_mode": "after_close_close_price",
+                    "account_id": ACCOUNT_KIS_KR_PAPER,
+                },
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+
+            data = load_dashboard_data(settings)
+
+            strategy_ids = set(data["kr_strategy_overview"]["strategy_id"].astype(str))
+            self.assertIn("kr_combo_15m_ahc_afterclose_v2", strategy_ids)
+            recent = data["kr_strategy_recent_events"]
+            hidden_row = recent.loc[recent["strategy_id"].astype(str) == "kr_combo_15m_ahc_afterclose_v2"].iloc[0]
+            self.assertEqual(str(hidden_row["session_mode"]), "after_close_close")
 
 
 if __name__ == "__main__":

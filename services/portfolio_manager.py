@@ -12,7 +12,14 @@ from storage.models import PositionRecord
 from storage.repository import TradingRepository, utc_now_iso
 
 
+def _float_or_nan(value: object) -> float:
+    number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    return float(number) if pd.notna(number) else float("nan")
+
+
 class PortfolioManager:
+    KR_LIVE_QUOTE_MAX_AGE_SECONDS = 30
+
     def __init__(self, settings: RuntimeSettings, repository: TradingRepository, broker):
         self.settings = settings
         self.repository = repository
@@ -21,22 +28,58 @@ class PortfolioManager:
     def _strategy_config(self, strategy_version: str = ""):
         return get_kr_strategy(self.settings, str(strategy_version or ""))
 
+    def _live_kr_price_bundle(self, symbol: str) -> dict[str, float] | None:
+        frame = self.repository.latest_live_market_quotes(
+            symbols=[symbol],
+            max_age_seconds=self.KR_LIVE_QUOTE_MAX_AGE_SECONDS,
+        )
+        if frame.empty:
+            return None
+        row = frame.iloc[0]
+        current_price = _float_or_nan(row.get("current_price"))
+        if not np.isfinite(current_price) or current_price <= 0:
+            return None
+        bid_price = _float_or_nan(row.get("bid_price"))
+        ask_price = _float_or_nan(row.get("ask_price"))
+        return {
+            "mark_price": current_price,
+            "long_exit_price": bid_price if np.isfinite(bid_price) and bid_price > 0 else current_price,
+            "short_exit_price": ask_price if np.isfinite(ask_price) and ask_price > 0 else current_price,
+        }
+
+    def _price_bundle(self, position: pd.Series, market_data_service: MarketDataService) -> dict[str, float] | None:
+        symbol = str(position["symbol"])
+        asset_type = str(position["asset_type"])
+        if asset_type == "한국주식":
+            live_bundle = self._live_kr_price_bundle(symbol)
+            if live_bundle is not None:
+                return live_bundle
+        quote = market_data_service.latest_quote(
+            symbol=symbol,
+            asset_type=asset_type,
+            timeframe=str(position["timeframe"]),
+        )
+        price = float(quote.price)
+        return {
+            "mark_price": price,
+            "long_exit_price": price,
+            "short_exit_price": price,
+        }
+
     def mark_to_market(self, market_data_service: MarketDataService, touch=None) -> None:
         positions = self.repository.open_positions()
         for _, position in positions.iterrows():
             if callable(touch):
                 touch("position_mark", {"symbol": str(position["symbol"]), "position_id": str(position.get("position_id") or "")})
             try:
-                quote = market_data_service.latest_quote(
-                    symbol=str(position["symbol"]),
-                    asset_type=str(position["asset_type"]),
-                    timeframe=str(position["timeframe"]),
-                )
+                price_bundle = self._price_bundle(position, market_data_service)
             except Exception:
+                continue
+            if price_bundle is None:
                 continue
             side = str(position["side"])
             entry = float(position["entry_price"])
-            mark = float(quote.price)
+            mark = float(price_bundle["mark_price"])
             qty = int(position["quantity"])
             strategy_cfg = self._strategy_config(str(position.get("strategy_version") or ""))
             trailing_mult = float(strategy_cfg.trailing_stop_atr_mult if strategy_cfg is not None else self.settings.strategy.trailing_stop_atr_mult)
@@ -75,7 +118,10 @@ class PortfolioManager:
         positions = self.repository.open_positions()
         active_exit_orders = self.repository.open_orders(statuses=("new", "submitted", "acknowledged", "pending_fill", "partially_filled"))
         latest_candidates = self.repository.latest_candidates(limit=500)
-        latest_candidates = latest_candidates.sort_values("created_at").drop_duplicates(subset=["symbol", "timeframe"], keep="last")
+        latest_candidates = latest_candidates.sort_values("created_at").drop_duplicates(
+            subset=["symbol", "timeframe", "strategy_version", "execution_account_id"],
+            keep="last",
+        )
         for _, position in positions.iterrows():
             account_id = str(position.get("account_id") or "")
             if callable(touch):
@@ -93,15 +139,13 @@ class PortfolioManager:
                 if not duplicated.empty:
                     continue
             try:
-                quote = market_data_service.latest_quote(
-                    symbol=str(position["symbol"]),
-                    asset_type=str(position["asset_type"]),
-                    timeframe=str(position["timeframe"]),
-                )
+                price_bundle = self._price_bundle(position, market_data_service)
             except Exception:
                 continue
-            price = float(quote.price)
+            if price_bundle is None:
+                continue
             side = str(position["side"])
+            price = float(price_bundle["long_exit_price"] if side == "LONG" else price_bundle["short_exit_price"])
             stop_loss = float(position["stop_loss"])
             take_profit = float(position["take_profit"])
             trailing_stop = float(position["trailing_stop"])

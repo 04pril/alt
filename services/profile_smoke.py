@@ -883,6 +883,7 @@ def run_profile_smoke(profile_path: str | Path) -> Dict[str, Any]:
         str(strategy_id)
         for strategy_id in (
             "kr_intraday_15m_v1",
+            "kr_intraday_15m_v1_auto",
             "kr_intraday_15m_v1_after_close_close",
             "kr_intraday_15m_v1_after_close_single",
         )
@@ -893,6 +894,7 @@ def run_profile_smoke(profile_path: str | Path) -> Dict[str, Any]:
         "active_strategy_ids": [str(strategy_id) for strategy_id, strategy in settings.kr_strategies.items() if bool(strategy.enabled)],
         "experimental_15m_family_ids": experimental_family_ids,
         "experimental_15m_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1"].enabled),
+        "experimental_15m_auto_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1_auto"].enabled),
         "experimental_15m_after_close_close_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_close"].enabled),
         "experimental_15m_after_close_single_enabled": bool(settings.kr_strategies["kr_intraday_15m_v1_after_close_single"].enabled),
         "experimental_15m_session_modes": {

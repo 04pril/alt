@@ -247,6 +247,114 @@ class RepositoryRuntimeTest(unittest.TestCase):
         self.assertEqual(self.repo.max_account_equity(source="kis_account_sync"), 500.0)
         self.assertEqual(self.repo.max_account_equity(exclude_sources=("kis_account_sync",)), 120.0)
 
+    def test_expire_stale_job_runs_marks_expired_leases_abandoned(self) -> None:
+        with self.repo.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO job_runs(
+                    job_run_id, job_name, run_key, scheduled_at, started_at, finished_at,
+                    status, retry_count, lock_owner, next_retry_at, lease_expires_at, error_message, metrics_json
+                ) VALUES(?, ?, ?, ?, ?, NULL, 'running', 0, ?, NULL, ?, '', '{}')
+                """,
+                (
+                    "job_stale",
+                    "scan:한국주식",
+                    "2026-03-08T10:00",
+                    "2026-03-08T10:00:00Z",
+                    "2026-03-08T10:00:01Z",
+                    "test-worker",
+                    "2026-03-08T10:01:00Z",
+                ),
+            )
+
+        expired = self.repo.expire_stale_job_runs()
+        row = self.repo.get_job_run("job_stale")
+
+        self.assertEqual(expired, 1)
+        self.assertEqual(str(row["status"]), "abandoned")
+        self.assertEqual(str(row["lease_expires_at"] or ""), "")
+
+    def test_initialize_backfills_position_execution_metadata_from_orders(self) -> None:
+        created_at = "2026-03-08T09:00:00Z"
+        self.repo.insert_order(
+            OrderRecord(
+                order_id="ord_meta",
+                created_at=created_at,
+                updated_at=created_at,
+                prediction_id=None,
+                scan_id=None,
+                symbol="005930.KS",
+                asset_type="한국주식",
+                timeframe="15m",
+                side="buy",
+                order_type="after_close_close",
+                requested_qty=1,
+                filled_qty=0,
+                remaining_qty=1,
+                requested_price=70000.0,
+                limit_price=0.0,
+                status="submitted",
+                fees_estimate=0.0,
+                slippage_bps=0.0,
+                retry_count=0,
+                strategy_version="kr_intraday_15m_v1_auto",
+                reason="entry",
+                raw_json='{"strategy_family":"kr_intraday_15m","session_mode":"after_close_close_price","price_policy":"close_price","account_id":"kis_kr_paper"}',
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+        self.repo.upsert_position(
+            PositionRecord(
+                position_id="pos_meta",
+                created_at=created_at,
+                updated_at=created_at,
+                closed_at=None,
+                prediction_id=None,
+                symbol="005930.KS",
+                asset_type="한국주식",
+                timeframe="15m",
+                side="LONG",
+                status="open",
+                quantity=1,
+                entry_price=70000.0,
+                mark_price=70000.0,
+                stop_loss=69000.0,
+                take_profit=71000.0,
+                trailing_stop=69000.0,
+                highest_price=70000.0,
+                lowest_price=70000.0,
+                unrealized_pnl=0.0,
+                realized_pnl=0.0,
+                expected_risk=0.01,
+                exposure_value=70000.0,
+                max_holding_until="2026-03-08T10:00:00Z",
+                strategy_version="kr_intraday_15m_v1_auto",
+                notes="opened_by_fill",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+
+        self.repo.initialize()
+
+        positions = self.repo.open_positions(account_id=ACCOUNT_KIS_KR_PAPER)
+        row = positions.loc[positions["position_id"].astype(str) == "pos_meta"].iloc[0]
+        self.assertEqual(str(row["strategy_family"]), "kr_intraday_15m")
+        self.assertEqual(str(row["session_mode"]), "after_close_close_price")
+        self.assertEqual(str(row["price_policy"]), "close_price")
+
+    def test_clear_broker_error_events_removes_only_broker_errors(self) -> None:
+        self.repo.log_event("ERROR", "scheduler", "job_failed", "generic failed", {})
+        self.repo.log_event("ERROR", "kis_execution", "rejected", "broker rejected", {})
+        self.repo.log_event("ERROR", "broker_order_sync", "broker_order_sync", "sync failed", {})
+        self.repo.log_event("INFO", "kis_execution", "submitted", "submitted", {})
+
+        cleared = self.repo.clear_broker_error_events()
+        events = self.repo.recent_system_events(limit=20)
+
+        self.assertEqual(cleared, 2)
+        self.assertTrue(((events["component"].astype(str) == "scheduler") & (events["level"].astype(str) == "ERROR")).any())
+        self.assertFalse(((events["component"].astype(str) == "kis_execution") & (events["level"].astype(str) == "ERROR")).any())
+
     def test_latest_position_and_cooldown_use_rowid_tiebreaker(self) -> None:
         updated_at = "2026-03-08T11:00:00Z"
         base = {

@@ -174,6 +174,9 @@ class PositionRecord:
     cooldown_until: str | None = None
     notes: str = ''
     account_id: str = ''
+    strategy_family: str = ''
+    session_mode: str = ''
+    price_policy: str = ''
 
 
 @dataclass(frozen=True)

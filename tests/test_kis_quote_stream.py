@@ -8,7 +8,10 @@ from config.settings import RuntimeSettings, UniverseSettings
 from services.kis_quote_stream import (
     KR_QUOTE_FIELDS,
     MAX_KR_QUOTE_SYMBOLS,
+    MAX_KR_QUOTE_SYMBOLS_PER_CONNECTION,
     KISKRQuoteStream,
+    _chunk_symbol_codes,
+    _is_transient_stream_error,
     _stream_connect_kwargs,
     parse_kr_quote_message,
 )
@@ -65,7 +68,7 @@ class KISQuoteStreamTest(unittest.TestCase):
         self.assertAlmostEqual(rows[0].bid_price, 189900.0)
         self.assertAlmostEqual(rows[0].volume, 1234567.0)
 
-    def test_candidate_symbols_expand_to_100_unique_codes(self) -> None:
+    def test_candidate_symbols_expand_to_runtime_cap_unique_codes(self) -> None:
         settings = RuntimeSettings()
         settings.universes["한국주식"] = UniverseSettings(
             watchlist=[f"{index:06d}.KS" for index in range(101, 111)],
@@ -77,5 +80,29 @@ class KISQuoteStreamTest(unittest.TestCase):
 
         self.assertEqual(len(symbols), MAX_KR_QUOTE_SYMBOLS)
         self.assertEqual(symbols[0], "000001")
-        self.assertEqual(symbols[-1], "000100")
+        self.assertEqual(symbols[-1], f"{MAX_KR_QUOTE_SYMBOLS:06d}")
         self.assertEqual(len(set(symbols)), MAX_KR_QUOTE_SYMBOLS)
+
+    def test_chunk_symbol_codes_shards_runtime_cap_across_connections(self) -> None:
+        batches = _chunk_symbol_codes([f"{index:06d}" for index in range(1, MAX_KR_QUOTE_SYMBOLS + 1)])
+
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), MAX_KR_QUOTE_SYMBOLS_PER_CONNECTION)
+        self.assertEqual(batches[0][0], "000001")
+        self.assertEqual(batches[0][-1], f"{MAX_KR_QUOTE_SYMBOLS:06d}")
+
+    def test_refresh_symbols_enforces_runtime_cap_for_explicit_symbol_lists(self) -> None:
+        settings = RuntimeSettings()
+        repository = _StubRepository()
+        stream = KISKRQuoteStream(settings, repository, client_factory=lambda: None)
+
+        changed = stream.refresh_symbols([f"{index:06d}" for index in range(1, 60)])
+
+        self.assertTrue(changed)
+        self.assertEqual(len(stream._desired_snapshot()), MAX_KR_QUOTE_SYMBOLS)
+        self.assertEqual(stream._desired_snapshot()[-1], f"{MAX_KR_QUOTE_SYMBOLS:06d}")
+
+    def test_transient_stream_error_classification(self) -> None:
+        self.assertTrue(_is_transient_stream_error(RuntimeError("no close frame received or sent")))
+        self.assertTrue(_is_transient_stream_error(RuntimeError("Connection closed unexpectedly")))
+        self.assertFalse(_is_transient_stream_error(RuntimeError("MAX SUBSCRIBE OVER")))

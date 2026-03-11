@@ -20,7 +20,7 @@ from jobs.tasks import (
     retrain_check_job,
     scan_job,
 )
-from kr_strategy import active_kr_strategy_ids, strategy_schedule
+from kr_strategy import active_strategy_ids, strategy_schedule
 from services.kis_quote_stream import KISKRQuoteStream
 from storage.repository import TradingRepository
 from storage.repository import utc_now_iso
@@ -34,6 +34,12 @@ def _bucket_key(dt: datetime, minutes: int) -> str:
     bucket = (dt.minute // max(minutes, 1)) * max(minutes, 1)
     rounded = dt.replace(minute=bucket, second=0, microsecond=0)
     return rounded.isoformat(timespec="minutes")
+
+
+def _ordered_asset_schedule_items(settings) -> list[tuple[str, object]]:
+    priority = {"한국주식": 0, "미국주식": 1, "코인": 2}
+    items = list(settings.asset_schedules.items())
+    return sorted(items, key=lambda item: (priority.get(str(item[0]), 99), str(item[0])))
 
 
 def _run_guarded(context, job_name: str, run_key: str, fn):
@@ -85,6 +91,9 @@ def _run_guarded(context, job_name: str, run_key: str, fn):
 
 def run_once(settings_path: str | None = None) -> None:
     context = build_task_context(settings_path)
+    expire_stale_job_runs = getattr(context.repository, "expire_stale_job_runs", None)
+    if callable(expire_stale_job_runs):
+        expire_stale_job_runs()
     settings = context.settings
     context.repository.set_control_flag("worker_heartbeat_at", utc_now_iso(), "scheduler loop heartbeat")
     _run_guarded(
@@ -99,9 +108,16 @@ def run_once(settings_path: str | None = None) -> None:
         run_key=_bucket_key(_utc_now(), settings.scheduler.broker_account_sync_interval_minutes),
         fn=lambda: broker_account_sync_job(context),
     )
-    for asset_type, schedule in settings.asset_schedules.items():
-        if asset_type == "한국주식" and active_kr_strategy_ids(settings):
-            for strategy_id in active_kr_strategy_ids(settings):
+    _run_guarded(
+        context,
+        job_name="exit_management",
+        run_key=_bucket_key(_utc_now(), settings.scheduler.exit_management_interval_minutes),
+        fn=lambda: exit_management_job(context),
+    )
+    for asset_type, schedule in _ordered_asset_schedule_items(settings):
+        asset_strategy_ids = active_strategy_ids(settings, asset_schedule_key=asset_type)
+        if asset_strategy_ids:
+            for strategy_id in asset_strategy_ids:
                 strategy_cfg = strategy_schedule(settings, strategy_id)
                 now = datetime.now(ZoneInfo(strategy_cfg.timezone))
                 _run_guarded(
@@ -135,12 +151,6 @@ def run_once(settings_path: str | None = None) -> None:
         job_name="broker_position_sync",
         run_key=_bucket_key(_utc_now(), settings.scheduler.broker_position_sync_interval_minutes),
         fn=lambda: broker_position_sync_job(context),
-    )
-    _run_guarded(
-        context,
-        job_name="exit_management",
-        run_key=_bucket_key(_utc_now(), settings.scheduler.exit_management_interval_minutes),
-        fn=lambda: exit_management_job(context),
     )
     _run_guarded(
         context,

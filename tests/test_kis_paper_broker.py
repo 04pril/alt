@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -16,7 +17,7 @@ from services.kis_paper_broker import KISPaperBroker
 from services.paper_broker import PaperBroker
 from services.risk_engine import RiskEngine
 from services.signal_engine import SignalDecision
-from storage.models import OrderRecord
+from storage.models import OrderRecord, PositionRecord
 from storage.repository import TradingRepository, utc_now_iso
 
 
@@ -50,8 +51,16 @@ class _FakeKISClient:
         self.daily_rows = pd.DataFrame()
 
     def get_account_snapshot(self) -> KISPaperSnapshot:
-        market_value = float(pd.to_numeric(self.holdings.get("market_value"), errors="coerce").fillna(0.0).sum()) if not self.holdings.empty else 0.0
-        unrealized = float(pd.to_numeric(self.holdings.get("unrealized_pnl"), errors="coerce").fillna(0.0).sum()) if not self.holdings.empty else 0.0
+        market_value = (
+            float(pd.to_numeric(self.holdings["market_value"], errors="coerce").fillna(0.0).sum())
+            if not self.holdings.empty and "market_value" in self.holdings.columns
+            else 0.0
+        )
+        unrealized = (
+            float(pd.to_numeric(self.holdings["unrealized_pnl"], errors="coerce").fillna(0.0).sum())
+            if not self.holdings.empty and "unrealized_pnl" in self.holdings.columns
+            else 0.0
+        )
         cash = 30_000_000.0
         return KISPaperSnapshot(
             summary={
@@ -214,6 +223,11 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.assertTrue(result["submitted"])
         self.assertEqual(self.client.place_orders[-1]["order_division"], "06")
         self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_close")
+        order = self.repo.get_order(str(result["order_id"]))
+        payload = json.loads(str(order.get("raw_json") or "{}"))
+        self.assertEqual(str(payload.get("strategy_family") or ""), "kr_intraday_15m")
+        self.assertEqual(str(payload.get("session_mode") or ""), "after_close_close_price")
+        self.assertEqual(str(payload.get("price_policy") or ""), "close_price")
 
     def test_after_close_single_gate_and_order_division(self) -> None:
         self.settings.kr_strategies["kr_intraday_15m_v1_after_close_single"].enabled = True
@@ -230,6 +244,36 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.assertTrue(submitted["submitted"])
         self.assertEqual(self.client.place_orders[-1]["order_division"], "07")
         self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_single")
+
+    def test_auto_15m_profile_switches_order_division_by_session(self) -> None:
+        self.settings.kr_strategies["kr_intraday_15m_v1_auto"].enabled = True
+        signal = self._signal()
+        signal = SignalDecision(**{**signal.__dict__, "timeframe": "15m", "strategy_version": "kr_intraday_15m_v1_auto"})
+
+        self.market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 15, 45, tzinfo=ZoneInfo("Asia/Seoul"))
+        close_submitted = self.broker.submit_entry_order_result(signal, quantity=1, market_data_service=self.market)
+        self.assertTrue(close_submitted["submitted"])
+        self.assertEqual(self.client.place_orders[-1]["order_division"], "06")
+        self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_close")
+
+        signal_2 = SignalDecision(
+            **{
+                **signal.__dict__,
+                "symbol": "000660.KS",
+                "prediction_id": "pred-kr-2",
+                "scan_id": "scan-kr-2",
+            }
+        )
+        self.market.current_times[self.kr_asset_type] = datetime(2026, 3, 9, 16, 10, tzinfo=ZoneInfo("Asia/Seoul"))
+        single_submitted = self.broker.submit_entry_order_result(signal_2, quantity=1, market_data_service=self.market)
+        self.assertTrue(single_submitted["submitted"])
+        self.assertEqual(self.client.place_orders[-1]["order_division"], "07")
+        self.assertEqual(self.client.place_orders[-1]["order_type"], "after_close_single")
+        order = self.repo.get_order(str(single_submitted["order_id"]))
+        payload = json.loads(str(order.get("raw_json") or "{}"))
+        self.assertEqual(str(payload.get("strategy_family") or ""), "kr_intraday_15m")
+        self.assertEqual(str(payload.get("session_mode") or ""), "after_close_single_price")
+        self.assertEqual(str(payload.get("price_policy") or ""), "auction_expected_price")
 
     def test_duplicate_pending_entry_does_not_submit(self) -> None:
         self.repo.insert_order(
@@ -311,6 +355,32 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.assertEqual(sync["fills"], 1)
         self.assertEqual(self.repo.get_order(result["order_id"])["status"], "filled")
 
+    def test_holdings_reconcile_fills_acknowledged_order_when_rest_lookup_missing(self) -> None:
+        result = self.broker.submit_entry_order_result(self._signal(), quantity=2, market_data_service=self.market)
+        self.client.daily_rows = pd.DataFrame()
+        self.client.holdings = pd.DataFrame(
+            [
+                {
+                    "symbol_code": "005930",
+                    "quantity": 2,
+                    "avg_price": 70000.0,
+                    "current_price": 70500.0,
+                    "unrealized_pnl": 1000.0,
+                    "market_value": 141000.0,
+                }
+            ]
+        )
+
+        sync = self.broker.sync_orders(self.market)
+        order = self.repo.get_order(result["order_id"])
+        position = self.repo.open_positions(account_id=ACCOUNT_KIS_KR_PAPER).iloc[0]
+
+        self.assertEqual(sync["fills"], 1)
+        self.assertEqual(order["status"], "filled")
+        self.assertEqual(int(position["quantity"]), 2)
+        self.assertLess(float(position["stop_loss"]), float(position["entry_price"]))
+        self.assertGreater(float(position["take_profit"]), float(position["entry_price"]))
+
     def test_sync_account_writes_canonical_snapshot_used_by_risk_engine(self) -> None:
         self.sim_broker.snapshot_account(cash_override=1_000_000.0)
         self.client.holdings = pd.DataFrame(
@@ -340,6 +410,153 @@ class KISPaperBrokerTest(unittest.TestCase):
         self.assertEqual(float(latest["net_exposure"]), 720_000.0)
         self.assertEqual(state["cash"], 30_000_000.0)
         self.assertEqual(state["equity"], 30_720_000.0)
+
+    def test_sync_account_restores_and_repairs_position_from_holdings(self) -> None:
+        self.repo.insert_order(
+            OrderRecord(
+                order_id="ord_restore",
+                created_at="2026-03-09T05:55:46Z",
+                updated_at="2026-03-09T05:55:48Z",
+                prediction_id="pred_restore",
+                scan_id="scan_restore",
+                symbol="005930.KS",
+                asset_type=self.kr_asset_type,
+                timeframe="15m",
+                side="buy",
+                order_type="market",
+                requested_qty=27,
+                filled_qty=27,
+                remaining_qty=0,
+                requested_price=190100.0,
+                limit_price=0.0,
+                status="filled",
+                fees_estimate=0.0,
+                slippage_bps=0.0,
+                retry_count=0,
+                strategy_version="kr_intraday_15m_v1",
+                reason="entry",
+                raw_json=json.dumps(
+                    {
+                        "broker": "kis_mock",
+                        "account_id": ACCOUNT_KIS_KR_PAPER,
+                        "symbol_code": "005930",
+                        "expected_risk": 0.003302578834825514,
+                        "stop_level": 194070.0,
+                        "take_level": 195353.0,
+                        "atr_14": 643.0,
+                        "max_holding_until": "2026-03-10T00:00:00Z",
+                        "strategy_version": "kr_intraday_15m_v1",
+                    },
+                    ensure_ascii=False,
+                ),
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+        self.repo.upsert_position(
+            PositionRecord(
+                position_id="pos_wrong",
+                created_at="2026-03-09T05:55:49Z",
+                updated_at="2026-03-09T05:55:49Z",
+                closed_at=None,
+                prediction_id="pred_restore",
+                symbol="005930.KS",
+                asset_type=self.kr_asset_type,
+                timeframe="15m",
+                side="LONG",
+                status="open",
+                quantity=27,
+                entry_price=190003.0,
+                mark_price=190003.0,
+                stop_loss=194070.0,
+                take_profit=195353.0,
+                trailing_stop=194070.0,
+                highest_price=190003.0,
+                lowest_price=190003.0,
+                unrealized_pnl=0.0,
+                realized_pnl=0.0,
+                expected_risk=0.003302578834825514,
+                exposure_value=5130081.0,
+                max_holding_until="2026-03-10T00:00:00Z",
+                strategy_version="kr_intraday_15m_v1",
+                cooldown_until=None,
+                notes="opened_by_fill",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            )
+        )
+        self.client.holdings = pd.DataFrame(
+            [
+                {
+                    "symbol_code": "005930",
+                    "quantity": 27,
+                    "avg_price": 190003.703,
+                    "current_price": 190100.0,
+                    "unrealized_pnl": 2600.0,
+                    "market_value": 5132700.0,
+                }
+            ]
+        )
+
+        sync = self.broker.sync_account()
+        position = self.repo.open_positions(account_id=ACCOUNT_KIS_KR_PAPER).iloc[0]
+
+        self.assertEqual(sync["reconcile_totals"]["updated"], 1)
+        self.assertAlmostEqual(float(position["entry_price"]), 190003.703, places=3)
+        self.assertLess(float(position["stop_loss"]), float(position["entry_price"]))
+        self.assertGreater(float(position["take_profit"]), float(position["entry_price"]))
+
+    def test_exit_preflight_falls_back_to_snapshot_when_sellable_api_fails_in_paper(self) -> None:
+        self.client.holdings = pd.DataFrame(
+            [
+                {
+                    "symbol_code": "005930",
+                    "quantity": 2,
+                    "avg_price": 70000.0,
+                }
+            ]
+        )
+
+        def _raise_sellable(symbol: str):
+            raise RuntimeError("paper sellable unavailable")
+
+        self.client.get_sellable_quantity = _raise_sellable  # type: ignore[method-assign]
+        now_iso = utc_now_iso()
+        position = pd.Series(
+            PositionRecord(
+                position_id="pos_exit_1",
+                created_at=now_iso,
+                updated_at=now_iso,
+                closed_at=None,
+                prediction_id="pred_exit_1",
+                symbol="005930.KS",
+                asset_type=self.kr_asset_type,
+                timeframe=self.kr_timeframe,
+                side="LONG",
+                status="open",
+                quantity=2,
+                entry_price=70000.0,
+                mark_price=70000.0,
+                stop_loss=68000.0,
+                take_profit=73000.0,
+                trailing_stop=69000.0,
+                highest_price=70000.0,
+                lowest_price=70000.0,
+                unrealized_pnl=0.0,
+                realized_pnl=0.0,
+                expected_risk=0.01,
+                exposure_value=140000.0,
+                max_holding_until="2026-03-10T00:00:00Z",
+                strategy_version=str(self.kr_strategy.strategy_id),
+                cooldown_until=None,
+                notes="opened_by_fill",
+                account_id=ACCOUNT_KIS_KR_PAPER,
+            ).__dict__
+        )
+
+        result = self.broker.submit_exit_order_result(position, reason="take_profit", market_data_service=self.market)
+
+        self.assertTrue(result["submitted"])
+        self.assertEqual(result["status"], "acknowledged")
+        self.assertEqual(self.client.place_orders[-1]["side"], "sell")
 
 
 if __name__ == "__main__":

@@ -14,21 +14,74 @@ from runtime_accounts import ACCOUNT_KIS_KR_PAPER
 KR_DAILY_PRE_CLOSE_V1 = "kr_daily_preclose_v1"
 KR_INTRADAY_1H_V1 = "kr_intraday_1h_v1"
 KR_INTRADAY_15M_V1 = "kr_intraday_15m_v1"
+KR_INTRADAY_15M_V1_AUTO = "kr_intraday_15m_v1_auto"
 KR_INTRADAY_15M_V1_AFTER_CLOSE_CLOSE = "kr_intraday_15m_v1_after_close_close"
 KR_INTRADAY_15M_V1_AFTER_CLOSE_SINGLE = "kr_intraday_15m_v1_after_close_single"
+KR_COMBO_1H_AHC_REGULAR_V1 = "kr_combo_1h_ahc_regular_v1"
+KR_COMBO_1H_AHC_AFTERCLOSE_V1 = "kr_combo_1h_ahc_afterclose_v1"
+US_INTRADAY_1H_V1 = "us_intraday_1h_v1"
+US_AFTERHOURS_V1 = "us_afterhours_v1"
+US_COMBO_1H_AHC_REGULAR_V1 = "us_combo_1h_ahc_regular_v1"
+US_COMBO_1H_AHC_AFTERHOURS_V1 = "us_combo_1h_ahc_afterhours_v1"
+KR_COMBO_15M_AHC_REGULAR_V2 = "kr_combo_15m_ahc_regular_v2"
+KR_COMBO_15M_AHC_AFTERCLOSE_V2 = "kr_combo_15m_ahc_afterclose_v2"
+US_COMBO_15M_AHC_REGULAR_V1 = "us_combo_15m_ahc_regular_v1"
+US_COMBO_15M_AHC_AFTERHOURS_V1 = "us_combo_15m_ahc_afterhours_v1"
+
+
+def strategy_asset_schedule_key(strategy: KRStrategyConfig | None) -> str:
+    return str((getattr(strategy, "asset_schedule_key", None) if strategy is not None else None) or "한국주식")
+
+
+def strategy_asset_type(settings: RuntimeSettings, strategy_id: str) -> str:
+    return strategy_asset_schedule_key(get_kr_strategy(settings, strategy_id))
+
+
+def _default_strategy_attr(asset_schedule_key: str) -> str:
+    if str(asset_schedule_key) == "미국주식":
+        return "us_default_strategy_id"
+    return "kr_default_strategy_id"
 
 
 def all_kr_strategies(settings: RuntimeSettings) -> dict[str, KRStrategyConfig]:
     return {str(key): value for key, value in (settings.kr_strategies or {}).items()}
 
 
-def enabled_kr_strategies(settings: RuntimeSettings) -> list[KRStrategyConfig]:
+def strategy_visible_in_ui(strategy: KRStrategyConfig | None) -> bool:
+    if strategy is None:
+        return False
+    return bool(getattr(strategy, "visible_in_ui", True))
+
+
+def visible_kr_strategies(settings: RuntimeSettings, *, asset_schedule_key: str | None = None) -> list[KRStrategyConfig]:
     ordered = list(all_kr_strategies(settings).values())
-    return [strategy for strategy in ordered if bool(strategy.enabled)]
+    return [
+        strategy
+        for strategy in ordered
+        if strategy_visible_in_ui(strategy) and (asset_schedule_key is None or strategy_asset_schedule_key(strategy) == str(asset_schedule_key))
+    ]
 
 
-def kr_strategy_ids(settings: RuntimeSettings, *, enabled_only: bool = False) -> list[str]:
-    source = enabled_kr_strategies(settings) if enabled_only else all_kr_strategies(settings).values()
+def enabled_kr_strategies(settings: RuntimeSettings, *, asset_schedule_key: str | None = None) -> list[KRStrategyConfig]:
+    ordered = list(all_kr_strategies(settings).values())
+    return [
+        strategy
+        for strategy in ordered
+        if bool(strategy.enabled) and (asset_schedule_key is None or strategy_asset_schedule_key(strategy) == str(asset_schedule_key))
+    ]
+
+
+def kr_strategy_ids(
+    settings: RuntimeSettings,
+    *,
+    enabled_only: bool = False,
+    asset_schedule_key: str | None = None,
+) -> list[str]:
+    source = (
+        enabled_kr_strategies(settings, asset_schedule_key=asset_schedule_key)
+        if enabled_only
+        else all_kr_strategies(settings).values()
+    )
     return [str(strategy.strategy_id) for strategy in source]
 
 
@@ -41,22 +94,40 @@ def is_kr_strategy(strategy_id: str, settings: RuntimeSettings) -> bool:
 
 
 def active_kr_strategy_ids(settings: RuntimeSettings) -> list[str]:
-    return kr_strategy_ids(settings, enabled_only=True)
+    return active_strategy_ids(settings, asset_schedule_key="한국주식")
 
 
-def default_kr_strategy(settings: RuntimeSettings) -> KRStrategyConfig | None:
-    preferred = get_kr_strategy(settings, str(settings.kr_default_strategy_id or ""))
-    if preferred and preferred.enabled:
+def active_strategy_ids(settings: RuntimeSettings, *, asset_schedule_key: str | None = None) -> list[str]:
+    return kr_strategy_ids(settings, enabled_only=True, asset_schedule_key=asset_schedule_key)
+
+
+def default_strategy(settings: RuntimeSettings, asset_schedule_key: str = "한국주식") -> KRStrategyConfig | None:
+    preferred = get_kr_strategy(settings, str(getattr(settings, _default_strategy_attr(asset_schedule_key), "") or ""))
+    if preferred and preferred.enabled and strategy_asset_schedule_key(preferred) == str(asset_schedule_key):
         return preferred
-    enabled = enabled_kr_strategies(settings)
+    enabled = enabled_kr_strategies(settings, asset_schedule_key=asset_schedule_key)
     return enabled[0] if enabled else preferred
 
 
-def strategy_schedule(settings: RuntimeSettings, strategy_id: str) -> AssetScheduleConfig:
+def default_kr_strategy(settings: RuntimeSettings) -> KRStrategyConfig | None:
+    return default_strategy(settings, "한국주식")
+
+
+def active_us_strategy_ids(settings: RuntimeSettings) -> list[str]:
+    return active_strategy_ids(settings, asset_schedule_key="미국주식")
+
+
+def default_us_strategy(settings: RuntimeSettings) -> KRStrategyConfig | None:
+    return default_strategy(settings, "미국주식")
+
+
+def strategy_schedule(settings: RuntimeSettings, strategy_id: str, *, when: datetime | None = None) -> AssetScheduleConfig:
     strategy = get_kr_strategy(settings, strategy_id)
     if strategy is None:
         raise KeyError(f"unknown KR strategy: {strategy_id}")
-    base = settings.asset_schedules["한국주식"]
+    strategy = strategy_runtime_config(strategy, when=when)
+    schedule_key = strategy_asset_schedule_key(strategy)
+    base = settings.asset_schedules.get(schedule_key) or settings.asset_schedules["한국주식"]
     return replace(
         base,
         session_mode=str(strategy.session_mode),
@@ -72,16 +143,73 @@ def strategy_schedule(settings: RuntimeSettings, strategy_id: str) -> AssetSched
 
 
 def strategy_label(strategy: KRStrategyConfig) -> str:
-    suffix = " Experimental" if bool(strategy.experimental) else ""
-    return f"{strategy.display_name}{suffix}".strip()
+    return str(strategy.display_name or "").strip()
 
 
-def strategy_session_mode(strategy: KRStrategyConfig | None) -> str:
-    return str((strategy.session_mode if strategy is not None else "") or "regular")
+def _kr_intraday_15m_auto_session(strategy: KRStrategyConfig, when: datetime | None = None) -> KRStrategyConfig:
+    local_now = when.astimezone(ZoneInfo("Asia/Seoul")) if when is not None else datetime.now(ZoneInfo("Asia/Seoul"))
+    common = {
+        "flatten_window_start": "17:50",
+        "flatten_window_end": "18:00",
+    }
+    if _time_in_window(local_now.time(), "16:00", "18:00"):
+        return replace(
+            strategy,
+            session_mode="after_close_single_price",
+            order_division="07",
+            session_price_policy="auction_expected_price",
+            auction_interval_minutes=10,
+            scan_interval_minutes=10,
+            entry_interval_minutes=10,
+            exit_interval_minutes=10,
+            entry_window_start="16:00",
+            entry_window_end="18:00",
+            **common,
+        )
+    if _time_in_window(local_now.time(), "15:40", "16:00"):
+        return replace(
+            strategy,
+            session_mode="after_close_close_price",
+            order_division="06",
+            session_price_policy="close_price",
+            auction_interval_minutes=0,
+            scan_interval_minutes=5,
+            entry_interval_minutes=5,
+            exit_interval_minutes=5,
+            entry_window_start="15:40",
+            entry_window_end="16:00",
+            **common,
+        )
+    return replace(
+        strategy,
+        session_mode="regular",
+        order_division="01",
+        session_price_policy="market_best_effort",
+        auction_interval_minutes=0,
+        scan_interval_minutes=15,
+        entry_interval_minutes=15,
+        exit_interval_minutes=15,
+        entry_window_start="09:15",
+        entry_window_end="14:45",
+        **common,
+    )
 
 
-def strategy_session_label(strategy: KRStrategyConfig | None) -> str:
-    mode = strategy_session_mode(strategy)
+def strategy_runtime_config(strategy: KRStrategyConfig | None, when: datetime | None = None) -> KRStrategyConfig | None:
+    if strategy is None:
+        return None
+    if str(strategy.strategy_id) == KR_INTRADAY_15M_V1_AUTO and strategy_asset_schedule_key(strategy) == "한국주식":
+        return _kr_intraday_15m_auto_session(strategy, when=when)
+    return strategy
+
+
+def strategy_session_mode(strategy: KRStrategyConfig | None, when: datetime | None = None) -> str:
+    effective = strategy_runtime_config(strategy, when=when)
+    return str((effective.session_mode if effective is not None else "") or "regular")
+
+
+def strategy_session_label(strategy: KRStrategyConfig | None, when: datetime | None = None) -> str:
+    mode = strategy_session_mode(strategy, when=when)
     return {
         "regular": "regular",
         "pre_close": "pre_close",
@@ -90,8 +218,14 @@ def strategy_session_label(strategy: KRStrategyConfig | None) -> str:
     }.get(mode, mode)
 
 
-def strategy_requires_flatten(strategy: KRStrategyConfig) -> bool:
-    return bool(strategy_session_mode(strategy) == "regular" and strategy_is_intraday(strategy))
+def strategy_requires_flatten(strategy: KRStrategyConfig, when: datetime | None = None) -> bool:
+    effective = strategy_runtime_config(strategy, when=when)
+    return bool(
+        effective is not None
+        and strategy_is_intraday(effective)
+        and str(effective.flatten_window_start or "").strip()
+        and str(effective.flatten_window_end or "").strip()
+    )
 
 
 def strategy_is_intraday(strategy: KRStrategyConfig) -> bool:
@@ -155,8 +289,9 @@ def entry_gate_reason(
     strategy = get_kr_strategy(settings, strategy_id)
     if strategy is None:
         return None
-    schedule = strategy_schedule(settings, strategy_id)
-    session_mode = strategy_session_mode(strategy)
+    strategy = strategy_runtime_config(strategy, when=when)
+    schedule = strategy_schedule(settings, strategy_id, when=when)
+    session_mode = strategy_session_mode(strategy, when=when)
     local_now = _local_dt(schedule, when)
     if local_now.weekday() >= 5:
         return "market_closed"
@@ -198,9 +333,10 @@ def entry_gate_reason(
 
 def flatten_due(settings: RuntimeSettings, strategy_id: str, when: datetime | None = None) -> bool:
     strategy = get_kr_strategy(settings, strategy_id)
-    if strategy is None or not strategy_requires_flatten(strategy):
+    strategy = strategy_runtime_config(strategy, when=when)
+    if strategy is None or not strategy_requires_flatten(strategy, when=when):
         return False
-    schedule = strategy_schedule(settings, strategy_id)
+    schedule = strategy_schedule(settings, strategy_id, when=when)
     local_now = _local_dt(schedule, when)
     if local_now.weekday() >= 5:
         return False
@@ -213,6 +349,29 @@ def strategy_execution_account_id(settings: RuntimeSettings, strategy_id: str) -
     if strategy is None:
         return ACCOUNT_KIS_KR_PAPER
     return str(strategy.execution_account_id or ACCOUNT_KIS_KR_PAPER)
+
+
+def strategy_runtime_metadata(
+    settings: RuntimeSettings,
+    strategy_id: str,
+    *,
+    when: datetime | None = None,
+) -> dict[str, str]:
+    strategy = get_kr_strategy(settings, strategy_id)
+    effective = strategy_runtime_config(strategy, when=when)
+    if effective is None:
+        return {
+            "strategy_family": "",
+            "session_mode": "",
+            "price_policy": "",
+            "account_id": strategy_execution_account_id(settings, strategy_id),
+        }
+    return {
+        "strategy_family": str(effective.strategy_family or ""),
+        "session_mode": str(effective.session_mode or ""),
+        "price_policy": str(effective.session_price_policy or ""),
+        "account_id": str(effective.execution_account_id or strategy_execution_account_id(settings, strategy_id)),
+    }
 
 
 def strategy_conflict_ids(settings: RuntimeSettings, strategy_id: str) -> set[str]:
@@ -232,10 +391,11 @@ def strategy_session_is_open(
     strategy = get_kr_strategy(settings, strategy_id)
     if strategy is None:
         return bool(market_is_open)
-    session_mode = strategy_session_mode(strategy)
+    strategy = strategy_runtime_config(strategy, when=when)
+    session_mode = strategy_session_mode(strategy, when=when)
     if session_mode in {"regular", "pre_close"}:
         return bool(market_is_open)
-    schedule = strategy_schedule(settings, strategy_id)
+    schedule = strategy_schedule(settings, strategy_id, when=when)
     local_now = _local_dt(schedule, when)
     if local_now.weekday() >= 5:
         return False
@@ -256,3 +416,7 @@ def enabled_strategy_labels(settings: RuntimeSettings) -> list[str]:
 
 def iter_strategy_rows(settings: RuntimeSettings) -> Iterable[KRStrategyConfig]:
     return all_kr_strategies(settings).values()
+
+
+def iter_visible_strategy_rows(settings: RuntimeSettings, *, asset_schedule_key: str | None = None) -> Iterable[KRStrategyConfig]:
+    return visible_kr_strategies(settings, asset_schedule_key=asset_schedule_key)

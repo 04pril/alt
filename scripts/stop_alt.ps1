@@ -2,6 +2,7 @@ $ErrorActionPreference = "SilentlyContinue"
 
 $patterns = @(
     "-m streamlit run app.py",
+    "beta_server.py",
     "-m jobs.scheduler"
 )
 
